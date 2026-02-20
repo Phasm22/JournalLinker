@@ -1,0 +1,16 @@
+# Python caches/artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+ScribeVenv/
+.venv/
+venv/
+env/
+
+# macOS
+.DS_Store
+
+# Local run outputs
+scribe_diag.txt
