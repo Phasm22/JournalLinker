@@ -95,12 +95,6 @@ def extract_json_obj(s: str) -> dict:
     raise ValueError("No valid JSON object found in model output.")
 
 
-def in_existing_link(text: str, idx: int) -> bool:
-    left = text.rfind("[[", 0, idx + 1)
-    right = text.find("]]", idx)
-    return left != -1 and right != -1 and left < idx < right
-
-
 GENERIC_TERMS = {
     "day",
     "thing",
@@ -172,21 +166,31 @@ def is_boundary_ok(text: str, s: int, e: int) -> bool:
     return left_ok and right_ok
 
 
+def iter_unlinked_ranges(text: str):
+    last = 0
+    for m in re.finditer(r"\[\[.*?\]\]", text, flags=re.DOTALL):
+        if m.start() > last:
+            yield last, m.start()
+        last = m.end()
+    if last < len(text):
+        yield last, len(text)
+
+
 def find_unlinked_span(text: str, term: str) -> tuple[int, int] | None:
     patterns = [
         re.compile(re.escape(term)),
         re.compile(re.escape(term), flags=re.IGNORECASE),
     ]
     for pattern in patterns:
-        for m in pattern.finditer(text):
-            s, e = m.start(), m.end()
-            if not is_boundary_ok(text, s, e):
-                continue
-            if in_existing_link(text, s) or in_existing_link(text, e - 1):
-                continue
-            if text[max(0, s - 2):s] == "[[" or text[e:e + 2] == "]]":
-                continue
-            return s, e
+        for start, end in iter_unlinked_ranges(text):
+            segment = text[start:end]
+            for m in pattern.finditer(segment):
+                s, e = start + m.start(), start + m.end()
+                if not is_boundary_ok(text, s, e):
+                    continue
+                if text[max(0, s - 2):s] == "[[" or text[e:e + 2] == "]]":
+                    continue
+                return s, e
     return None
 
 
