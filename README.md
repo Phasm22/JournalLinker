@@ -68,3 +68,4 @@ python3 Scribe.py --reset-learning
 - Daily note files should be named `YYYY-MM-DD.md` in the configured journal folder.
 - If learning context is unavailable (missing date, missing file, missing env), Scribe still runs normally.
 # JournalLinker
+# JournalLinker
