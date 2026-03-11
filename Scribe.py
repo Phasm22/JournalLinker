@@ -6,8 +6,32 @@ import subprocess
 import ollama
 import os
 import html
+import math
+from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
+
+
+def load_local_env(path: Path) -> None:
+    if not path.exists():
+        return
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return
+
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key or key in os.environ:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and ((value[0] == value[-1] == "\"") or (value[0] == value[-1] == "'")):
+            value = value[1:-1]
+        os.environ[key] = value
 
 
 def get_input_text(remaining_args: list[str]) -> str:
@@ -32,11 +56,15 @@ def get_input_text(remaining_args: list[str]) -> str:
     return get_clipboard_text()
 
 
-def parse_cli() -> tuple[str, int, str | None, bool, list[str]]:
+def parse_cli() -> tuple[str, int, str | None, bool, str | None, str | None, list[str]]:
+    load_local_env(Path(__file__).with_name(".env"))
+
     model = "llama3.1:8b"
     num_ctx = 8192
     journal_dir: str | None = os.getenv("SCRIBE_JOURNAL_DIR")
     reset_learning = False
+    active_date: str | None = None
+    active_file: str | None = None
     env_model = os.getenv("SCRIBE_MODEL")
     env_ctx = os.getenv("SCRIBE_CTX")
 
@@ -91,11 +119,27 @@ def parse_cli() -> tuple[str, int, str | None, bool, list[str]]:
         elif arg == "--reset-learning":
             reset_learning = True
             i += 1
+        elif arg == "--active-date":
+            if i + 1 < len(args):
+                active_date = args[i + 1]
+                skip_next = True
+            i += 1
+        elif arg.startswith("--active-date="):
+            active_date = arg.split("=", 1)[1]
+            i += 1
+        elif arg == "--active-file":
+            if i + 1 < len(args):
+                active_file = args[i + 1]
+                skip_next = True
+            i += 1
+        elif arg.startswith("--active-file="):
+            active_file = arg.split("=", 1)[1]
+            i += 1
         else:
             remaining_args.append(arg)
             i += 1
 
-    return model, num_ctx, journal_dir, reset_learning, remaining_args
+    return model, num_ctx, journal_dir, reset_learning, active_date, active_file, remaining_args
 
 
 def get_clipboard_text() -> str:
@@ -192,31 +236,66 @@ GENERIC_TERMS = {
     "details",
 }
 
-LEARNING_FILE = Path(__file__).with_name("scribe_learning.json")
+MEMORY_STORE_FILE = Path(__file__).with_name("scribe_learning.json")
 MAX_TERM_WEIGHT = 30.0
 POSITIVE_DELTA = 2.0
 NEGATIVE_DELTA = -1.5
+SEMANTIC_CONTEXT_LIMIT = 8
+RECENCY_LAMBDA = 0.08
+BURST_LOOKBACK_DAYS = 3
+BURST_WEIGHT = 4.0
+
+STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "for",
+    "from",
+    "i",
+    "in",
+    "is",
+    "it",
+    "me",
+    "my",
+    "of",
+    "on",
+    "or",
+    "that",
+    "the",
+    "to",
+    "we",
+    "with",
+    "you",
+}
+NAV_LINKS_PATTERN = re.compile(r"\[\[[^\]]+\|Yesterday\]\]\s*\|\s*\[\[[^\]]+\|Tomorrow\]\]")
 
 
-def load_learning(path: Path) -> dict:
+def load_memory_store(path: Path) -> dict:
     if not path.exists():
-        return {"term_weights": {}, "runs": {}}
+        return {"term_weights": {}, "runs": {}, "term_memory": {}}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
-        return {"term_weights": {}, "runs": {}}
+        return {"term_weights": {}, "runs": {}, "term_memory": {}}
     if not isinstance(data, dict):
-        return {"term_weights": {}, "runs": {}}
+        return {"term_weights": {}, "runs": {}, "term_memory": {}}
     data.setdefault("term_weights", {})
     data.setdefault("runs", {})
+    data.setdefault("term_memory", {})
     if not isinstance(data["term_weights"], dict):
         data["term_weights"] = {}
     if not isinstance(data["runs"], dict):
         data["runs"] = {}
+    if not isinstance(data["term_memory"], dict):
+        data["term_memory"] = {}
     return data
 
 
-def save_learning(path: Path, data: dict) -> None:
+def save_memory_store(path: Path, data: dict) -> None:
     path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
 
 
@@ -243,12 +322,360 @@ def extract_wikilink_terms(text: str) -> set[str]:
     return out
 
 
-def apply_yesterday_learning(
+def parse_iso_date(date_str: str | None) -> datetime | None:
+    if not date_str or not isinstance(date_str, str):
+        return None
+    try:
+        return datetime.strptime(date_str, "%Y-%m-%d")
+    except Exception:
+        return None
+
+
+def today_date_str() -> str:
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def extract_date_from_journal_filename(path: Path) -> str | None:
+    match = re.fullmatch(r"(\d{4}-\d{2}-\d{2})\.md", path.name)
+    if not match:
+        return None
+    date_str = match.group(1)
+    if not parse_iso_date(date_str):
+        return None
+    return date_str
+
+
+def read_file_text(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8")
+    except Exception:
+        return None
+
+
+def find_latest_modified_journal_note(journal_dir: str | None) -> Path | None:
+    if not journal_dir:
+        return None
+    journal_path = Path(journal_dir)
+    if not journal_path.exists():
+        return None
+
+    latest_path: Path | None = None
+    latest_mtime: float | None = None
+    for note_path in journal_path.glob("*.md"):
+        if not extract_date_from_journal_filename(note_path):
+            continue
+        try:
+            mtime = note_path.stat().st_mtime
+        except Exception:
+            continue
+        if latest_mtime is None or mtime > latest_mtime:
+            latest_mtime = mtime
+            latest_path = note_path
+    return latest_path
+
+
+def resolve_current_journal_context(
+    input_text: str,
+    journal_dir: str | None,
+    active_date_override: str | None = None,
+    active_file_override: str | None = None,
+) -> tuple[str | None, Path | None, str | None, str]:
+    if active_file_override:
+        candidate = Path(active_file_override).expanduser()
+        if candidate.exists() and candidate.is_file():
+            note_text = read_file_text(candidate)
+            date_from_name = extract_date_from_journal_filename(candidate)
+            current_date = date_from_name or parse_journal_date(note_text or "")
+            if current_date:
+                return current_date, candidate, note_text, "active_file"
+
+    if active_date_override and parse_iso_date(active_date_override):
+        note_path: Path | None = None
+        note_text: str | None = None
+        if journal_dir:
+            candidate = Path(journal_dir) / f"{active_date_override}.md"
+            if candidate.exists():
+                note_path = candidate
+                note_text = read_file_text(candidate)
+        return active_date_override, note_path, note_text, "active_date"
+
+    input_date = parse_journal_date(input_text)
+    if input_date:
+        note_path = None
+        note_text = None
+        if journal_dir:
+            candidate = Path(journal_dir) / f"{input_date}.md"
+            if candidate.exists():
+                note_path = candidate
+                note_text = read_file_text(candidate)
+        return input_date, note_path, note_text, "input_date"
+
+    latest_note = find_latest_modified_journal_note(journal_dir)
+    if latest_note:
+        current_date = extract_date_from_journal_filename(latest_note)
+        if current_date:
+            return current_date, latest_note, read_file_text(latest_note), "latest_modified_file"
+
+    return None, None, None, "none"
+
+
+def find_adjacent_journal_dates(
+    journal_dir: str | None,
+    current_date: str,
+) -> tuple[str, str] | None:
+    current_dt = parse_iso_date(current_date)
+    if not journal_dir or not current_dt:
+        return None
+    journal_path = Path(journal_dir)
+    if not journal_path.exists():
+        return None
+
+    previous_dt: datetime | None = None
+    next_dt: datetime | None = None
+    for note_path in journal_path.glob("*.md"):
+        match = re.fullmatch(r"(\d{4}-\d{2}-\d{2})\.md", note_path.name)
+        if not match:
+            continue
+        note_dt = parse_iso_date(match.group(1))
+        if not note_dt:
+            continue
+        if note_dt < current_dt and (previous_dt is None or note_dt > previous_dt):
+            previous_dt = note_dt
+        if note_dt > current_dt and (next_dt is None or note_dt < next_dt):
+            next_dt = note_dt
+
+    prev = (previous_dt or (current_dt - timedelta(days=1))).strftime("%Y-%m-%d")
+    nxt = (next_dt or (current_dt + timedelta(days=1))).strftime("%Y-%m-%d")
+    return prev, nxt
+
+
+def find_previous_existing_journal_date(
+    journal_dir: str | None,
+    current_date: str,
+) -> str | None:
+    current_dt = parse_iso_date(current_date)
+    if not journal_dir or not current_dt:
+        return None
+    journal_path = Path(journal_dir)
+    if not journal_path.exists():
+        return None
+
+    previous_dt: datetime | None = None
+    for note_path in journal_path.glob("*.md"):
+        match = re.fullmatch(r"(\d{4}-\d{2}-\d{2})\.md", note_path.name)
+        if not match:
+            continue
+        note_dt = parse_iso_date(match.group(1))
+        if not note_dt or note_dt >= current_dt:
+            continue
+        if previous_dt is None or note_dt > previous_dt:
+            previous_dt = note_dt
+    if not previous_dt:
+        return None
+    return previous_dt.strftime("%Y-%m-%d")
+
+
+def apply_navigation_links_to_text(
+    text: str,
+    journal_dir: str | None,
+    current_date: str,
+) -> tuple[str, bool]:
+    if not parse_iso_date(current_date):
+        return text, False
+    adjacent = find_adjacent_journal_dates(journal_dir, current_date)
+    if not adjacent:
+        return text, False
+    previous_date, next_date = adjacent
+    nav_line = f"[[{previous_date}|Yesterday]] | [[{next_date}|Tomorrow]]"
+
+    if NAV_LINKS_PATTERN.search(text):
+        updated = NAV_LINKS_PATTERN.sub(nav_line, text, count=1)
+        return updated, updated != text
+
+    heading_match = re.search(
+        rf"(?m)^#\s*Daily Log\s*-\s*{re.escape(current_date)}\s*$",
+        text,
+    )
+    if not heading_match:
+        return text, False
+    line_end = text.find("\n", heading_match.end())
+    if line_end == -1:
+        updated = text + f"\n\n{nav_line}\n"
+        return updated, updated != text
+    insert_pos = line_end + 1
+    tail = text[insert_pos:].lstrip("\n")
+    updated = text[:insert_pos] + "\n" + nav_line + "\n\n" + tail
+    return updated, updated != text
+
+
+def sync_navigation_links_in_file(
+    note_path: Path,
+    journal_dir: str | None,
+    current_date: str,
+) -> bool:
+    existing = read_file_text(note_path)
+    if existing is None:
+        return False
+    updated, changed = apply_navigation_links_to_text(existing, journal_dir, current_date)
+    if not changed:
+        return False
+    try:
+        note_path.write_text(updated, encoding="utf-8")
+    except Exception:
+        return False
+    return True
+
+
+def sync_daily_navigation_links(
+    text: str,
+    journal_dir: str | None,
+    current_date_override: str | None = None,
+) -> str:
+    current_date = current_date_override or parse_journal_date(text)
+    if not current_date:
+        return text
+    updated, _ = apply_navigation_links_to_text(text, journal_dir, current_date)
+    return updated
+
+
+def build_term_record(memory: dict, key: str, term_label: str) -> dict:
+    record = memory.setdefault(key, {})
+    if not isinstance(record, dict):
+        record = {}
+        memory[key] = record
+    record.setdefault("term", term_label)
+    record.setdefault("reinforcement", 0.0)
+    record.setdefault("seen_count", 0)
+    record.setdefault("success_count", 0)
+    record.setdefault("failure_count", 0)
+    record.setdefault("contexts", [])
+    if not isinstance(record["contexts"], list):
+        record["contexts"] = []
+    if not isinstance(record["term"], str) or not record["term"].strip():
+        record["term"] = term_label
+    return record
+
+
+def trim_contexts(values: list[str], limit: int = SEMANTIC_CONTEXT_LIMIT) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        clean = normalize_term(value)
+        if not clean:
+            continue
+        key = clean.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(clean)
+    if len(out) > limit:
+        out = out[-limit:]
+    return out
+
+
+def extract_candidate_context(text: str, term: str, window: int = 80) -> str:
+    pattern = re.compile(re.escape(term), flags=re.IGNORECASE)
+    match = pattern.search(text)
+    if not match:
+        return ""
+    start = max(0, match.start() - window)
+    end = min(len(text), match.end() + window)
+    snippet = text[start:end]
+    snippet = re.sub(r"\s+", " ", snippet).strip()
+    return snippet
+
+
+def tokenize_for_similarity(text: str) -> list[str]:
+    tokens = re.findall(r"[a-z0-9']+", text.lower())
+    return [t for t in tokens if t not in STOPWORDS and len(t) > 1]
+
+
+def cosine_similarity(a: Counter, b: Counter) -> float:
+    if not a or not b:
+        return 0.0
+    dot = 0.0
+    for token, count in a.items():
+        dot += float(count * b.get(token, 0))
+    if dot <= 0:
+        return 0.0
+    norm_a = math.sqrt(sum(float(v * v) for v in a.values()))
+    norm_b = math.sqrt(sum(float(v * v) for v in b.values()))
+    if norm_a <= 0 or norm_b <= 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+def compute_semantic_similarity(current_context: str, history_contexts: list[str]) -> float:
+    if not current_context or not history_contexts:
+        return 0.0
+    current_tokens = tokenize_for_similarity(current_context)
+    if not current_tokens:
+        return 0.0
+    current_vec = Counter(current_tokens)
+    best = 0.0
+    for snippet in history_contexts:
+        tokens = tokenize_for_similarity(snippet)
+        if not tokens:
+            continue
+        score = cosine_similarity(current_vec, Counter(tokens))
+        if score > best:
+            best = score
+    return best
+
+
+def compute_recency_weight(last_date: str | None, reference_date: str | None) -> float:
+    dt_last = parse_iso_date(last_date)
+    dt_ref = parse_iso_date(reference_date) or parse_iso_date(today_date_str())
+    if not dt_last or not dt_ref:
+        return 0.0
+    days = max(0, (dt_ref - dt_last).days)
+    return math.exp(-RECENCY_LAMBDA * days)
+
+
+def collect_recent_topic_activity(
+    journal_dir: str | None,
+    reference_date: str | None,
+    lookback_days: int = BURST_LOOKBACK_DAYS,
+) -> dict[str, int]:
+    if not journal_dir:
+        return {}
+    reference_dt = parse_iso_date(reference_date)
+    if not reference_dt:
+        return {}
+    journal_path = Path(journal_dir)
+    if not journal_path.exists():
+        return {}
+
+    topic_activity: dict[str, int] = {}
+    for days_ago in range(max(1, lookback_days)):
+        day = (reference_dt - timedelta(days=days_ago)).strftime("%Y-%m-%d")
+        note_path = journal_path / f"{day}.md"
+        if not note_path.exists():
+            continue
+        try:
+            note_text = note_path.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        for topic in extract_wikilink_terms(note_text):
+            topic_activity[topic] = topic_activity.get(topic, 0) + 1
+    return topic_activity
+
+
+def compute_burst_weight(activity_count: int) -> float:
+    if activity_count <= 0:
+        return 0.0
+    return float(min(activity_count, 3)) * BURST_WEIGHT
+
+
+def apply_previous_day_feedback(
     learning: dict,
     current_entry_text: str,
     journal_dir: str | None,
+    current_date_override: str | None = None,
 ) -> str | None:
-    current_date = parse_journal_date(current_entry_text)
+    current_date = current_date_override or parse_journal_date(current_entry_text)
     if not current_date:
         return None
 
@@ -276,16 +703,22 @@ def apply_yesterday_learning(
     suggested = run.get("suggested_terms", [])
     if not isinstance(suggested, list):
         return current_date
+    run_contexts = run.get("term_contexts", {})
+    if not isinstance(run_contexts, dict):
+        run_contexts = {}
 
     weights = learning.setdefault("term_weights", {})
+    term_memory = learning.setdefault("term_memory", {})
     for term in suggested:
         if not isinstance(term, str):
             continue
         key = normalize_term(term).lower()
         if not key:
             continue
+
+        matched = key in actual_links
         current = float(weights.get(key, 0.0))
-        if key in actual_links:
+        if matched:
             current += POSITIVE_DELTA
         else:
             current += NEGATIVE_DELTA
@@ -295,15 +728,53 @@ def apply_yesterday_learning(
         else:
             weights[key] = round(current, 3)
 
+        record = build_term_record(term_memory, key, term)
+        record["seen_count"] = int(record.get("seen_count", 0)) + 1
+        if matched:
+            record["success_count"] = int(record.get("success_count", 0)) + 1
+            record["last_success_date"] = yesterday
+        else:
+            record["failure_count"] = int(record.get("failure_count", 0)) + 1
+        record["last_seen_date"] = yesterday
+        reinforcement = float(record.get("reinforcement", 0.0))
+        reinforcement += POSITIVE_DELTA if matched else NEGATIVE_DELTA
+        reinforcement = max(-MAX_TERM_WEIGHT, min(MAX_TERM_WEIGHT, reinforcement))
+        record["reinforcement"] = round(reinforcement, 3)
+        if matched:
+            candidate_context = run_contexts.get(key)
+            if isinstance(candidate_context, str) and candidate_context.strip():
+                existing = record.get("contexts", [])
+                if not isinstance(existing, list):
+                    existing = []
+                record["contexts"] = trim_contexts(existing + [candidate_context])
+
     return current_date
 
 
-def persist_current_run(learning: dict, current_date: str | None, ranked_terms: list[str]) -> None:
+def record_daily_suggestions(
+    learning: dict,
+    current_date: str | None,
+    ranked_terms: list[str],
+    source_text: str,
+) -> None:
     if not current_date:
         return
+
+    term_contexts: dict[str, str] = {}
+    for term in ranked_terms:
+        if not isinstance(term, str):
+            continue
+        key = normalize_term(term).lower()
+        if not key:
+            continue
+        context = extract_candidate_context(source_text, term)
+        if context:
+            term_contexts[key] = context
+
     learning.setdefault("runs", {})
     learning["runs"][current_date] = {
         "suggested_terms": ranked_terms,
+        "term_contexts": term_contexts,
         "updated_at": datetime.now().isoformat(timespec="seconds"),
     }
 
@@ -325,10 +796,25 @@ def term_frequency(text: str, term: str) -> int:
     return len(re.findall(re.escape(term), text, flags=re.IGNORECASE))
 
 
-def rank_terms(original: str, terms: list[str], learning: dict, max_links: int = 45) -> list[str]:
+def rank_link_candidates(
+    original: str,
+    terms: list[str],
+    learning: dict,
+    max_links: int = 45,
+    current_date: str | None = None,
+    journal_dir: str | None = None,
+) -> list[str]:
     scored: list[tuple[float, int, int, int, str]] = []
     seen: set[str] = set()
     weights = learning.get("term_weights", {})
+    term_memory = learning.get("term_memory", {})
+    parsed_current_date = current_date or parse_journal_date(original)
+    reference_date = parsed_current_date or today_date_str()
+    recent_topic_activity = collect_recent_topic_activity(
+        journal_dir=journal_dir,
+        reference_date=parsed_current_date,
+        lookback_days=BURST_LOOKBACK_DAYS,
+    )
 
     for idx, raw in enumerate(terms):
         if not isinstance(raw, str):
@@ -351,6 +837,29 @@ def rank_terms(original: str, terms: list[str], learning: dict, max_links: int =
         if key in GENERIC_TERMS:
             score -= 20.0
         score += float(weights.get(key, 0.0))
+        score += compute_burst_weight(recent_topic_activity.get(key, 0))
+
+        if isinstance(term_memory, dict):
+            record = term_memory.get(key, {})
+        else:
+            record = {}
+        if isinstance(record, dict):
+            reinforcement = float(record.get("reinforcement", 0.0))
+            successes = max(0, int(record.get("success_count", 0)))
+            failures = max(0, int(record.get("failure_count", 0)))
+            last_success = record.get("last_success_date") or record.get("last_seen_date")
+            recency = compute_recency_weight(last_success, reference_date)
+            history_contexts = record.get("contexts", [])
+            if not isinstance(history_contexts, list):
+                history_contexts = []
+            semantic = compute_semantic_similarity(extract_candidate_context(original, term), history_contexts)
+
+            usage = math.log1p(successes) - (0.4 * math.log1p(failures))
+            score += reinforcement * 1.5
+            score += usage * 4.0
+            score += recency * 8.0
+            score += semantic * 10.0
+
         # Keep some influence from the model's original ordering.
         score += max(0.0, 8.0 - (idx * 0.15))
 
@@ -406,7 +915,7 @@ def split_frontmatter(text: str) -> tuple[str, str]:
     return text[:end_line], text[end_line:]
 
 
-def apply_links_in_chunks(text: str, ranked_terms: list[str]) -> str:
+def insert_wikilinks_by_paragraph(text: str, ranked_terms: list[str]) -> str:
     chunks = re.split(r"(\n\s*\n)", text)
     for term in ranked_terms:
         for i, chunk in enumerate(chunks):
@@ -421,8 +930,22 @@ def apply_links_in_chunks(text: str, ranked_terms: list[str]) -> str:
     return "".join(chunks)
 
 
-def apply_links(original: str, terms: list[str], learning: dict, max_links: int = 45) -> tuple[str, list[str]]:
-    ranked_terms = rank_terms(original, terms, learning, max_links=max_links)
+def insert_ranked_wikilinks(
+    original: str,
+    terms: list[str],
+    learning: dict,
+    max_links: int = 45,
+    current_date: str | None = None,
+    journal_dir: str | None = None,
+) -> tuple[str, list[str]]:
+    ranked_terms = rank_link_candidates(
+        original,
+        terms,
+        learning,
+        max_links=max_links,
+        current_date=current_date,
+        journal_dir=journal_dir,
+    )
     frontmatter, body = split_frontmatter(original)
 
     marker = "\n## Portability Export"
@@ -433,15 +956,53 @@ def apply_links(original: str, terms: list[str], learning: dict, max_links: int 
     else:
         main_body = body
 
-    linked_main = apply_links_in_chunks(main_body, ranked_terms)
+    linked_main = insert_wikilinks_by_paragraph(main_body, ranked_terms)
     return frontmatter + linked_main + portability, ranked_terms
 
 
 def main() -> int:
     input_text = None
-    MODEL, NUM_CTX, JOURNAL_DIR, RESET_LEARNING, remaining_args = parse_cli()
+    MODEL, NUM_CTX, JOURNAL_DIR, RESET_LEARNING, ACTIVE_DATE, ACTIVE_FILE, remaining_args = parse_cli()
     input_text = get_input_text(remaining_args)
     input_text = strip_html_if_needed(input_text)
+    (
+        resolved_current_date,
+        resolved_note_path,
+        _resolved_note_text,
+        active_context_source,
+    ) = resolve_current_journal_context(
+        input_text=input_text,
+        journal_dir=JOURNAL_DIR,
+        active_date_override=ACTIVE_DATE,
+        active_file_override=ACTIVE_FILE,
+    )
+
+    has_embedded_date = parse_journal_date(input_text) is not None
+    file_nav_sync_applied = False
+    previous_file_nav_sync_applied = False
+    if has_embedded_date and resolved_current_date:
+        input_text = sync_daily_navigation_links(
+            input_text,
+            JOURNAL_DIR,
+            current_date_override=resolved_current_date,
+        )
+    elif resolved_current_date and resolved_note_path:
+        file_nav_sync_applied = sync_navigation_links_in_file(
+            note_path=resolved_note_path,
+            journal_dir=JOURNAL_DIR,
+            current_date=resolved_current_date,
+        )
+
+    if resolved_current_date and JOURNAL_DIR:
+        previous_existing_date = find_previous_existing_journal_date(JOURNAL_DIR, resolved_current_date)
+        if previous_existing_date:
+            previous_path = Path(JOURNAL_DIR) / f"{previous_existing_date}.md"
+            if previous_path.exists():
+                previous_file_nav_sync_applied = sync_navigation_links_in_file(
+                    note_path=previous_path,
+                    journal_dir=JOURNAL_DIR,
+                    current_date=previous_existing_date,
+                )
 
     if not input_text.strip():
         print(
@@ -457,11 +1018,16 @@ def main() -> int:
     KEEP_ALIVE = "5m"
 
     try:
-        if RESET_LEARNING and LEARNING_FILE.exists():
-            LEARNING_FILE.unlink(missing_ok=True)
+        if RESET_LEARNING and MEMORY_STORE_FILE.exists():
+            MEMORY_STORE_FILE.unlink(missing_ok=True)
 
-        learning_data = load_learning(LEARNING_FILE)
-        current_date = apply_yesterday_learning(learning_data, input_text, JOURNAL_DIR)
+        memory_store_data = load_memory_store(MEMORY_STORE_FILE)
+        current_date = apply_previous_day_feedback(
+            memory_store_data,
+            input_text,
+            JOURNAL_DIR,
+            current_date_override=resolved_current_date,
+        )
 
         t0 = time.perf_counter()
         response = ollama.chat(
@@ -475,9 +1041,15 @@ def main() -> int:
         terms = data.get("links", [])
         if not isinstance(terms, list):
             raise ValueError("Model JSON must include a list at key 'links'.")
-        out, ranked_terms = apply_links(input_text, terms, learning_data)
-        persist_current_run(learning_data, current_date, ranked_terms)
-        save_learning(LEARNING_FILE, learning_data)
+        out, ranked_terms = insert_ranked_wikilinks(
+            input_text,
+            terms,
+            memory_store_data,
+            current_date=current_date,
+            journal_dir=JOURNAL_DIR,
+        )
+        record_daily_suggestions(memory_store_data, current_date, ranked_terms, input_text)
+        save_memory_store(MEMORY_STORE_FILE, memory_store_data)
         t2 = time.perf_counter()
         # Diagnostics to stderr so stdout stays clean for piping
         print(
@@ -487,6 +1059,14 @@ def main() -> int:
         )
         print(
             f"[Scribe] model={MODEL} num_ctx={NUM_CTX} journal_dir={JOURNAL_DIR or 'unset'}",
+            file=sys.stderr,
+        )
+        print(
+            f"[Scribe] active_context_source={active_context_source} "
+            f"active_date={resolved_current_date or 'unset'} "
+            f"active_file={str(resolved_note_path) if resolved_note_path else 'unset'} "
+            f"file_nav_sync_applied={file_nav_sync_applied} "
+            f"previous_file_nav_sync_applied={previous_file_nav_sync_applied}",
             file=sys.stderr,
         )
         if response.get("eval_duration"):
