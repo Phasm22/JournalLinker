@@ -1,9 +1,11 @@
 import importlib.util
+import io
 import os
 import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "Scribe.py"
@@ -373,6 +375,151 @@ class TestScribeLearning(unittest.TestCase):
                 journal_dir=str(journal_dir),
             )
         self.assertEqual(ranked[0].lower(), "walk")
+
+    def test_write_run_report_prepends_newest_history_entry(self):
+        with tempfile.TemporaryDirectory() as d:
+            base_dir = Path(d)
+            first = scribe.write_run_report(
+                base_dir=base_dir,
+                started_at=datetime(2026, 3, 17, 9, 0, 0),
+                finished_at=datetime(2026, 3, 17, 9, 0, 5),
+                status="success",
+                model="test-model",
+                num_ctx=2048,
+                journal_dir=str(base_dir),
+                active_context_source="input_date",
+                active_date="2026-03-17",
+                active_file=base_dir / "2026-03-17.md",
+                input_text="I went for a walk.",
+                prompt="prompt",
+                suggested_terms=["walk"],
+                ranked_terms=["walk"],
+                output_text="I went for a [[walk]].",
+                file_nav_sync_applied=False,
+                previous_file_nav_sync_applied=False,
+                actions=[{"action": "Insert ranked wikilinks", "result": "completed", "target": "walk"}],
+                touched_files=[],
+                error_message=None,
+                traceback_text=None,
+            )
+            second = scribe.write_run_report(
+                base_dir=base_dir,
+                started_at=datetime(2026, 3, 17, 10, 0, 0),
+                finished_at=datetime(2026, 3, 17, 10, 0, 3),
+                status="error",
+                model="test-model",
+                num_ctx=2048,
+                journal_dir=str(base_dir),
+                active_context_source="input_date",
+                active_date="2026-03-17",
+                active_file=base_dir / "2026-03-17.md",
+                input_text="I went for a walk.",
+                prompt="prompt",
+                suggested_terms=[],
+                ranked_terms=[],
+                output_text=None,
+                file_nav_sync_applied=False,
+                previous_file_nav_sync_applied=False,
+                actions=[{"action": "Run journal linker", "result": "failed", "target": "current input"}],
+                touched_files=[],
+                error_message="boom",
+                traceback_text="traceback",
+            )
+
+            self.assertIsNotNone(first)
+            self.assertIsNotNone(second)
+            history_path = base_dir / scribe.RUN_REPORTS_DIRNAME / scribe.RUN_HISTORY_FILENAME
+            history = history_path.read_text(encoding="utf-8")
+            self.assertLess(history.find("2026-03-17 10:00:00"), history.find("2026-03-17 09:00:00"))
+
+    def test_main_writes_success_report_in_journal_linker_folder(self):
+        with tempfile.TemporaryDirectory() as d:
+            journal_dir = Path(d) / "journal"
+            journal_dir.mkdir()
+            note_path = journal_dir / "2026-03-10.md"
+            note_path.write_text(
+                "# Daily Log - 2026-03-10\n\nI called Dad and went for a walk.\n",
+                encoding="utf-8",
+            )
+            learning_path = Path(d) / "scribe_learning.json"
+            model_response = {
+                "message": {"content": '{"links":["Dad","walk"]}'},
+                "eval_duration": 123,
+            }
+
+            with (
+                mock.patch.object(
+                    scribe,
+                    "parse_cli",
+                    return_value=("test-model", 2048, str(journal_dir), False, None, None, []),
+                ),
+                mock.patch.object(
+                    scribe,
+                    "get_input_text",
+                    return_value=note_path.read_text(encoding="utf-8"),
+                ),
+                mock.patch.object(scribe, "MEMORY_STORE_FILE", learning_path),
+                mock.patch.object(scribe.ollama, "chat", return_value=model_response),
+                mock.patch("sys.stdout", new_callable=io.StringIO) as stdout,
+                mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+            ):
+                exit_code = scribe.main()
+
+            self.assertEqual(exit_code, 0)
+            self.assertIn("[[Dad]]", stdout.getvalue())
+            self.assertIn("report=", stderr.getvalue())
+
+            report_dir = journal_dir / scribe.RUN_REPORTS_DIRNAME
+            history_path = report_dir / scribe.RUN_HISTORY_FILENAME
+            self.assertTrue(history_path.exists())
+            report_files = sorted(report_dir.glob("Journal Linker Run - *.md"))
+            self.assertEqual(len(report_files), 1)
+            report_text = report_files[0].read_text(encoding="utf-8")
+            self.assertIn("**Status:** Success", report_text)
+            self.assertIn("Save learning store", report_text)
+            self.assertIn(str(learning_path), report_text)
+
+    def test_main_writes_error_report_in_journal_linker_folder(self):
+        with tempfile.TemporaryDirectory() as d:
+            journal_dir = Path(d) / "journal"
+            journal_dir.mkdir()
+            note_path = journal_dir / "2026-03-10.md"
+            note_path.write_text(
+                "# Daily Log - 2026-03-10\n\nI called Dad and went for a walk.\n",
+                encoding="utf-8",
+            )
+            learning_path = Path(d) / "scribe_learning.json"
+
+            with (
+                mock.patch.object(
+                    scribe,
+                    "parse_cli",
+                    return_value=("test-model", 2048, str(journal_dir), False, None, None, []),
+                ),
+                mock.patch.object(
+                    scribe,
+                    "get_input_text",
+                    return_value=note_path.read_text(encoding="utf-8"),
+                ),
+                mock.patch.object(scribe, "MEMORY_STORE_FILE", learning_path),
+                mock.patch.object(scribe.ollama, "chat", side_effect=RuntimeError("boom")),
+                mock.patch("sys.stdout", new_callable=io.StringIO),
+                mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+            ):
+                exit_code = scribe.main()
+
+            self.assertEqual(exit_code, 1)
+            self.assertIn("Error: boom", stderr.getvalue())
+
+            report_dir = journal_dir / scribe.RUN_REPORTS_DIRNAME
+            history_path = report_dir / scribe.RUN_HISTORY_FILENAME
+            self.assertTrue(history_path.exists())
+            report_files = sorted(report_dir.glob("Journal Linker Run - *.md"))
+            self.assertEqual(len(report_files), 1)
+            report_text = report_files[0].read_text(encoding="utf-8")
+            self.assertIn("**Status:** Error", report_text)
+            self.assertIn("boom", report_text)
+            self.assertIn("## Traceback", report_text)
 
 
 if __name__ == "__main__":

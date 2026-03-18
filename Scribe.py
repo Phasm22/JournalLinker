@@ -7,6 +7,7 @@ import ollama
 import os
 import html
 import math
+import traceback
 from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -237,6 +238,8 @@ GENERIC_TERMS = {
 }
 
 MEMORY_STORE_FILE = Path(__file__).with_name("scribe_learning.json")
+RUN_REPORTS_DIRNAME = "journal-linker"
+RUN_HISTORY_FILENAME = "Run History.md"
 MAX_TERM_WEIGHT = 30.0
 POSITIVE_DELTA = 2.0
 NEGATIVE_DELTA = -1.5
@@ -350,6 +353,228 @@ def read_file_text(path: Path) -> str | None:
         return path.read_text(encoding="utf-8")
     except Exception:
         return None
+
+
+def count_wikilink_markers(text: str) -> int:
+    return text.count("[[")
+
+
+def derive_report_base_dir(journal_dir: str | None, note_path: Path | None) -> Path | None:
+    if journal_dir:
+        return Path(journal_dir)
+    if note_path:
+        return note_path.parent
+    return None
+
+
+def markdown_cell(value: object) -> str:
+    text = str(value)
+    text = text.replace("|", "\\|")
+    return text.replace("\n", "<br>")
+
+
+def build_run_report_markdown(
+    *,
+    started_at: datetime,
+    finished_at: datetime,
+    status: str,
+    model: str,
+    num_ctx: int,
+    journal_dir: str | None,
+    active_context_source: str,
+    active_date: str | None,
+    active_file: Path | None,
+    input_chars: int,
+    prompt_chars: int,
+    input_wikilinks: int,
+    suggested_terms: list[str],
+    ranked_terms: list[str],
+    output_text: str | None,
+    file_nav_sync_applied: bool,
+    previous_file_nav_sync_applied: bool,
+    actions: list[dict[str, str]],
+    touched_files: list[Path],
+    error_message: str | None,
+    traceback_text: str | None,
+    ollama_sec: float | None = None,
+    postprocess_sec: float | None = None,
+    eval_duration_ns: int | None = None,
+) -> str:
+    status_label = "Success" if status == "success" else "Error"
+    suggested_preview = ", ".join(ranked_terms[:12]) if ranked_terms else ", ".join(suggested_terms[:12])
+
+    lines = [
+        f"# Journal Linker Run - {started_at.strftime('%Y-%m-%d %H:%M:%S')}",
+        "",
+        f"**Status:** {status_label}",
+        "",
+        "## Summary",
+        "",
+        f"- Started: {started_at.isoformat(timespec='seconds')}",
+        f"- Finished: {finished_at.isoformat(timespec='seconds')}",
+        f"- Duration seconds: {(finished_at - started_at).total_seconds():.3f}",
+        f"- Model: `{model}`",
+        f"- Context window: `{num_ctx}`",
+        f"- Journal directory: `{journal_dir or 'unset'}`",
+        f"- Active context source: `{active_context_source}`",
+        f"- Active date: `{active_date or 'unset'}`",
+        f"- Active file: `{str(active_file) if active_file else 'unset'}`",
+        f"- Input characters: `{input_chars}`",
+        f"- Prompt characters: `{prompt_chars}`",
+        f"- Input wikilink markers: `{input_wikilinks}`",
+        f"- Suggested terms returned: `{len(suggested_terms)}`",
+        f"- Ranked terms considered: `{len(ranked_terms)}`",
+        f"- Current note nav sync applied: `{file_nav_sync_applied}`",
+        f"- Previous note nav sync applied: `{previous_file_nav_sync_applied}`",
+    ]
+
+    if output_text is not None:
+        output_wikilinks = count_wikilink_markers(output_text)
+        lines.append(f"- Output wikilink markers: `{output_wikilinks}`")
+        lines.append(f"- Approximate new wikilinks added: `{max(0, output_wikilinks - input_wikilinks)}`")
+    if ollama_sec is not None:
+        lines.append(f"- Ollama seconds: `{ollama_sec:.3f}`")
+    if postprocess_sec is not None:
+        lines.append(f"- Post-process seconds: `{postprocess_sec:.3f}`")
+    if eval_duration_ns is not None:
+        lines.append(f"- Model eval duration ns: `{eval_duration_ns}`")
+
+    lines.extend(
+        [
+            "",
+            "## Actions",
+            "",
+            "| Action | Result | Target |",
+            "| --- | --- | --- |",
+        ]
+    )
+    for action in actions:
+        lines.append(
+            f"| {markdown_cell(action.get('action', ''))} | "
+            f"{markdown_cell(action.get('result', ''))} | "
+            f"{markdown_cell(action.get('target', ''))} |"
+        )
+
+    lines.extend(["", "## Files Touched", ""])
+    if touched_files:
+        seen_files: set[str] = set()
+        for path in touched_files:
+            path_str = str(path)
+            if path_str in seen_files:
+                continue
+            seen_files.add(path_str)
+            lines.append(f"- `{path_str}`")
+    else:
+        lines.append("- None")
+
+    lines.extend(["", "## Suggested Links", ""])
+    if suggested_preview:
+        lines.append(suggested_preview)
+    else:
+        lines.append("_No suggestions were recorded._")
+
+    if error_message:
+        lines.extend(["", "## Error", "", error_message])
+    if traceback_text:
+        lines.extend(["", "## Traceback", "", "```text", traceback_text.strip(), "```"])
+
+    lines.append("")
+    return "\n".join(lines)
+
+
+def write_run_report(
+    *,
+    base_dir: Path | None,
+    started_at: datetime,
+    finished_at: datetime,
+    status: str,
+    model: str,
+    num_ctx: int,
+    journal_dir: str | None,
+    active_context_source: str,
+    active_date: str | None,
+    active_file: Path | None,
+    input_text: str,
+    prompt: str | None,
+    suggested_terms: list[str],
+    ranked_terms: list[str],
+    output_text: str | None,
+    file_nav_sync_applied: bool,
+    previous_file_nav_sync_applied: bool,
+    actions: list[dict[str, str]],
+    touched_files: list[Path],
+    error_message: str | None,
+    traceback_text: str | None,
+    ollama_sec: float | None = None,
+    postprocess_sec: float | None = None,
+    eval_duration_ns: int | None = None,
+) -> Path | None:
+    if base_dir is None:
+        return None
+
+    report_dir = base_dir / RUN_REPORTS_DIRNAME
+    report_dir.mkdir(parents=True, exist_ok=True)
+
+    started_stamp = started_at.strftime("%Y-%m-%d %H-%M-%S")
+    report_name = f"Journal Linker Run - {started_stamp}.md"
+    report_path = report_dir / report_name
+    history_path = report_dir / RUN_HISTORY_FILENAME
+
+    report_body = build_run_report_markdown(
+        started_at=started_at,
+        finished_at=finished_at,
+        status=status,
+        model=model,
+        num_ctx=num_ctx,
+        journal_dir=journal_dir,
+        active_context_source=active_context_source,
+        active_date=active_date,
+        active_file=active_file,
+        input_chars=len(input_text),
+        prompt_chars=len(prompt or ""),
+        input_wikilinks=count_wikilink_markers(input_text),
+        suggested_terms=suggested_terms,
+        ranked_terms=ranked_terms,
+        output_text=output_text,
+        file_nav_sync_applied=file_nav_sync_applied,
+        previous_file_nav_sync_applied=previous_file_nav_sync_applied,
+        actions=actions,
+        touched_files=touched_files,
+        error_message=error_message,
+        traceback_text=traceback_text,
+        ollama_sec=ollama_sec,
+        postprocess_sec=postprocess_sec,
+        eval_duration_ns=eval_duration_ns,
+    )
+    report_path.write_text(report_body, encoding="utf-8")
+
+    status_label = "Success" if status == "success" else "Error"
+    history_header = "# Journal Linker Run History\n\n"
+    history_entry_lines = [
+        f"## {started_at.strftime('%Y-%m-%d %H:%M:%S')} - {status_label}",
+        "",
+        f"- Report: [{report_name}]({report_name})",
+        f"- Active date: `{active_date or 'unset'}`",
+        f"- Active file: `{str(active_file) if active_file else 'unset'}`",
+        f"- Result: `{status_label}`",
+    ]
+    if error_message:
+        history_entry_lines.append(f"- Error: `{error_message}`")
+    history_entry = "\n".join(history_entry_lines) + "\n\n"
+
+    existing_history = read_file_text(history_path) or ""
+    if existing_history.startswith(history_header):
+        existing_body = existing_history[len(history_header):].lstrip()
+    else:
+        existing_body = existing_history.strip()
+
+    new_history = history_header + history_entry
+    if existing_body:
+        new_history += existing_body
+        if not new_history.endswith("\n"):
+            new_history += "\n"
+    history_path.write_text(new_history, encoding="utf-8")
+    return report_path
 
 
 def find_latest_modified_journal_note(journal_dir: str | None) -> Path | None:
@@ -961,7 +1186,7 @@ def insert_ranked_wikilinks(
 
 
 def main() -> int:
-    input_text = None
+    run_started_at = datetime.now()
     MODEL, NUM_CTX, JOURNAL_DIR, RESET_LEARNING, ACTIVE_DATE, ACTIVE_FILE, remaining_args = parse_cli()
     input_text = get_input_text(remaining_args)
     input_text = strip_html_if_needed(input_text)
@@ -976,10 +1201,23 @@ def main() -> int:
         active_date_override=ACTIVE_DATE,
         active_file_override=ACTIVE_FILE,
     )
+    report_base_dir = derive_report_base_dir(JOURNAL_DIR, resolved_note_path)
 
     has_embedded_date = parse_journal_date(input_text) is not None
     file_nav_sync_applied = False
     previous_file_nav_sync_applied = False
+    previous_path: Path | None = None
+    prompt: str | None = None
+    t0: float | None = None
+    t1: float | None = None
+    t2: float | None = None
+    eval_duration_ns: int | None = None
+    suggested_terms: list[str] = []
+    ranked_terms: list[str] = []
+    out: str | None = None
+    touched_files: list[Path] = []
+    actions: list[dict[str, str]] = []
+
     if has_embedded_date and resolved_current_date:
         input_text = sync_daily_navigation_links(
             input_text,
@@ -992,6 +1230,15 @@ def main() -> int:
             journal_dir=JOURNAL_DIR,
             current_date=resolved_current_date,
         )
+        actions.append(
+            {
+                "action": "Sync current note navigation links",
+                "result": "updated" if file_nav_sync_applied else "no change",
+                "target": str(resolved_note_path),
+            }
+        )
+        if file_nav_sync_applied:
+            touched_files.append(resolved_note_path)
 
     if resolved_current_date and JOURNAL_DIR:
         previous_existing_date = find_previous_existing_journal_date(JOURNAL_DIR, resolved_current_date)
@@ -1003,15 +1250,66 @@ def main() -> int:
                     journal_dir=JOURNAL_DIR,
                     current_date=previous_existing_date,
                 )
+                actions.append(
+                    {
+                        "action": "Sync previous note navigation links",
+                        "result": "updated" if previous_file_nav_sync_applied else "no change",
+                        "target": str(previous_path),
+                    }
+                )
+                if previous_file_nav_sync_applied:
+                    touched_files.append(previous_path)
 
     if not input_text.strip():
+        error_message = (
+            "Error: No input provided. Pipe text in (pbpaste | python Scribe.py) or pass as an argument."
+        )
+        actions.append(
+            {
+                "action": "Read input",
+                "result": "failed",
+                "target": "stdin/argv/clipboard",
+            }
+        )
+        report_path = write_run_report(
+            base_dir=report_base_dir,
+            started_at=run_started_at,
+            finished_at=datetime.now(),
+            status="error",
+            model=MODEL,
+            num_ctx=NUM_CTX,
+            journal_dir=JOURNAL_DIR,
+            active_context_source=active_context_source,
+            active_date=resolved_current_date,
+            active_file=resolved_note_path,
+            input_text=input_text,
+            prompt=prompt,
+            suggested_terms=suggested_terms,
+            ranked_terms=ranked_terms,
+            output_text=out,
+            file_nav_sync_applied=file_nav_sync_applied,
+            previous_file_nav_sync_applied=previous_file_nav_sync_applied,
+            actions=actions,
+            touched_files=touched_files,
+            error_message=error_message,
+            traceback_text=None,
+        )
+        if report_path is not None:
+            print(f"[Scribe] report={report_path}", file=sys.stderr)
         print(
-            "Error: No input provided. Pipe text in (pbpaste | python Scribe.py) or pass as an argument.",
+            error_message,
             file=sys.stderr,
         )
         return 2
 
     prompt = build_prompt(input_text)
+    actions.append(
+        {
+            "action": "Build prompt",
+            "result": "completed",
+            "target": f"{len(prompt)} chars",
+        }
+    )
 
     # MODEL = "deepseek-r1:32b"  # removed as per instructions
     # Use string "5m" per API docs so model stays loaded; run "ollama ps" while Scribe runs or right after
@@ -1020,6 +1318,13 @@ def main() -> int:
     try:
         if RESET_LEARNING and MEMORY_STORE_FILE.exists():
             MEMORY_STORE_FILE.unlink(missing_ok=True)
+            actions.append(
+                {
+                    "action": "Reset learning store",
+                    "result": "deleted",
+                    "target": str(MEMORY_STORE_FILE),
+                }
+            )
 
         memory_store_data = load_memory_store(MEMORY_STORE_FILE)
         current_date = apply_previous_day_feedback(
@@ -1027,6 +1332,13 @@ def main() -> int:
             input_text,
             JOURNAL_DIR,
             current_date_override=resolved_current_date,
+        )
+        actions.append(
+            {
+                "action": "Apply previous-day feedback",
+                "result": "completed" if current_date else "skipped",
+                "target": current_date or "no active date",
+            }
         )
 
         t0 = time.perf_counter()
@@ -1037,10 +1349,19 @@ def main() -> int:
             keep_alive=KEEP_ALIVE,
         )
         t1 = time.perf_counter()
+        eval_duration_ns = response.get("eval_duration")
+        actions.append(
+            {
+                "action": "Request candidate links from model",
+                "result": "completed",
+                "target": MODEL,
+            }
+        )
         data = extract_json_obj(response["message"]["content"])
         terms = data.get("links", [])
         if not isinstance(terms, list):
             raise ValueError("Model JSON must include a list at key 'links'.")
+        suggested_terms = [term for term in terms if isinstance(term, str)]
         out, ranked_terms = insert_ranked_wikilinks(
             input_text,
             terms,
@@ -1048,8 +1369,30 @@ def main() -> int:
             current_date=current_date,
             journal_dir=JOURNAL_DIR,
         )
+        actions.append(
+            {
+                "action": "Insert ranked wikilinks",
+                "result": "completed",
+                "target": f"{len(ranked_terms)} ranked terms",
+            }
+        )
         record_daily_suggestions(memory_store_data, current_date, ranked_terms, input_text)
+        actions.append(
+            {
+                "action": "Record daily suggestions",
+                "result": "completed" if current_date else "skipped",
+                "target": current_date or "no active date",
+            }
+        )
         save_memory_store(MEMORY_STORE_FILE, memory_store_data)
+        touched_files.append(MEMORY_STORE_FILE)
+        actions.append(
+            {
+                "action": "Save learning store",
+                "result": "updated",
+                "target": str(MEMORY_STORE_FILE),
+            }
+        )
         t2 = time.perf_counter()
         # Diagnostics to stderr so stdout stays clean for piping
         print(
@@ -1069,11 +1412,74 @@ def main() -> int:
             f"previous_file_nav_sync_applied={previous_file_nav_sync_applied}",
             file=sys.stderr,
         )
-        if response.get("eval_duration"):
-            print(f"[Scribe] eval_duration_ns={response['eval_duration']}", file=sys.stderr)
+        if eval_duration_ns:
+            print(f"[Scribe] eval_duration_ns={eval_duration_ns}", file=sys.stderr)
+        report_path = write_run_report(
+            base_dir=report_base_dir,
+            started_at=run_started_at,
+            finished_at=datetime.now(),
+            status="success",
+            model=MODEL,
+            num_ctx=NUM_CTX,
+            journal_dir=JOURNAL_DIR,
+            active_context_source=active_context_source,
+            active_date=resolved_current_date,
+            active_file=resolved_note_path,
+            input_text=input_text,
+            prompt=prompt,
+            suggested_terms=suggested_terms,
+            ranked_terms=ranked_terms,
+            output_text=out,
+            file_nav_sync_applied=file_nav_sync_applied,
+            previous_file_nav_sync_applied=previous_file_nav_sync_applied,
+            actions=actions,
+            touched_files=touched_files,
+            error_message=None,
+            traceback_text=None,
+            ollama_sec=(t1 - t0) if t0 is not None and t1 is not None else None,
+            postprocess_sec=(t2 - t1) if t1 is not None and t2 is not None else None,
+            eval_duration_ns=eval_duration_ns,
+        )
+        if report_path is not None:
+            print(f"[Scribe] report={report_path}", file=sys.stderr)
         print(out)
         return 0
     except Exception as e:
+        actions.append(
+            {
+                "action": "Run journal linker",
+                "result": "failed",
+                "target": str(resolved_note_path) if resolved_note_path else "current input",
+            }
+        )
+        report_path = write_run_report(
+            base_dir=report_base_dir,
+            started_at=run_started_at,
+            finished_at=datetime.now(),
+            status="error",
+            model=MODEL,
+            num_ctx=NUM_CTX,
+            journal_dir=JOURNAL_DIR,
+            active_context_source=active_context_source,
+            active_date=resolved_current_date,
+            active_file=resolved_note_path,
+            input_text=input_text,
+            prompt=prompt,
+            suggested_terms=suggested_terms,
+            ranked_terms=ranked_terms,
+            output_text=out,
+            file_nav_sync_applied=file_nav_sync_applied,
+            previous_file_nav_sync_applied=previous_file_nav_sync_applied,
+            actions=actions,
+            touched_files=touched_files,
+            error_message=str(e),
+            traceback_text=traceback.format_exc(),
+            ollama_sec=(t1 - t0) if t0 is not None and t1 is not None else None,
+            postprocess_sec=(t2 - t1) if t1 is not None and t2 is not None else None,
+            eval_duration_ns=eval_duration_ns,
+        )
+        if report_path is not None:
+            print(f"[Scribe] report={report_path}", file=sys.stderr)
         print(f"Error: {e}", file=sys.stderr)
         return 1
 
