@@ -12,5 +12,11 @@ env/
 # macOS
 .DS_Store
 
+# Local config and secrets
+.env
+
+# Personal learning data
+scribe_learning.json
+
 # Local run outputs
 scribe_diag.txt

@@ -19,7 +19,7 @@ It is designed for a clipboard workflow (for example, macOS Shortcuts keybind):
 Create or update `.env` in this directory:
 
 ```bash
-SCRIBE_JOURNAL_DIR="/Users/tjm4/Documents/TJ's Think Tank/much thinks"
+SCRIBE_JOURNAL_DIR="/path/to/your/journal"
 ```
 
 `Scribe.py` automatically reads this local `.env` file at runtime.
@@ -66,14 +66,14 @@ pbpaste | python3 Scribe.py
 With explicit journal folder:
 
 ```bash
-pbpaste | python3 Scribe.py --journal-dir "/Users/tjm4/Documents/TJ's Think Tank/much thinks"
+pbpaste | python3 Scribe.py --journal-dir "/path/to/your/journal"
 ```
 
 Optional active-entry overrides:
 
 ```bash
 pbpaste | python3 Scribe.py --active-date 2026-03-11
-pbpaste | python3 Scribe.py --active-file "/Users/tjm4/Documents/TJ's Think Tank/much thinks/2026-03-11.md"
+pbpaste | python3 Scribe.py --active-file "/path/to/your/journal/2026-03-11.md"
 ```
 
 Reset learned weights:
