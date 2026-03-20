@@ -16,6 +16,19 @@ spec.loader.exec_module(scribe)
 
 
 class TestScribeLearning(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.embedding_patcher = mock.patch.object(
+            scribe.LocalEmbeddingCache,
+            "embed_many",
+            side_effect=lambda texts, max_chars=None: [None for _ in texts],
+        )
+        cls.embedding_patcher.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.embedding_patcher.stop()
+
     def test_find_latest_modified_journal_note_selects_newest_valid_date_file(self):
         with tempfile.TemporaryDirectory() as d:
             journal_dir = Path(d) / "journal"
@@ -212,6 +225,30 @@ class TestScribeLearning(unittest.TestCase):
             current_date="2026-03-10",
         )
         self.assertEqual(ranked[0].lower(), "call dad tonight")
+
+    def test_rank_link_candidates_uses_embedding_similarity_when_words_are_equally_plain(self):
+        original = "I felt calm by the ocean and the music helped me settle."
+        terms = ["music", "ocean"]
+        learning = {"term_weights": {}, "term_memory": {}, "runs": {}}
+
+        class FakeEmbedder:
+            dirty = False
+
+            def embed_many(self, texts, max_chars=None):
+                vectors = []
+                for text in texts:
+                    lowered = text.lower()
+                    if lowered.startswith("ocean"):
+                        vectors.append([1.0, 0.0])
+                    elif lowered.startswith("music"):
+                        vectors.append([0.0, 1.0])
+                    else:
+                        vectors.append([1.0, 0.0])
+                return vectors
+
+        ranked = scribe.rank_link_candidates(original, terms, learning, max_links=2, embedder=FakeEmbedder())
+
+        self.assertEqual(ranked[0].lower(), "ocean")
 
     def test_burst_boosts_recently_active_topics(self):
         original = "# Daily Log - 2026-03-05\nI need to handle walk and laundry."

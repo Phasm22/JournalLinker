@@ -12,6 +12,8 @@ from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from local_embeddings import LocalEmbeddingCache, cosine_similarity as embedding_cosine_similarity, normalize_embedding_text
+
 
 def load_local_env(path: Path) -> None:
     if not path.exists():
@@ -279,22 +281,25 @@ NAV_LINKS_PATTERN = re.compile(r"\[\[[^\]]+\|Yesterday\]\]\s*\|\s*\[\[[^\]]+\|To
 
 def load_memory_store(path: Path) -> dict:
     if not path.exists():
-        return {"term_weights": {}, "runs": {}, "term_memory": {}}
+        return {"term_weights": {}, "runs": {}, "term_memory": {}, "embedding_cache": {}}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
-        return {"term_weights": {}, "runs": {}, "term_memory": {}}
+        return {"term_weights": {}, "runs": {}, "term_memory": {}, "embedding_cache": {}}
     if not isinstance(data, dict):
-        return {"term_weights": {}, "runs": {}, "term_memory": {}}
+        return {"term_weights": {}, "runs": {}, "term_memory": {}, "embedding_cache": {}}
     data.setdefault("term_weights", {})
     data.setdefault("runs", {})
     data.setdefault("term_memory", {})
+    data.setdefault("embedding_cache", {})
     if not isinstance(data["term_weights"], dict):
         data["term_weights"] = {}
     if not isinstance(data["runs"], dict):
         data["runs"] = {}
     if not isinstance(data["term_memory"], dict):
         data["term_memory"] = {}
+    if not isinstance(data["embedding_cache"], dict):
+        data["embedding_cache"] = {}
     return data
 
 
@@ -1028,11 +1033,11 @@ def rank_link_candidates(
     max_links: int = 45,
     current_date: str | None = None,
     journal_dir: str | None = None,
+    embedder: LocalEmbeddingCache | None = None,
 ) -> list[str]:
-    scored: list[tuple[float, int, int, int, str]] = []
-    seen: set[str] = set()
     weights = learning.get("term_weights", {})
     term_memory = learning.get("term_memory", {})
+    embedder = embedder or LocalEmbeddingCache(learning)
     parsed_current_date = current_date or parse_journal_date(original)
     reference_date = parsed_current_date or today_date_str()
     recent_topic_activity = collect_recent_topic_activity(
@@ -1041,6 +1046,37 @@ def rank_link_candidates(
         lookback_days=BURST_LOOKBACK_DAYS,
     )
 
+    seen: set[str] = set()
+    normalized_terms: list[str] = []
+    semantic_inputs: list[str] = []
+    for raw in terms:
+        if not isinstance(raw, str):
+            continue
+        term = normalize_term(raw)
+        if len(term) < 3:
+            continue
+
+        key = term.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized_terms.append(term)
+        candidate_context = extract_candidate_context(original, term)
+        semantic_basis = term if not candidate_context else f"{term} {candidate_context}"
+        semantic_inputs.append(normalize_embedding_text(semantic_basis, max_chars=240))
+
+    embedding_scores: dict[str, float] = {}
+    if semantic_inputs:
+        vectors = embedder.embed_many([normalize_embedding_text(original, max_chars=1400)] + semantic_inputs, max_chars=1400)
+        source_vector = vectors[0] if vectors else None
+        for term, vector in zip(normalized_terms, vectors[1:]):
+            if not source_vector or not vector:
+                continue
+            key = term.lower()
+            embedding_scores[key] = max(0.0, embedding_cosine_similarity(source_vector, vector))
+
+    scored: list[tuple[float, int, int, int, str]] = []
+    seen.clear()
     for idx, raw in enumerate(terms):
         if not isinstance(raw, str):
             continue
@@ -1084,6 +1120,7 @@ def rank_link_candidates(
             score += usage * 4.0
             score += recency * 8.0
             score += semantic * 10.0
+            score += embedding_scores.get(key, 0.0) * 7.0
 
         # Keep some influence from the model's original ordering.
         score += max(0.0, 8.0 - (idx * 0.15))

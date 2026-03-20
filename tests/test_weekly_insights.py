@@ -80,6 +80,19 @@ tags: [journal, reflection]
 
 
 class TestWeeklyInsights(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.embedding_patcher = mock.patch.object(
+            weekly_insights.LocalEmbeddingCache,
+            "embed_many",
+            side_effect=lambda texts, max_chars=None: [None for _ in texts],
+        )
+        cls.embedding_patcher.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.embedding_patcher.stop()
+
     def write_learning(self, path: Path) -> None:
         payload = {
             "term_weights": {},
@@ -172,6 +185,74 @@ class TestWeeklyInsights(unittest.TestCase):
             self.assertEqual(signals["entries_found"], 2)
             self.assertEqual(signals["substantive_entries"], 0)
             self.assertEqual(signals["total_words"], 0)
+
+    def test_embedding_signal_identifies_the_semantic_anchor_entries(self):
+        with tempfile.TemporaryDirectory() as d:
+            journal_dir = Path(d) / "journal"
+            journal_dir.mkdir()
+            rest_day = """
+---
+tags: [journal]
+---
+
+# Daily Log - 2026-03-03
+
+[[2026-03-02|Yesterday]] | [[2026-03-04|Tomorrow]]
+
+I wanted quiet and rest today, and I kept noticing how much better the day felt when I stopped forcing effort.
+There was still some work pressure in the background, but the strongest pull was toward slow, quiet time.
+That made the whole day feel softer and easier to hold.
+""".strip()
+            work_day = """
+---
+tags: [journal]
+---
+
+# Daily Log - 2026-03-05
+
+[[2026-03-04|Yesterday]] | [[2026-03-06|Tomorrow]]
+
+Work felt heavy and the effort kept piling up throughout the day, especially when I tried to keep pace.
+I noticed pressure more than momentum, and that tension made it hard to settle into anything for long.
+The whole thing felt like carrying too much at once.
+""".strip()
+            (journal_dir / "2026-03-03.md").write_text(rest_day, encoding="utf-8")
+            (journal_dir / "2026-03-05.md").write_text(work_day, encoding="utf-8")
+            learning_file = Path(d) / "scribe_learning.json"
+            self.write_learning(learning_file)
+
+            class FakeEmbedder:
+                dirty = False
+
+                def embed_many(self, texts, max_chars=None):
+                    vectors = []
+                    for text in texts:
+                        lowered = text.lower()
+                        if "quiet" in lowered or "rest" in lowered:
+                            vectors.append([1.0, 0.0])
+                        elif "work" in lowered or "pressure" in lowered:
+                            vectors.append([0.7, 0.3])
+                        else:
+                            vectors.append([0.0, 1.0])
+                    return vectors
+
+            entries = weekly_insights.collect_weekly_entries(
+                journal_dir=journal_dir,
+                week_start=weekly_insights.date(2026, 3, 2),
+                week_end=weekly_insights.date(2026, 3, 8),
+            )
+            signals = weekly_insights.build_weekly_reflection_signals(
+                entries,
+                weekly_insights.load_memory_store(learning_file),
+                "2026-W10",
+                weekly_insights.date(2026, 3, 2),
+                weekly_insights.date(2026, 3, 8),
+                embedder=FakeEmbedder(),
+            )
+
+            self.assertGreater(signals["semantic_cohesion"], 0)
+            self.assertTrue(signals["semantic_anchor_entries"])
+            self.assertEqual(signals["semantic_anchor_entries"][0]["date"], "2026-03-03")
 
     def test_writes_calm_weekly_arc_for_high_signal_week(self):
         with tempfile.TemporaryDirectory() as d:

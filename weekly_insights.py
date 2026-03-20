@@ -6,6 +6,8 @@ from collections import Counter
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+from local_embeddings import LocalEmbeddingCache, average_vector, cosine_similarity as embedding_cosine_similarity, normalize_embedding_text
+
 try:
     import ollama
 except Exception:  # pragma: no cover - import availability depends on local runtime
@@ -134,23 +136,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def load_memory_store(path: Path) -> dict:
     if not path.exists():
-        return {"term_weights": {}, "runs": {}, "term_memory": {}}
+        return {"term_weights": {}, "runs": {}, "term_memory": {}, "embedding_cache": {}}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
-        return {"term_weights": {}, "runs": {}, "term_memory": {}}
+        return {"term_weights": {}, "runs": {}, "term_memory": {}, "embedding_cache": {}}
     if not isinstance(data, dict):
-        return {"term_weights": {}, "runs": {}, "term_memory": {}}
+        return {"term_weights": {}, "runs": {}, "term_memory": {}, "embedding_cache": {}}
     data.setdefault("term_weights", {})
     data.setdefault("runs", {})
     data.setdefault("term_memory", {})
+    data.setdefault("embedding_cache", {})
     if not isinstance(data["term_weights"], dict):
         data["term_weights"] = {}
     if not isinstance(data["runs"], dict):
         data["runs"] = {}
     if not isinstance(data["term_memory"], dict):
         data["term_memory"] = {}
+    if not isinstance(data["embedding_cache"], dict):
+        data["embedding_cache"] = {}
     return data
+
+
+def save_memory_store(path: Path, data: dict) -> None:
+    path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
 
 
 def parse_iso_date(date_str: str | None) -> date | None:
@@ -312,10 +321,12 @@ def build_weekly_reflection_signals(
     week_label: str,
     week_start: date,
     week_end: date,
+    embedder: LocalEmbeddingCache | None = None,
 ) -> dict:
     substantive_entries = [entry for entry in entries if entry["is_substantive"]]
     substantive_texts = [entry["cleaned_text"] for entry in substantive_entries if entry["cleaned_text"]]
     total_words = sum(entry["word_count"] for entry in substantive_entries)
+    embedder = embedder or LocalEmbeddingCache(memory_store)
 
     keyword_presence: Counter[str] = Counter()
     for entry in substantive_entries:
@@ -330,13 +341,39 @@ def build_weekly_reflection_signals(
     repeated_phrases = extract_repeated_phrases(substantive_texts)
     repeated_memory_terms = collect_memory_term_hits(substantive_entries, memory_store)
 
+    semantic_anchor_entries: list[dict] = []
+    semantic_cohesion = 0.0
+    semantic_inputs = [normalize_embedding_text(entry["cleaned_text"], max_chars=1200) for entry in substantive_entries]
+    if semantic_inputs:
+        vectors = embedder.embed_many(semantic_inputs, max_chars=1200)
+        centroid = average_vector(vectors)
+        if centroid is not None:
+            scored_entries: list[tuple[float, dict]] = []
+            for entry, vector in zip(substantive_entries, vectors):
+                if not vector:
+                    continue
+                similarity = max(0.0, embedding_cosine_similarity(vector, centroid))
+                scored_entries.append((similarity, entry))
+            if scored_entries:
+                scored_entries.sort(key=lambda item: (-item[0], item[1]["date"]))
+                semantic_cohesion = round(sum(score for score, _ in scored_entries) / len(scored_entries), 2)
+                semantic_anchor_entries = [
+                    {
+                        "date": entry["date"],
+                        "similarity": round(score, 2),
+                        "excerpt": build_entry_excerpt(entry["cleaned_text"]),
+                    }
+                    for score, entry in scored_entries[:3]
+                ]
+
     confidence = (
         min(1.0, len(substantive_entries) / 3.0) * 0.40
         + min(1.0, total_words / 220.0) * 0.25
         + min(1.0, len(repeated_keywords) / 3.0) * 0.20
         + min(1.0, len(repeated_memory_terms) / 2.0) * 0.15
+        + min(1.0, semantic_cohesion) * 0.15
     )
-    confidence = round(confidence, 2)
+    confidence = round(min(1.0, confidence), 2)
 
     return {
         "week_label": week_label,
@@ -349,6 +386,8 @@ def build_weekly_reflection_signals(
         "repeated_keywords": repeated_keywords,
         "repeated_phrases": repeated_phrases,
         "repeated_memory_terms": repeated_memory_terms,
+        "semantic_cohesion": semantic_cohesion,
+        "semantic_anchor_entries": semantic_anchor_entries,
         "entries": [
             {
                 "date": entry["date"],
@@ -474,9 +513,12 @@ def generate_weekly_insight(
     journal_path = Path(journal_dir)
     memory_store_path = Path(learning_file)
     memory_store = load_memory_store(memory_store_path)
+    embedder = LocalEmbeddingCache(memory_store)
 
     entries = collect_weekly_entries(journal_path, week_start, week_end)
-    signals = build_weekly_reflection_signals(entries, memory_store, week_label, week_start, week_end)
+    signals = build_weekly_reflection_signals(entries, memory_store, week_label, week_start, week_end, embedder=embedder)
+    if embedder.dirty:
+        save_memory_store(memory_store_path, memory_store)
 
     stats: dict[str, int | float | str | bool] = {
         "entries_found": signals["entries_found"],
