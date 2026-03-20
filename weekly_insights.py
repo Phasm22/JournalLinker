@@ -199,7 +199,6 @@ def strip_yaml_frontmatter(text: str) -> str:
 def clean_daily_journal_text(text: str) -> str:
     normalized = text.replace("\r\n", "\n").replace("\r", "\n")
     normalized = strip_yaml_frontmatter(normalized)
-    normalized = re.split(r"\n---\s*\n##\s+Portability Export\b", normalized, maxsplit=1)[0]
     normalized = re.split(r"\n##\s+Daily Questions\b", normalized, maxsplit=1)[0]
     normalized = re.sub(r"^#\s+Daily Log\s+-\s+\d{4}-\d{2}-\d{2}\s*$", "", normalized, flags=re.MULTILINE)
     normalized = re.sub(

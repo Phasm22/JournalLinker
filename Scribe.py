@@ -1209,17 +1209,8 @@ def insert_ranked_wikilinks(
         journal_dir=journal_dir,
     )
     frontmatter, body = split_frontmatter(original)
-
-    marker = "\n## Portability Export"
-    portability = ""
-    if marker in body:
-        main_body, portability_tail = body.split(marker, 1)
-        portability = marker + portability_tail
-    else:
-        main_body = body
-
-    linked_main = insert_wikilinks_by_paragraph(main_body, ranked_terms)
-    return frontmatter + linked_main + portability, ranked_terms
+    linked_body = insert_wikilinks_by_paragraph(body, ranked_terms)
+    return frontmatter + linked_body, ranked_terms
 
 
 def main() -> int:

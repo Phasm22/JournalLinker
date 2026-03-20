@@ -33,10 +33,6 @@ The tension around effort and being seen at work was there in the background the
 
 ## Daily Questions
 - Last night, after work, I...
-
----
-## Portability Export
-I felt wrung out by [[work]] again but my [[stomach]] was loud.
 """.strip()
 
 SUBSTANTIVE_DAY_TWO = """
@@ -53,10 +49,6 @@ My stomach was better, but I still mostly wanted rest and a little more room to 
 
 ## Daily Questions
 - Last night, after work, I...
-
----
-## Portability Export
-[[work]] [[effort]] [[rest]]
 """.strip()
 
 TEMPLATE_ONLY_DAY = """
@@ -73,9 +65,6 @@ tags: [journal, reflection]
 
 ## Daily Questions
 - Last night, after work, I...
-
----
-## Portability Export
 """.strip()
 
 
@@ -133,11 +122,10 @@ class TestWeeklyInsights(unittest.TestCase):
         self.assertNotIn("2026-03-05", terms)
         self.assertNotIn("today", terms)
 
-    def test_clean_daily_journal_text_strips_template_and_export_sections(self):
+    def test_clean_daily_journal_text_strips_template_sections(self):
         cleaned = weekly_insights.clean_daily_journal_text(SUBSTANTIVE_DAY_ONE)
         self.assertIn("I felt wrung out by work again", cleaned)
         self.assertNotIn("Daily Questions", cleaned)
-        self.assertNotIn("Portability Export", cleaned)
         self.assertNotIn("[[work]]", cleaned)
         self.assertNotIn("Yesterday", cleaned)
 
@@ -289,7 +277,6 @@ The whole thing felt like carrying too much at once.
             self.assertIn("## Weekly Arc", content)
             self.assertIn("physical discomfort and the wish to slow down", content)
             self.assertNotIn("Top Active Topics", content)
-            self.assertNotIn("Portability Export", content)
             self.assertFalse(stats["skipped"])
             self.assertGreaterEqual(float(stats["confidence"]), 0.45)
 
