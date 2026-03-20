@@ -128,6 +128,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--journal-dir", default=os.getenv("SCRIBE_JOURNAL_DIR"))
     parser.add_argument("--learning-file", default=str(DEFAULT_MEMORY_STORE_FILE))
     parser.add_argument("--week", help="ISO week label in the form YYYY-Www (example: 2026-W10)")
+    parser.add_argument("--update-vault-map", action="store_true", help="Run vault_mapper after generating the weekly insight.")
     return parser.parse_args(argv)
 
 
@@ -521,6 +522,9 @@ def generate_weekly_insight(
 
 
 def main() -> int:
+    import subprocess
+    import sys
+
     args = parse_args()
 
     if not args.journal_dir:
@@ -546,16 +550,23 @@ def main() -> int:
             f"substantive_entries={stats['substantive_entries']} "
             f"confidence={float(stats['confidence']):.2f}"
         )
-        return 0
+    else:
+        print(
+            "[weekly_insights] "
+            f"wrote={output_path} "
+            f"week={stats['week_label']} "
+            f"entries={stats['entries_found']} "
+            f"substantive_entries={stats['substantive_entries']} "
+            f"confidence={float(stats['confidence']):.2f}"
+        )
 
-    print(
-        "[weekly_insights] "
-        f"wrote={output_path} "
-        f"week={stats['week_label']} "
-        f"entries={stats['entries_found']} "
-        f"substantive_entries={stats['substantive_entries']} "
-        f"confidence={float(stats['confidence']):.2f}"
-    )
+    if args.update_vault_map:
+        vault_mapper = Path(__file__).with_name("vault_mapper.py")
+        subprocess.run(
+            [sys.executable, str(vault_mapper), "--journal-dir", args.journal_dir, "--learning-file", args.learning_file],
+            check=False,
+        )
+
     return 0
 
 
