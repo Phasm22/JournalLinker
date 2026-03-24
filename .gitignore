@@ -1,22 +1,14 @@
-# Python caches/artifacts
-__pycache__/
-*.py[cod]
-*$py.class
-
-# Virtual environments
-ScribeVenv/
-.venv/
-venv/
-env/
-
-# macOS
-.DS_Store
-
-# Local config and secrets
+# Secrets and local config
 .env
 
-# Personal learning data
+# Python
+ScribeVenv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Personal learning store (remove this line if you want it in git)
 scribe_learning.json
 
-# Local run outputs
-scribe_diag.txt
+# OS / editor
+.DS_Store

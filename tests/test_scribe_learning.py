@@ -59,16 +59,38 @@ class TestScribeLearning(unittest.TestCase):
             os.utime(note1, (1000, 1000))
             os.utime(note2, (2000, 2000))
 
-            current_date, note_path, note_text, source = scribe.resolve_current_journal_context(
-                input_text="Body only input",
-                journal_dir=str(journal_dir),
-            )
+            with mock.patch.object(scribe, "today_date_str", return_value="2026-03-10"):
+                current_date, note_path, note_text, source = scribe.resolve_current_journal_context(
+                    input_text="Body only input",
+                    journal_dir=str(journal_dir),
+                )
             self.assertEqual(source, "latest_modified_file")
             self.assertEqual(current_date, "2026-03-06")
             self.assertEqual(note_path, note2)
             self.assertIn("2026-03-06", note_text or "")
 
-    def test_find_previous_existing_journal_date_returns_latest_before_current(self):
+    def test_resolve_current_journal_context_prefers_todays_file_over_newer_mtime(self):
+        with tempfile.TemporaryDirectory() as d:
+            journal_dir = Path(d) / "journal"
+            journal_dir.mkdir()
+            older_day = journal_dir / "2026-03-21.md"
+            today_note = journal_dir / "2026-03-23.md"
+            older_day.write_text("# Daily Log - 2026-03-21\n\nRecently edited.\n", encoding="utf-8")
+            today_note.write_text("# Daily Log - 2026-03-23\n\nToday stub.\n", encoding="utf-8")
+            os.utime(today_note, (1000, 1000))
+            os.utime(older_day, (9000, 9000))
+
+            with mock.patch.object(scribe, "today_date_str", return_value="2026-03-23"):
+                current_date, note_path, note_text, source = scribe.resolve_current_journal_context(
+                    input_text="Body only input",
+                    journal_dir=str(journal_dir),
+                )
+            self.assertEqual(source, "calendar_today_file")
+            self.assertEqual(current_date, "2026-03-23")
+            self.assertEqual(note_path, today_note)
+            self.assertIn("2026-03-23", note_text or "")
+
+    def test_find_previous_existing_journal_date_is_latest_substantive_before_current(self):
         with tempfile.TemporaryDirectory() as d:
             journal_dir = Path(d) / "journal"
             journal_dir.mkdir()
@@ -77,6 +99,38 @@ class TestScribeLearning(unittest.TestCase):
             (journal_dir / "2026-03-11.md").write_text("c", encoding="utf-8")
             got = scribe.find_previous_existing_journal_date(str(journal_dir), "2026-03-11")
             self.assertEqual(got, "2026-03-06")
+
+    def test_find_previous_existing_journal_date_skips_empty_stubs_in_gap(self):
+        with tempfile.TemporaryDirectory() as d:
+            journal_dir = Path(d) / "journal"
+            journal_dir.mkdir()
+            (journal_dir / "2026-03-08.md").write_text(
+                "# Daily Log - 2026-03-08\n\nReal prior entry.\n", encoding="utf-8"
+            )
+            (journal_dir / "2026-03-09.md").write_text("", encoding="utf-8")
+            (journal_dir / "2026-03-10.md").write_text("2026-03-10\n", encoding="utf-8")
+            got = scribe.find_previous_existing_journal_date(str(journal_dir), "2026-03-11")
+            self.assertEqual(got, "2026-03-08")
+
+    def test_sync_daily_navigation_links_skips_empty_neighbors_for_nav(self):
+        with tempfile.TemporaryDirectory() as d:
+            journal_dir = Path(d) / "journal"
+            journal_dir.mkdir()
+            (journal_dir / "2026-03-05.md").write_text(
+                "# Daily Log - 2026-03-05\n\nHas body.\n", encoding="utf-8"
+            )
+            (journal_dir / "2026-03-06.md").write_text("2026-03-06\n", encoding="utf-8")
+            (journal_dir / "2026-03-08.md").write_text("", encoding="utf-8")
+            (journal_dir / "2026-03-09.md").write_text(
+                "# Daily Log - 2026-03-09\n\nHas body.\n", encoding="utf-8"
+            )
+            text = (
+                "# Daily Log - 2026-03-07\n\n"
+                "[[2026-03-01|Yesterday]] | [[2026-03-31|Tomorrow]]\n\n"
+                "Body"
+            )
+            synced = scribe.sync_daily_navigation_links(text, str(journal_dir))
+            self.assertIn("[[2026-03-05|Yesterday]] | [[2026-03-09|Tomorrow]]", synced)
 
     def test_load_local_env_sets_missing_values(self):
         with tempfile.TemporaryDirectory() as d:
@@ -128,6 +182,16 @@ class TestScribeLearning(unittest.TestCase):
         cleaned = scribe.strip_html_if_needed(raw)
         self.assertEqual(cleaned, "Hello world\nLine 2")
 
+    def test_get_input_text_empty_pipe_does_not_read_clipboard(self):
+        fake_stdin = io.StringIO("")
+        with (
+            mock.patch.object(scribe.sys, "stdin", fake_stdin),
+            mock.patch.object(scribe, "get_clipboard_text", side_effect=AssertionError("clipboard")),
+        ):
+            got, origin = scribe.get_input_text([])
+        self.assertEqual(got, "")
+        self.assertEqual(origin, "stdin_pipe_empty")
+
     def test_parse_journal_date_from_heading(self):
         text = "# Daily Log - 2026-03-04\n"
         self.assertEqual(scribe.parse_journal_date(text), "2026-03-04")
@@ -138,6 +202,58 @@ class TestScribeLearning(unittest.TestCase):
         self.assertIn("dad", got)
         self.assertIn("project", got)
         self.assertIn("walk", got)
+
+    def test_insert_ranked_skips_markdown_fenced_code(self):
+        original = (
+            "walk and coffee.\n\n"
+            "```bash\ncp walk.log out.log\n```\n\n"
+            "another walk.\n"
+        )
+        learning = {"term_weights": {}, "term_memory": {}, "runs": {}}
+        terms = ["walk", "cp", "coffee", "log"]
+        out, _ = scribe.insert_ranked_wikilinks(original, terms, learning, max_links=10)
+        self.assertNotIn("[[cp]]", out)
+        self.assertNotIn("[[log]]", out)
+        self.assertIn("[[walk]]", out)
+        self.assertIn("[[coffee]]", out)
+
+    def test_insert_ranked_skips_shell_transcript_paragraph(self):
+        original = (
+            "I took a walk today.\n\n"
+            "# setup\ncp /Users/me/x.plist ~/Library/LaunchAgents/com.foo.plist\n"
+            "launchctl bootstrap gui/501 ~/Library/LaunchAgents/com.foo.plist\n"
+        )
+        learning = {"term_weights": {}, "term_memory": {}, "runs": {}}
+        terms = ["walk", "plist", "cp", "setup", "bootstrap"]
+        out, _ = scribe.insert_ranked_wikilinks(original, terms, learning, max_links=10)
+        self.assertIn("[[walk]]", out)
+        self.assertNotIn("[[plist]]", out)
+        self.assertNotIn("[[cp]]", out)
+        self.assertNotIn("[[bootstrap]]", out)
+
+    def test_insert_ranked_skips_single_line_just_command(self):
+        original = 'just launchagent-journal "/Users/me/Documents/TJ\'s Think Tank/vault"\n'
+        learning = {"term_weights": {}, "term_memory": {}, "runs": {}}
+        terms = ["launchagent", "journal", "Think Tank", "Documents", "vault"]
+        out, _ = scribe.insert_ranked_wikilinks(original, terms, learning, max_links=10)
+        self.assertEqual(out.strip(), original.strip())
+        self.assertNotIn("[[", out)
+
+    def test_insert_ranked_skips_readlink_and_logs_path_hints(self):
+        original = "readlink ~/Library/Logs/JournalLinker/scribe-latest.log\n"
+        learning = {"term_weights": {}, "term_memory": {}, "runs": {}}
+        terms = ["JournalLinker", "scribe-latest", "log", "Library", "Logs"]
+        out, _ = scribe.insert_ranked_wikilinks(original, terms, learning, max_links=10)
+        self.assertEqual(out.strip(), original.strip())
+        self.assertNotIn("[[", out)
+
+    def test_insert_ranked_skips_tail_readlink_one_liner(self):
+        original = 'tail -40 "$(readlink "$HOME/Library/Logs/JournalLinker/scribe-latest.log")"\n'
+        learning = {"term_weights": {}, "term_memory": {}, "runs": {}}
+        terms = ["readlink", "tail", "JournalLinker", "HOME", "Library"]
+        out, _ = scribe.insert_ranked_wikilinks(original, terms, learning, max_links=10)
+        self.assertNotIn("[[JournalLinker]]", out)
+        self.assertNotIn("[[readlink]]", out)
 
     def test_yesterday_learning_applies_positive_and_negative_weights(self):
         fixtures = Path(__file__).resolve().parent / "fixtures"
@@ -287,12 +403,16 @@ class TestScribeLearning(unittest.TestCase):
             )
         self.assertEqual(ranked[0].lower(), "laundry")
 
-    def test_sync_daily_navigation_links_uses_adjacent_existing_notes(self):
+    def test_sync_daily_navigation_links_uses_substantive_neighbors(self):
         with tempfile.TemporaryDirectory() as d:
             journal_dir = Path(d) / "journal"
             journal_dir.mkdir()
-            (journal_dir / "2026-03-05.md").write_text("# Daily Log - 2026-03-05\n", encoding="utf-8")
-            (journal_dir / "2026-03-09.md").write_text("# Daily Log - 2026-03-09\n", encoding="utf-8")
+            (journal_dir / "2026-03-05.md").write_text(
+                "# Daily Log - 2026-03-05\n\nEarlier note body.\n", encoding="utf-8"
+            )
+            (journal_dir / "2026-03-09.md").write_text(
+                "# Daily Log - 2026-03-09\n\nLater note body.\n", encoding="utf-8"
+            )
             text = (
                 "# Daily Log - 2026-03-07\n\n"
                 "[[2026-03-06|Yesterday]] | [[2026-03-08|Tomorrow]]\n\n"
@@ -317,8 +437,12 @@ class TestScribeLearning(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             journal_dir = Path(d) / "journal"
             journal_dir.mkdir()
-            (journal_dir / "2026-03-05.md").write_text("# Daily Log - 2026-03-05\n", encoding="utf-8")
-            (journal_dir / "2026-03-09.md").write_text("# Daily Log - 2026-03-09\n", encoding="utf-8")
+            (journal_dir / "2026-03-05.md").write_text(
+                "# Daily Log - 2026-03-05\n\nEarlier note body.\n", encoding="utf-8"
+            )
+            (journal_dir / "2026-03-09.md").write_text(
+                "# Daily Log - 2026-03-09\n\nLater note body.\n", encoding="utf-8"
+            )
             active = journal_dir / "2026-03-07.md"
             active.write_text(
                 "# Daily Log - 2026-03-07\n\n[[2026-01-01|Yesterday]] | [[2026-01-02|Tomorrow]]\n\nBody",
@@ -341,30 +465,26 @@ class TestScribeLearning(unittest.TestCase):
             self.assertIn("[[2026-03-05|Yesterday]] | [[2026-03-09|Tomorrow]]", content)
             self.assertEqual(content.count("|Tomorrow]]"), 1)
 
-    def test_previous_existing_note_tomorrow_points_to_latest_note(self):
+    def test_sync_yesterday_file_when_running_on_today_updates_calendar_tomorrow(self):
         with tempfile.TemporaryDirectory() as d:
             journal_dir = Path(d) / "journal"
             journal_dir.mkdir()
-            previous = journal_dir / "2026-03-06.md"
-            latest = journal_dir / "2026-03-11.md"
-            previous.write_text(
-                "# Daily Log - 2026-03-06\n\n[[2026-03-04|Yesterday]] | [[2026-03-07|Tomorrow]]\n",
-                encoding="utf-8",
-            )
-            latest.write_text(
-                "# Daily Log - 2026-03-11\n\n[[2026-03-10|Yesterday]] | [[2026-03-12|Tomorrow]]\n",
+            yesterday = journal_dir / "2026-03-10.md"
+            yesterday.write_text(
+                "# Daily Log - 2026-03-10\n\n[[2026-03-09|Yesterday]] | [[2026-03-12|Tomorrow]]\n\n"
+                "Entry body.\n",
                 encoding="utf-8",
             )
             previous_date = scribe.find_previous_existing_journal_date(str(journal_dir), "2026-03-11")
-            self.assertEqual(previous_date, "2026-03-06")
+            self.assertEqual(previous_date, "2026-03-10")
             changed = scribe.sync_navigation_links_in_file(
-                note_path=previous,
+                note_path=yesterday,
                 journal_dir=str(journal_dir),
                 current_date=previous_date,
             )
             self.assertTrue(changed)
-            updated = previous.read_text(encoding="utf-8")
-            self.assertIn("[[2026-03-11|Tomorrow]]", updated)
+            updated = yesterday.read_text(encoding="utf-8")
+            self.assertIn("[[2026-03-09|Yesterday]] | [[2026-03-11|Tomorrow]]", updated)
 
     def test_apply_previous_day_feedback_uses_current_date_override(self):
         with tempfile.TemporaryDirectory() as d:
@@ -469,6 +589,77 @@ class TestScribeLearning(unittest.TestCase):
             history = history_path.read_text(encoding="utf-8")
             self.assertLess(history.find("2026-03-17 10:00:00"), history.find("2026-03-17 09:00:00"))
 
+    def test_main_uses_resolved_journal_note_when_input_and_clipboard_empty(self):
+        with tempfile.TemporaryDirectory() as d:
+            journal_dir = Path(d) / "journal"
+            journal_dir.mkdir()
+            note_path = journal_dir / "2026-03-10.md"
+            note_path.write_text(
+                "# Daily Log - 2026-03-10\n\nI called Mom.\n",
+                encoding="utf-8",
+            )
+            learning_path = Path(d) / "scribe_learning.json"
+            model_response = {
+                "message": {"content": '{"links":["Mom"]}'},
+                "eval_duration": 1,
+            }
+
+            with (
+                mock.patch.object(
+                    scribe,
+                    "parse_cli",
+                    return_value=("test-model", 2048, str(journal_dir), False, None, None, []),
+                ),
+                mock.patch.object(scribe, "today_date_str", return_value="2026-03-10"),
+                mock.patch.object(scribe, "get_input_text", return_value=("", "stdin_pipe_empty")),
+                mock.patch.object(scribe, "get_clipboard_text", return_value=""),
+                mock.patch.object(scribe, "MEMORY_STORE_FILE", learning_path),
+                mock.patch.object(scribe.ollama, "chat", return_value=model_response),
+                mock.patch("sys.stdout", new_callable=io.StringIO) as stdout,
+                mock.patch("sys.stderr", new_callable=io.StringIO),
+            ):
+                exit_code = scribe.main()
+
+            self.assertEqual(exit_code, 0)
+            self.assertIn("[[Mom]]", stdout.getvalue())
+
+    def test_main_prefers_journal_file_over_clipboard_on_tty(self):
+        with tempfile.TemporaryDirectory() as d:
+            journal_dir = Path(d) / "journal"
+            journal_dir.mkdir()
+            note_path = journal_dir / "2026-03-10.md"
+            note_path.write_text(
+                "# Daily Log - 2026-03-10\n\nI called Mom.\n",
+                encoding="utf-8",
+            )
+            learning_path = Path(d) / "scribe_learning.json"
+            model_response = {
+                "message": {"content": '{"links":["Mom","tail","readlink"]}'},
+                "eval_duration": 1,
+            }
+            junk = "=== log ===\ntail -40\nreadlink ~/Library/Logs\n"
+
+            with (
+                mock.patch.object(
+                    scribe,
+                    "parse_cli",
+                    return_value=("test-model", 2048, str(journal_dir), False, None, None, []),
+                ),
+                mock.patch.object(scribe, "today_date_str", return_value="2026-03-10"),
+                mock.patch.object(scribe, "get_input_text", return_value=(junk, "clipboard")),
+                mock.patch.object(scribe, "MEMORY_STORE_FILE", learning_path),
+                mock.patch.object(scribe.ollama, "chat", return_value=model_response),
+                mock.patch("sys.stdout", new_callable=io.StringIO) as stdout,
+                mock.patch("sys.stderr", new_callable=io.StringIO),
+            ):
+                exit_code = scribe.main()
+
+            self.assertEqual(exit_code, 0)
+            out = stdout.getvalue()
+            self.assertIn("[[Mom]]", out)
+            self.assertNotIn("[[tail]]", out)
+            self.assertNotIn("[[readlink]]", out)
+
     def test_main_writes_success_report_in_journal_linker_folder(self):
         with tempfile.TemporaryDirectory() as d:
             journal_dir = Path(d) / "journal"
@@ -493,7 +684,7 @@ class TestScribeLearning(unittest.TestCase):
                 mock.patch.object(
                     scribe,
                     "get_input_text",
-                    return_value=note_path.read_text(encoding="utf-8"),
+                    return_value=(note_path.read_text(encoding="utf-8"), "stdin"),
                 ),
                 mock.patch.object(scribe, "MEMORY_STORE_FILE", learning_path),
                 mock.patch.object(scribe.ollama, "chat", return_value=model_response),
@@ -536,7 +727,7 @@ class TestScribeLearning(unittest.TestCase):
                 mock.patch.object(
                     scribe,
                     "get_input_text",
-                    return_value=note_path.read_text(encoding="utf-8"),
+                    return_value=(note_path.read_text(encoding="utf-8"), "stdin"),
                 ),
                 mock.patch.object(scribe, "MEMORY_STORE_FILE", learning_path),
                 mock.patch.object(scribe.ollama, "chat", side_effect=RuntimeError("boom")),

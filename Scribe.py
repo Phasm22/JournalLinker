@@ -37,26 +37,24 @@ def load_local_env(path: Path) -> None:
         os.environ[key] = value
 
 
-def get_input_text(remaining_args: list[str]) -> str:
-    """Get journal entry text from argv, stdin, or clipboard.
+def get_input_text(remaining_args: list[str]) -> tuple[str, str]:
+    """Return (text, origin) for how input was obtained.
 
-    Priority:
-    1) argv: `python Scribe.py "..."`
-    2) piped stdin: `pbpaste | python Scribe.py`
-    3) interactive run: fallback to clipboard (macOS)
+    origin is one of: argv, stdin, stdin_pipe_empty, clipboard.
 
-    Important: never block waiting on stdin when run interactively.
+    Empty stdin pipe does not read clipboard here — main() may use the journal file
+    or clipboard after resolve_current_journal_context.
     """
     if remaining_args:
-        return " ".join(remaining_args).strip("\n")
+        return " ".join(remaining_args).strip("\n"), "argv"
 
-    # If stdin is being piped, read it. If we're on a TTY, do NOT block.
     if not sys.stdin.isatty():
-        data = sys.stdin.read()
-        return data.strip("\n")
+        data = sys.stdin.read().strip("\n")
+        if data.strip():
+            return data, "stdin"
+        return "", "stdin_pipe_empty"
 
-    # Interactive invocation: pull from clipboard so `python Scribe.py` just works.
-    return get_clipboard_text()
+    return get_clipboard_text(), "clipboard"
 
 
 def parse_cli() -> tuple[str, int, str | None, bool, str | None, str | None, list[str]]:
@@ -360,6 +358,38 @@ def read_file_text(path: Path) -> str | None:
         return None
 
 
+def journal_note_has_substantive_body(raw_text: str | None, iso_date: str) -> bool:
+    """True if the daily note has real body text (skip empty / date-only stubs for nav)."""
+    if raw_text is None:
+        return False
+    text = raw_text.strip()
+    if not text:
+        return False
+    collapsed = " ".join(text.split())
+    if collapsed == iso_date:
+        return False
+    if re.fullmatch(rf"#\s*Daily Log\s*-\s*{re.escape(iso_date)}", collapsed):
+        return False
+
+    _, body = split_frontmatter(text)
+    work = body.strip()
+    work = re.sub(rf"(?m)^#\s*Daily Log\s*-\s*{re.escape(iso_date)}\s*$", "", work)
+    work = NAV_LINKS_PATTERN.sub("", work)
+    work = work.strip()
+    kept: list[str] = []
+    for line in work.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if s == iso_date:
+            continue
+        if re.fullmatch(rf"#\s*Daily Log\s*-\s*{re.escape(iso_date)}", s):
+            continue
+        kept.append(s)
+    work = "\n".join(kept).strip()
+    return bool(work)
+
+
 def count_wikilink_markers(text: str) -> int:
     return text.count("[[")
 
@@ -640,6 +670,13 @@ def resolve_current_journal_context(
                 note_text = read_file_text(candidate)
         return input_date, note_path, note_text, "input_date"
 
+    # Prefer today's calendar note if the file exists (avoids "wrong day" when an older note was edited last).
+    today = today_date_str()
+    if journal_dir and parse_iso_date(today):
+        today_path = Path(journal_dir) / f"{today}.md"
+        if today_path.is_file():
+            return today, today_path, read_file_text(today_path), "calendar_today_file"
+
     latest_note = find_latest_modified_journal_note(journal_dir)
     if latest_note:
         current_date = extract_date_from_journal_filename(latest_note)
@@ -653,6 +690,10 @@ def find_adjacent_journal_dates(
     journal_dir: str | None,
     current_date: str,
 ) -> tuple[str, str] | None:
+    """Yesterday / Tomorrow target the nearest substantive daily notes, not empty stubs.
+
+    If there is no substantive neighbor on a side, falls back to calendar ± 1 day.
+    """
     current_dt = parse_iso_date(current_date)
     if not journal_dir or not current_dt:
         return None
@@ -666,8 +707,12 @@ def find_adjacent_journal_dates(
         match = re.fullmatch(r"(\d{4}-\d{2}-\d{2})\.md", note_path.name)
         if not match:
             continue
-        note_dt = parse_iso_date(match.group(1))
+        note_date_str = match.group(1)
+        note_dt = parse_iso_date(note_date_str)
         if not note_dt:
+            continue
+        note_text = read_file_text(note_path)
+        if not journal_note_has_substantive_body(note_text, note_date_str):
             continue
         if note_dt < current_dt and (previous_dt is None or note_dt > previous_dt):
             previous_dt = note_dt
@@ -683,6 +728,7 @@ def find_previous_existing_journal_date(
     journal_dir: str | None,
     current_date: str,
 ) -> str | None:
+    """Latest substantive daily note strictly before current_date (for nav sync on gap days)."""
     current_dt = parse_iso_date(current_date)
     if not journal_dir or not current_dt:
         return None
@@ -695,8 +741,12 @@ def find_previous_existing_journal_date(
         match = re.fullmatch(r"(\d{4}-\d{2}-\d{2})\.md", note_path.name)
         if not match:
             continue
-        note_dt = parse_iso_date(match.group(1))
+        note_date_str = match.group(1)
+        note_dt = parse_iso_date(note_date_str)
         if not note_dt or note_dt >= current_dt:
+            continue
+        note_text = read_file_text(note_path)
+        if not journal_note_has_substantive_body(note_text, note_date_str):
             continue
         if previous_dt is None or note_dt > previous_dt:
             previous_dt = note_dt
@@ -1137,14 +1187,112 @@ def is_boundary_ok(text: str, s: int, e: int) -> bool:
     return left_ok and right_ok
 
 
-def iter_unlinked_ranges(text: str):
-    last = 0
+_MD_FENCE_OPEN = re.compile(r"^\s*```[\w.-]*\s*$")
+_MD_FENCE_CLOSE = re.compile(r"^\s*```\s*$")
+
+
+def _merge_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    if not intervals:
+        return []
+    intervals = sorted(intervals)
+    out: list[tuple[int, int]] = [intervals[0]]
+    for s, e in intervals[1:]:
+        ps, pe = out[-1]
+        if s <= pe:
+            out[-1] = (ps, max(pe, e))
+        else:
+            out.append((s, e))
+    return out
+
+
+def markdown_fenced_code_spans(text: str) -> list[tuple[int, int]]:
+    """Character ranges inside ``` fenced blocks (opening/closing lines included)."""
+    spans: list[tuple[int, int]] = []
+    pos = 0
+    n = len(text)
+    while pos < n:
+        nl = text.find("\n", pos)
+        line_end = nl if nl != -1 else n
+        line = text[pos:line_end]
+        if _MD_FENCE_OPEN.match(line):
+            fence_start = pos
+            pos = (nl + 1) if nl != -1 else n
+            while pos < n:
+                nl2 = text.find("\n", pos)
+                line_end2 = nl2 if nl2 != -1 else n
+                line2 = text[pos:line_end2]
+                if _MD_FENCE_CLOSE.match(line2):
+                    span_end = (nl2 + 1) if nl2 != -1 else line_end2
+                    spans.append((fence_start, span_end))
+                    pos = span_end
+                    break
+                pos = (nl2 + 1) if nl2 != -1 else n
+            else:
+                spans.append((fence_start, n))
+            continue
+        pos = (nl + 1) if nl != -1 else n
+    return spans
+
+
+def iter_wikilink_candidate_ranges(text: str):
+    """Ranges where new wikilinks may appear: outside existing [[ ]] and fenced ``` blocks."""
+    excluded: list[tuple[int, int]] = []
     for m in re.finditer(r"\[\[.*?\]\]", text, flags=re.DOTALL):
-        if m.start() > last:
-            yield last, m.start()
-        last = m.end()
+        excluded.append((m.start(), m.end()))
+    excluded.extend(markdown_fenced_code_spans(text))
+    excluded = _merge_intervals(excluded)
+    last = 0
+    for s, e in excluded:
+        if s > last:
+            yield last, s
+        last = max(last, e)
     if last < len(text):
         yield last, len(text)
+
+
+def paragraph_looks_like_shell_or_transcript(block: str) -> bool:
+    """Heuristic: pasted terminal / launchd recipes — do not add wikilinks here."""
+    if not block.strip():
+        return False
+    if re.search(r"~/Library/LaunchAgents", block):
+        return True
+    if re.search(r"~/Library/Logs/", block) and re.search(
+        r"\b(readlink|tail|head|ls|cat|open|ln)\s",
+        block,
+        re.I,
+    ):
+        return True
+    if re.search(
+        r"launchctl\s+(bootstrap|kickstart|bootout|load|unload|print|list)\b",
+        block,
+        re.I,
+    ):
+        return True
+    # Common CLI verbs at line start (macOS / homebrew workflows)
+    _cli_verb = (
+        r"^\s*(cp|mv|chmod|mkdir|launchctl|grep|egrep|fgrep|cat|tail|head|ls|sudo|brew|"
+        r"plutil|python3|readlink|ln|rm|open|xattr|dirname|basename|which)\s"
+    )
+    lines = [ln for ln in block.splitlines() if ln.strip()]
+    if len(lines) == 1:
+        ln = lines[0]
+        if re.match(r"^\s*just\s+", ln, re.I):
+            return True
+        if re.match(_cli_verb, ln, re.I):
+            return True
+    if len(lines) < 2:
+        return False
+    score = 0
+    for ln in lines:
+        if re.match(r"^\s*(%|\$\s+)", ln):
+            score += 2
+        elif re.match(_cli_verb, ln, re.I):
+            score += 1
+        elif re.search(r"@\S+:\s*~", ln):
+            score += 2
+        elif re.search(r"/Users/\S+.*\.(plist|sh)\b", ln):
+            score += 1
+    return score >= 2
 
 
 def find_unlinked_span(text: str, term: str) -> tuple[int, int] | None:
@@ -1153,7 +1301,7 @@ def find_unlinked_span(text: str, term: str) -> tuple[int, int] | None:
         re.compile(re.escape(term), flags=re.IGNORECASE),
     ]
     for pattern in patterns:
-        for start, end in iter_unlinked_ranges(text):
+        for start, end in iter_wikilink_candidate_ranges(text):
             segment = text[start:end]
             for m in pattern.finditer(segment):
                 s, e = start + m.start(), start + m.end()
@@ -1182,6 +1330,8 @@ def insert_wikilinks_by_paragraph(text: str, ranked_terms: list[str]) -> str:
     for term in ranked_terms:
         for i, chunk in enumerate(chunks):
             if re.fullmatch(r"\n\s*\n", chunk):
+                continue
+            if paragraph_looks_like_shell_or_transcript(chunk):
                 continue
             span = find_unlinked_span(chunk, term)
             if not span:
@@ -1216,12 +1366,12 @@ def insert_ranked_wikilinks(
 def main() -> int:
     run_started_at = datetime.now()
     MODEL, NUM_CTX, JOURNAL_DIR, RESET_LEARNING, ACTIVE_DATE, ACTIVE_FILE, remaining_args = parse_cli()
-    input_text = get_input_text(remaining_args)
+    input_text, input_origin = get_input_text(remaining_args)
     input_text = strip_html_if_needed(input_text)
     (
         resolved_current_date,
         resolved_note_path,
-        _resolved_note_text,
+        resolved_note_text,
         active_context_source,
     ) = resolve_current_journal_context(
         input_text=input_text,
@@ -1229,6 +1379,17 @@ def main() -> int:
         active_date_override=ACTIVE_DATE,
         active_file_override=ACTIVE_FILE,
     )
+    # launchd / empty pipe / TTY often leave clipboard = terminal junk; prefer disk note.
+    input_body_source = input_origin
+    if input_origin in ("stdin_pipe_empty", "clipboard") and resolved_note_text is not None:
+        input_text = strip_html_if_needed(resolved_note_text)
+        input_body_source = f"{input_origin}->journal_file"
+    elif not input_text.strip() and resolved_note_text and resolved_note_text.strip():
+        input_text = strip_html_if_needed(resolved_note_text)
+        input_body_source = f"{input_origin}->journal_file"
+    elif not input_text.strip() and input_origin == "stdin_pipe_empty":
+        input_text = strip_html_if_needed(get_clipboard_text())
+        input_body_source = "stdin_pipe_empty->clipboard"
     report_base_dir = derive_report_base_dir(JOURNAL_DIR, resolved_note_path)
 
     has_embedded_date = parse_journal_date(input_text) is not None
@@ -1290,7 +1451,8 @@ def main() -> int:
 
     if not input_text.strip():
         error_message = (
-            "Error: No input provided. Pipe text in (pbpaste | python Scribe.py) or pass as an argument."
+            "Error: No input provided. Use stdin, a CLI argument, clipboard, or SCRIBE_JOURNAL_DIR "
+            "(latest YYYY-MM-DD.md / --active-date / --active-file)."
         )
         actions.append(
             {
@@ -1434,6 +1596,7 @@ def main() -> int:
         )
         print(
             f"[Scribe] active_context_source={active_context_source} "
+            f"input_body_source={input_body_source} "
             f"active_date={resolved_current_date or 'unset'} "
             f"active_file={str(resolved_note_path) if resolved_note_path else 'unset'} "
             f"file_nav_sync_applied={file_nav_sync_applied} "

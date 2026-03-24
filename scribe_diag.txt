@@ -1,0 +1,2 @@
+[Scribe] input_chars=552 prompt_chars=1124 ollama_sec=63.8 postprocess_sec=0.001
+[Scribe] eval_duration_ns=59069815448

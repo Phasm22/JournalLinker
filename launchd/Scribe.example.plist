@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>SCRIBE_CTX</key>
+		<string>8192</string>
+		<key>SCRIBE_JOURNAL_DIR</key>
+		<string>REPLACE_WITH_YOUR_JOURNAL_PATH</string>
+		<key>SCRIBE_MODEL</key>
+		<string>llama3.1:8b</string>
+	</dict>
+	<key>Label</key>
+	<string>com.journal-linker.scribe</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>/Users/tjm4/journalLinker/scripts/scheduled_run.sh</string>
+	</array>
+	<key>StandardErrorPath</key>
+	<string>/tmp/scribe.launchd.wrapper.err.log</string>
+	<key>StandardOutPath</key>
+	<string>/tmp/scribe.launchd.wrapper.out.log</string>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key>
+		<integer>3</integer>
+		<key>Minute</key>
+		<integer>17</integer>
+	</dict>
+	<key>WorkingDirectory</key>
+	<string>/Users/tjm4/journalLinker</string>
+</dict>
+</plist>
