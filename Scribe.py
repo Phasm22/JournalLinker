@@ -57,7 +57,7 @@ def get_input_text(remaining_args: list[str]) -> tuple[str, str]:
     return get_clipboard_text(), "clipboard"
 
 
-def parse_cli() -> tuple[str, int, str | None, bool, str | None, str | None, list[str]]:
+def parse_cli() -> tuple[str, int, str | None, bool, str | None, str | None, bool, list[str]]:
     load_local_env(Path(__file__).with_name(".env"))
 
     model = "llama3.1:8b"
@@ -66,6 +66,7 @@ def parse_cli() -> tuple[str, int, str | None, bool, str | None, str | None, lis
     reset_learning = False
     active_date: str | None = None
     active_file: str | None = None
+    write_back = False
     env_model = os.getenv("SCRIBE_MODEL")
     env_ctx = os.getenv("SCRIBE_CTX")
 
@@ -120,6 +121,9 @@ def parse_cli() -> tuple[str, int, str | None, bool, str | None, str | None, lis
         elif arg == "--reset-learning":
             reset_learning = True
             i += 1
+        elif arg == "--write-back":
+            write_back = True
+            i += 1
         elif arg == "--active-date":
             if i + 1 < len(args):
                 active_date = args[i + 1]
@@ -140,7 +144,7 @@ def parse_cli() -> tuple[str, int, str | None, bool, str | None, str | None, lis
             remaining_args.append(arg)
             i += 1
 
-    return model, num_ctx, journal_dir, reset_learning, active_date, active_file, remaining_args
+    return model, num_ctx, journal_dir, reset_learning, active_date, active_file, write_back, remaining_args
 
 
 def get_clipboard_text() -> str:
@@ -1365,7 +1369,7 @@ def insert_ranked_wikilinks(
 
 def main() -> int:
     run_started_at = datetime.now()
-    MODEL, NUM_CTX, JOURNAL_DIR, RESET_LEARNING, ACTIVE_DATE, ACTIVE_FILE, remaining_args = parse_cli()
+    MODEL, NUM_CTX, JOURNAL_DIR, RESET_LEARNING, ACTIVE_DATE, ACTIVE_FILE, WRITE_BACK, remaining_args = parse_cli()
     input_text, input_origin = get_input_text(remaining_args)
     input_text = strip_html_if_needed(input_text)
     (
@@ -1633,6 +1637,15 @@ def main() -> int:
         )
         if report_path is not None:
             print(f"[Scribe] report={report_path}", file=sys.stderr)
+
+        if WRITE_BACK and resolved_note_path is not None and "journal_file" in input_body_source:
+            try:
+                resolved_note_path.write_text(out, encoding="utf-8")
+                touched_files.append(resolved_note_path)
+                print(f"[Scribe] write_back={resolved_note_path}", file=sys.stderr)
+            except Exception as wb_err:
+                print(f"[Scribe] write_back failed: {wb_err}", file=sys.stderr)
+
         print(out)
         return 0
     except Exception as e:
