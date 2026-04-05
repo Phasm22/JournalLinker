@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>SCRIBE_JOURNAL_DIR</key>
+		<string>REPLACE_WITH_YOUR_JOURNAL_PATH</string>
+		<key>SCRIBE_WHISPER_MODEL</key>
+		<string>base.en</string>
+		<!-- Optional: override the VoiceDrop folder if you use a different iCloud path -->
+		<!-- <key>SCRIBE_VOICEDROP_DIR</key> -->
+		<!-- <string>/Users/YOURNAME/Library/Mobile Documents/com~apple~CloudDocs/VoiceDrop</string> -->
+	</dict>
+	<key>Label</key>
+	<string>com.journal-linker.voice</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>REPLACE_WITH_REPO_PATH/scripts/voice_watcher.sh</string>
+	</array>
+	<!-- WatchPaths fires when any file appears or changes in the VoiceDrop folder.
+	     launchd wakes the job within seconds of iCloud syncing a new recording. -->
+	<key>WatchPaths</key>
+	<array>
+		<string>/Users/REPLACE_WITH_USERNAME/Library/Mobile Documents/com~apple~CloudDocs/VoiceDrop</string>
+	</array>
+	<key>StandardErrorPath</key>
+	<string>/tmp/voice-watcher.launchd.wrapper.err.log</string>
+	<key>StandardOutPath</key>
+	<string>/tmp/voice-watcher.launchd.wrapper.out.log</string>
+	<key>WorkingDirectory</key>
+	<string>REPLACE_WITH_REPO_PATH</string>
+</dict>
+</plist>

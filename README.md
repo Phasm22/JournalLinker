@@ -66,6 +66,47 @@ Full CLI flags and env vars: [TECHNICAL.md](./TECHNICAL.md).
 - **Logs:** `~/Library/Logs/JournalLinker/` — per-run files `scribe-YYYYMMDD-HHMMSS-<pid>.log`, symlink `scribe-latest.log`. Only one `scribe-job` at a time (`.scribe-job.lock`); a second start exits quietly. Stale lock after a crash: `rmdir ~/Library/Logs/JournalLinker/.scribe-job.lock`. Tail the resolved file: `tail "$(readlink "$HOME/Library/Logs/JournalLinker/scribe-latest.log")"`.
 - **LaunchAgent wrapper logs** (stdout/stderr from the plist’s wrapper): `/tmp/scribe.launchd.wrapper.*.log` as in the example plist.
 
+## Voice pipeline (iPhone → journal)
+
+Record on your iPhone; the Mac transcribes and appends to the day's note automatically.
+
+**Quick start:**
+1. Build the iOS Shortcut: **[docs/ios-setup.md](./docs/ios-setup.md)** — 3 actions, one-time setup.
+2. Install faster-whisper: `just voice-install`
+3. Install the LaunchAgent: copy `launchd/VoiceWatch.example.plist`, fill in your paths, load it.
+4. Check everything: `just voice-doctor`
+
+**How it works:** Each recording (`YYYY-MM-DD-HHmm.m4a`) saved to an iCloud Drive `VoiceDrop/` folder is picked up by a launchd `WatchPaths` agent. `scripts/process_voice.py` reads `scribe_learning.json`, ranks your known wikilink terms by success × recency, passes them as Whisper's `initial_prompt` (vocabulary bias), transcribes the audio, appends a `> [!voice] HH:MM` callout to the daily note, then calls `Scribe.py --write-back` so the full wikilink + learning feedback loop runs on the voice entry too.
+
+**New `.env` vars for voice:**
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `SCRIBE_VOICEDROP_DIR` | `~/Library/Mobile Documents/com~apple~CloudDocs/VoiceDrop` | iCloud folder to watch |
+| `SCRIBE_WHISPER_MODEL` | `base.en` | faster-whisper model (`base.en`, `small.en`, `medium.en`) |
+| `SCRIBE_NIGHT_CUTOFF` | `4` | Hour (0–23) before which a recording is attributed to the previous day |
+
+**New `just` recipes:**
+
+| Command | Meaning |
+|---------|---------|
+| `just voice-install` | `pip install faster-whisper` into the venv |
+| `just voice FILE` | Process a single `.m4a` file |
+| `just voice-dry FILE` | Dry-run: transcribe + print callout, no writes |
+| `just voice-scan` | Process all pending files in VoiceDrop |
+| `just voice-doctor` | Check faster-whisper, VoiceDrop dir, pending count, LaunchAgent |
+
+**Voice pipeline on your Mac:**
+
+1. Copy the plist: `cp launchd/VoiceWatch.example.plist ~/Library/LaunchAgents/com.journal-linker.voice.plist`
+2. Edit it — replace `REPLACE_WITH_YOUR_JOURNAL_PATH` and `REPLACE_WITH_REPO_PATH` / `REPLACE_WITH_USERNAME`.
+3. Load it: `launchctl load ~/Library/LaunchAgents/com.journal-linker.voice.plist`
+4. Verify: `launchctl list | grep journal-linker.voice`
+5. Logs: `~/Library/Logs/JournalLinker/voice-*.log`, symlink `voice-latest.log`.
+6. Stale lock after crash: `rmdir ~/Library/Logs/JournalLinker/.voice-job.lock`
+
+---
+
 ## Repo layout (high level)
 
 | Path | Role |
@@ -73,6 +114,9 @@ Full CLI flags and env vars: [TECHNICAL.md](./TECHNICAL.md).
 | `Scribe.py` | Main wikilink pipeline |
 | `weekly_insights.py` | Weekly note generator |
 | `archivist.py` | Separate Ollama + clipboard utility (shared env pattern) |
+| `scripts/process_voice.py` | Voice-to-journal bridge (faster-whisper + Scribe handoff) |
+| `scripts/voice_watcher.sh` | launchd wrapper for voice processing |
+| `docs/ios-setup.md` | iOS Shortcut build instructions |
 | `scribe_learning.json` | Local learning store (often gitignored — see `.gitignore`) |
 | `tests/` | Pytest; Ollama mocked |
 

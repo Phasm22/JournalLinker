@@ -554,9 +554,14 @@ def write_run_report(
     report_dir = base_dir / RUN_REPORTS_DIRNAME
     report_dir.mkdir(parents=True, exist_ok=True)
 
-    started_stamp = started_at.strftime("%Y-%m-%d %H-%M-%S")
-    report_name = f"Journal Linker Run - {started_stamp}.md"
+    # Keep only one "last run" file; purge old timestamped reports.
+    report_name = "Journal Linker Run - Latest.md"
     report_path = report_dir / report_name
+    for old in report_dir.glob("Journal Linker Run - 20??-??-?? ??-??-??.md"):
+        try:
+            old.unlink()
+        except Exception:
+            pass
     history_path = report_dir / RUN_HISTORY_FILENAME
 
     report_body = build_run_report_markdown(
