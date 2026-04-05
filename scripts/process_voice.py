@@ -219,7 +219,7 @@ def _wrap_callout(time_str: str, transcript: str) -> str:
     header = f"> [!voice] {time_str}"
     lines = textwrap.wrap(transcript.strip(), width=76) or ["(empty transcript)"]
     body = "\n".join(f"> {line}" for line in lines)
-    return f"\n{header}\n{body}\n"
+    return f"\n\n{header}\n{body}\n"
 
 
 def append_voice_block(
@@ -374,6 +374,7 @@ def parse_cli() -> argparse.Namespace:
         help="Hour (0-23) before which recordings are attributed to the previous day (default: 4)",
     )
     parser.add_argument("--dry-run", action="store_true", help="Transcribe and print; do not write or mark processed")
+    parser.add_argument("--force", "-f", action="store_true", help="Re-process files even if already marked .processed")
     parser.add_argument("--verbose", "-v", action="store_true", help="Print transcript preview and prompt details")
     return parser.parse_args()
 
@@ -414,6 +415,11 @@ def main() -> int:
         if not audio_path.exists():
             print(f"[voice] file not found: {audio_path}", file=sys.stderr)
             return 1
+        if is_processed(audio_path) and not args.force:
+            print(f"[voice] already processed: {audio_path.name} (use --force to re-run)", file=sys.stderr)
+            return 0
+        if args.force and is_processed(audio_path):
+            print(f"[voice] --force: re-processing {audio_path.name}", file=sys.stderr)
         success = process_file(
             audio_path,
             journal_dir=journal_dir,
@@ -439,8 +445,10 @@ def main() -> int:
         f for ext in ("*.m4a", "*.wav", "*.mp4", "*.aac")
         for f in drop_dir.glob(ext)
     )
-    pending = [f for f in candidates if not is_processed(f)]
-    print(f"[voice] found {len(pending)} unprocessed of {len(candidates)} recordings in {drop_dir}", file=sys.stderr)
+    pending = [f for f in candidates if args.force or not is_processed(f)]
+    skipped = len(candidates) - len(pending)
+    print(f"[voice] found {len(pending)} to process of {len(candidates)} recordings in {drop_dir}"
+          + (f" ({skipped} skipped — use --force to re-run)" if skipped else ""), file=sys.stderr)
 
     if not pending:
         return 0
