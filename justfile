@@ -49,6 +49,14 @@ voice FILE:
 voice-dry FILE:
     "{{py}}" "{{root}}/scripts/process_voice.py" --dry-run --verbose "{{FILE}}"
 
+# Force re-process a single recording even if already marked .processed
+voice-reprocess FILE:
+    "{{py}}" "{{root}}/scripts/process_voice.py" --force "{{FILE}}"
+
+# Force re-process ALL recordings in VoiceDrop (ignores .processed markers)
+voice-reprocess-all:
+    "{{py}}" "{{root}}/scripts/process_voice.py" --force
+
 # Scan VoiceDrop folder and process all unprocessed recordings
 voice-scan:
     "{{py}}" "{{root}}/scripts/process_voice.py"
