@@ -36,6 +36,7 @@ WHISPER_PROMPT_MAX_CHARS = 800  # ~200 tokens; Whisper decoder prefix limit is 2
 DEFAULT_WHISPER_MODEL = "base.en"
 DEFAULT_NIGHT_CUTOFF = 4
 PROCESSED_SUFFIX = ".processed"
+FAILED_SUFFIX = ".failed"
 VOICEDROP_DEFAULT = (
     Path.home() / "Library" / "Mobile Documents" / "com~apple~CloudDocs" / "VoiceDrop"
 )
@@ -280,8 +281,20 @@ def is_processed(audio_path: Path) -> bool:
     return audio_path.with_suffix(audio_path.suffix + PROCESSED_SUFFIX).exists()
 
 
+def is_failed(audio_path: Path) -> bool:
+    return audio_path.with_suffix(audio_path.suffix + FAILED_SUFFIX).exists()
+
+
 def mark_processed(audio_path: Path) -> None:
+    failed = audio_path.with_suffix(audio_path.suffix + FAILED_SUFFIX)
+    if failed.exists():
+        failed.unlink()
     audio_path.with_suffix(audio_path.suffix + PROCESSED_SUFFIX).touch()
+
+
+def mark_failed(audio_path: Path, reason: str = "") -> None:
+    marker = audio_path.with_suffix(audio_path.suffix + FAILED_SUFFIX)
+    marker.write_text(reason or "unknown error", encoding="utf-8")
 
 
 def is_fully_synced(audio_path: Path) -> bool:
@@ -331,7 +344,14 @@ def process_file(
     if verbose and whisper_prompt:
         print(f"[voice] whisper prompt ({len(whisper_prompt)} chars): {whisper_prompt[:120]}…", file=sys.stderr)
 
-    transcript, duration, language = transcribe_audio(audio_path, model, whisper_prompt)
+    try:
+        transcript, duration, language = transcribe_audio(audio_path, model, whisper_prompt)
+    except Exception as exc:
+        print(f"[voice] transcription failed for {audio_path.name}: {exc}", file=sys.stderr)
+        if not dry_run:
+            mark_failed(audio_path, f"transcription error: {exc}")
+        return False
+
     print(
         f"[voice] transcribed {duration:.1f}s audio [{language}]: {len(transcript.split())} words",
         file=sys.stderr,
@@ -342,7 +362,7 @@ def process_file(
     if not transcript.strip():
         print(f"[voice] empty transcript, skipping {audio_path.name}", file=sys.stderr)
         if not dry_run:
-            mark_processed(audio_path)
+            mark_failed(audio_path, "empty transcript")
         return False
 
     append_voice_block(journal_dir, date_str, time_str, transcript, dry_run=dry_run)
@@ -350,12 +370,15 @@ def process_file(
     scribe_exit = run_scribe(python_bin, scribe_py, date_str, dry_run=dry_run)
     if scribe_exit != 0:
         print(f"[voice] Scribe exited {scribe_exit} for {audio_path.name}", file=sys.stderr)
+        if not dry_run:
+            mark_failed(audio_path, f"Scribe exit code {scribe_exit}")
+        return False
 
     if not dry_run:
         mark_processed(audio_path)
         print(f"[voice] marked processed: {audio_path.name}", file=sys.stderr)
 
-    return scribe_exit == 0
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -467,7 +490,12 @@ def main() -> int:
         f for ext in ("*.m4a", "*.wav", "*.mp4", "*.aac")
         for f in drop_dir.glob(ext)
     )
-    pending = [f for f in candidates if args.force or not is_processed(f)]
+    pending = [f for f in candidates if args.force or (not is_processed(f) and not is_failed(f))]
+    if not args.force:
+        failed_files = [f for f in candidates if is_failed(f)]
+        if failed_files:
+            print(f"[voice] {len(failed_files)} file(s) in failed state (use --force to retry): "
+                  + ", ".join(f.name for f in failed_files), file=sys.stderr)
     # Drop iCloud placeholders — WatchPaths fires before the file downloads
     synced = [f for f in pending if is_fully_synced(f)]
     waiting = [f for f in pending if not is_fully_synced(f)]

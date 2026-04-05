@@ -70,7 +70,7 @@ voice-doctor:
     @printf '%s\n' "Journal Linker — Voice Pipeline"
     @bash -c '"{{py}}" -c "import faster_whisper; print(\"  faster-whisper: OK (\" + faster_whisper.__version__ + \")\")" 2>/dev/null || echo "  faster-whisper: NOT INSTALLED  →  run: just voice-install"'
     @bash -c 'VOICEDROP="${SCRIBE_VOICEDROP_DIR:-$HOME/Library/Mobile Documents/com~apple~CloudDocs/VoiceDrop}"; [[ -d "$VOICEDROP" ]] && echo "  VoiceDrop dir:  $VOICEDROP" || echo "  VoiceDrop dir:  NOT FOUND — create in Files app or mkdir -p \"$VOICEDROP\""'
-    @bash -c 'VOICEDROP="${SCRIBE_VOICEDROP_DIR:-$HOME/Library/Mobile Documents/com~apple~CloudDocs/VoiceDrop}"; TOTAL=$(ls "$VOICEDROP"/*.m4a 2>/dev/null | wc -l | tr -d " "); DONE=$(ls "$VOICEDROP"/*.processed 2>/dev/null | wc -l | tr -d " "); PENDING=$((TOTAL - DONE)); echo "  Recordings:     $TOTAL total, $PENDING pending"' 2>/dev/null || true
+    @bash -c 'VOICEDROP="${SCRIBE_VOICEDROP_DIR:-$HOME/Library/Mobile Documents/com~apple~CloudDocs/VoiceDrop}"; TOTAL=$(ls "$VOICEDROP"/*.m4a 2>/dev/null | wc -l | tr -d " "); DONE=$(ls "$VOICEDROP"/*.m4a.processed 2>/dev/null | wc -l | tr -d " "); FAIL=$(ls "$VOICEDROP"/*.m4a.failed 2>/dev/null | wc -l | tr -d " "); PENDING=$((TOTAL - DONE - FAIL)); echo "  Recordings:     $TOTAL total  ✓ $DONE processed  ✗ $FAIL failed  ⧖ $PENDING pending"' 2>/dev/null || true
     @bash -c 'launchctl list 2>/dev/null | grep -q journal-linker.voice && echo "  LaunchAgent:    com.journal-linker.voice loaded" || echo "  LaunchAgent:    com.journal-linker.voice NOT loaded (see launchd/VoiceWatch.example.plist)"'
     @printf '%s\n' \
       "" \
