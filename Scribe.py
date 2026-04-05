@@ -278,7 +278,7 @@ STOPWORDS = {
     "with",
     "you",
 }
-NAV_LINKS_PATTERN = re.compile(r"\[\[[^\]]+\|Yesterday\]\]\s*\|\s*\[\[[^\]]+\|Tomorrow\]\]")
+NAV_LINKS_PATTERN = re.compile(r"\[\[[^\]]+\|(?:←\s*)?Yesterday\]\]\s*\|\s*\[\[[^\]]+\|Tomorrow(?:\s*→)?\]\]")
 
 
 def load_memory_store(path: Path) -> dict:
@@ -372,23 +372,40 @@ def journal_note_has_substantive_body(raw_text: str | None, iso_date: str) -> bo
     collapsed = " ".join(text.split())
     if collapsed == iso_date:
         return False
-    if re.fullmatch(rf"#\s*Daily Log\s*-\s*{re.escape(iso_date)}", collapsed):
+    if re.fullmatch(rf"#\s*Daily Log\s*[—–-]\s*{re.escape(iso_date)}", collapsed):
         return False
 
     _, body = split_frontmatter(text)
     work = body.strip()
-    work = re.sub(rf"(?m)^#\s*Daily Log\s*-\s*{re.escape(iso_date)}\s*$", "", work)
+    work = re.sub(rf"(?m)^#\s*Daily Log\s*[—–-]\s*{re.escape(iso_date)}\s*$", "", work)
     work = NAV_LINKS_PATTERN.sub("", work)
     work = work.strip()
+    in_boilerplate_callout = False
     kept: list[str] = []
     for line in work.splitlines():
         s = line.strip()
         if not s:
+            in_boilerplate_callout = False
             continue
         if s == iso_date:
             continue
-        if re.fullmatch(rf"#\s*Daily Log\s*-\s*{re.escape(iso_date)}", s):
+        # Heading — handle both hyphen and em/en-dash variants
+        if re.fullmatch(rf"#\s*Daily Log\s*[—–-]\s*{re.escape(iso_date)}", s):
             continue
+        # Horizontal rules
+        if re.fullmatch(r"-{3,}", s):
+            continue
+        # Boilerplate section headers (## Journal, ## Daily Questions, etc.)
+        if re.fullmatch(r"#+\s*(?:Journal|Daily Questions|Questions|Prompts)\s*", s, re.IGNORECASE):
+            continue
+        # Boilerplate callout blocks (TIP/INFO/NOTE/WARNING/HINT — not [!voice])
+        if re.match(r"^>\s*\[!(TIP|INFO|NOTE|WARNING|HINT|QUESTION|ABSTRACT|SUMMARY|TODO)\b", s, re.IGNORECASE):
+            in_boilerplate_callout = True
+            continue
+        # Continuation lines of a boilerplate callout
+        if in_boilerplate_callout and s.startswith(">"):
+            continue
+        in_boilerplate_callout = False
         kept.append(s)
     work = "\n".join(kept).strip()
     return bool(work)
@@ -775,14 +792,14 @@ def apply_navigation_links_to_text(
     if not adjacent:
         return text, False
     previous_date, next_date = adjacent
-    nav_line = f"[[{previous_date}|Yesterday]] | [[{next_date}|Tomorrow]]"
+    nav_line = f"[[{previous_date}|← Yesterday]] | [[{next_date}|Tomorrow →]]"
 
     if NAV_LINKS_PATTERN.search(text):
         updated = NAV_LINKS_PATTERN.sub(nav_line, text, count=1)
         return updated, updated != text
 
     heading_match = re.search(
-        rf"(?m)^#\s*Daily Log\s*-\s*{re.escape(current_date)}\s*$",
+        rf"(?m)^#\s*Daily Log\s*[—–-]\s*{re.escape(current_date)}\s*$",
         text,
     )
     if not heading_match:

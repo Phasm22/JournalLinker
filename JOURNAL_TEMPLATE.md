@@ -16,21 +16,22 @@ let yesterday = moment(dateStr, "YYYY-MM-DD").subtract(1, "days").format("YYYY-M
 let tomorrow = moment(dateStr, "YYYY-MM-DD").add(1, "days").format("YYYY-MM-DD");
 -%>
 ---
-tags: [journal, reflection, tired, happy, energetic, annoyed]
+tags: [journal]
+mood: ""
+energy: ""
 ---
 
-# Daily Log - <% dateStr %>
+# Daily Log — <% dateStr %>
 
-[[<% yesterday %>|Yesterday]] | [[<% tomorrow %>|Tomorrow]]
+[[<% yesterday %>|← Yesterday]] | [[<% tomorrow %>|Tomorrow →]]
 
-> [!TIP] Memory Prompt
-> What is one interaction from today that felt significant? 
+---
+
+## Journal
 
 <% tp.file.cursor() %>
 
-## Daily Questions
-- Last night, after work, I...
+---
 
-- One thing I'm excited about right now is...
-
-- One thing I'm struggling with today is...
+> [!TIP] Memory Prompt
+> What is one interaction from today that felt significant?
