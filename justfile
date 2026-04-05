@@ -21,6 +21,10 @@ scribe *ARGS:
 scribe-paste *ARGS:
     @pbpaste | "{{py}}" "{{scribe}}" {{ARGS}}
 
+# Read today's note from disk, insert wikilinks, write back in-place
+scribe-writeback *ARGS:
+    @echo "" | "{{py}}" "{{scribe}}" --write-back {{ARGS}}
+
 # Same as the launchd job: logs in ~/Library/Logs/JournalLinker/
 scribe-job:
     "{{root}}/scripts/scheduled_run.sh"

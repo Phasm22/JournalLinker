@@ -52,7 +52,7 @@ ts() { date "+%Y-%m-%dT%H:%M:%S%z"; }
 
 set +e
 START_EPOCH=$(date +%s)
-"$PYTHON" "$SCRIBE_PY" 2>&1 | tee -a "$LOG_FILE"
+echo "" | "$PYTHON" "$SCRIBE_PY" --write-back 2>&1 | tee -a "$LOG_FILE"
 EXIT="${PIPESTATUS[0]}"
 END_EPOCH=$(date +%s)
 DURATION=$((END_EPOCH - START_EPOCH))
