@@ -284,6 +284,28 @@ def mark_processed(audio_path: Path) -> None:
     audio_path.with_suffix(audio_path.suffix + PROCESSED_SUFFIX).touch()
 
 
+def is_fully_synced(audio_path: Path) -> bool:
+    """Return False if the file is an iCloud placeholder not yet downloaded.
+
+    iCloud marks undownloaded files with the com.apple.icloud.itemName xattr
+    and/or a zero-byte size. The actual file appears only after download.
+    """
+    try:
+        if audio_path.stat().st_size == 0:
+            return False
+        # Check for iCloud eviction marker
+        import subprocess
+        result = subprocess.run(
+            ["xattr", "-p", "com.apple.icloud.itemName", str(audio_path)],
+            capture_output=True,
+        )
+        if result.returncode == 0:
+            return False  # placeholder — real file not downloaded yet
+    except Exception:
+        pass
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Single-file pipeline
 # ---------------------------------------------------------------------------
@@ -446,9 +468,16 @@ def main() -> int:
         for f in drop_dir.glob(ext)
     )
     pending = [f for f in candidates if args.force or not is_processed(f)]
-    skipped = len(candidates) - len(pending)
+    # Drop iCloud placeholders — WatchPaths fires before the file downloads
+    synced = [f for f in pending if is_fully_synced(f)]
+    waiting = [f for f in pending if not is_fully_synced(f)]
+    if waiting:
+        print(f"[voice] skipping {len(waiting)} file(s) still downloading from iCloud: "
+              + ", ".join(f.name for f in waiting), file=sys.stderr)
+    pending = synced
+    skipped = len(candidates) - len(pending) - len(waiting)
     print(f"[voice] found {len(pending)} to process of {len(candidates)} recordings in {drop_dir}"
-          + (f" ({skipped} skipped — use --force to re-run)" if skipped else ""), file=sys.stderr)
+          + (f" ({skipped} already processed — use --force to re-run)" if skipped else ""), file=sys.stderr)
 
     if not pending:
         return 0
