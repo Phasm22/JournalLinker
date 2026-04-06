@@ -37,6 +37,12 @@ DEFAULT_WHISPER_MODEL = "base.en"
 DEFAULT_NIGHT_CUTOFF = 4
 PROCESSED_SUFFIX = ".processed"
 FAILED_SUFFIX = ".failed"
+
+# Failure kinds written into the .failed marker file.
+# Transient = worth retrying automatically (Ollama/network down, Mac was asleep).
+# Permanent = do not auto-retry (empty transcript, corrupt audio, bad file).
+FAIL_TRANSIENT = "transient"
+FAIL_PERMANENT = "permanent"
 VOICEDROP_DEFAULT = (
     Path.home() / "Library" / "Mobile Documents" / "com~apple~CloudDocs" / "VoiceDrop"
 )
@@ -241,6 +247,12 @@ def append_voice_block(
 
     if note_path.exists():
         existing = note_path.read_text(encoding="utf-8")
+        # Guard against duplicate: skip if this exact timestamp callout already exists.
+        # Handles the case where a prior run appended the block but Scribe then failed.
+        marker = f"> [!voice] {time_str}"
+        if marker in existing:
+            print(f"[voice] voice block for {time_str} already in {note_path.name}, skipping append", file=sys.stderr)
+            return note_path
         note_path.write_text(existing.rstrip("\n") + callout, encoding="utf-8")
     else:
         note_path.write_text(f"# {date_str}\n{callout}", encoding="utf-8")
@@ -292,28 +304,61 @@ def mark_processed(audio_path: Path) -> None:
     audio_path.with_suffix(audio_path.suffix + PROCESSED_SUFFIX).touch()
 
 
-def mark_failed(audio_path: Path, reason: str = "") -> None:
+def mark_failed(audio_path: Path, reason: str = "", kind: str = FAIL_PERMANENT) -> None:
+    """Write a structured .failed marker.
+
+    kind is FAIL_TRANSIENT or FAIL_PERMANENT.  Transient failures are eligible
+    for automatic timed retry; permanent ones are not.
+    """
     marker = audio_path.with_suffix(audio_path.suffix + FAILED_SUFFIX)
-    marker.write_text(reason or "unknown error", encoding="utf-8")
+    marker.write_text(f"kind: {kind}\nreason: {reason or 'unknown error'}\n", encoding="utf-8")
+
+
+def is_transient_failed(audio_path: Path) -> bool:
+    """Return True if this file has a .failed marker with kind: transient.
+
+    Legacy markers (plain-text, no kind: prefix) are treated as transient
+    because all pre-classification failures came from the processing pipeline
+    (Ollama unavailable, Mac asleep), not from permanently bad audio.
+    """
+    marker = audio_path.with_suffix(audio_path.suffix + FAILED_SUFFIX)
+    if not marker.exists():
+        return False
+    try:
+        content = marker.read_text(encoding="utf-8")
+        for line in content.splitlines():
+            if line.strip().startswith("kind:"):
+                return line.split(":", 1)[1].strip() == FAIL_TRANSIENT
+        # Legacy format — no kind: line; assume transient.
+        return True
+    except Exception:
+        return True
 
 
 def is_fully_synced(audio_path: Path) -> bool:
     """Return False if the file is an iCloud placeholder not yet downloaded.
 
     iCloud marks undownloaded files with the com.apple.icloud.itemName xattr
-    and/or a zero-byte size. The actual file appears only after download.
+    and/or a zero-byte size. We also trigger a download via brctl so that by
+    the time this returns True, the file is locally available and not locked.
     """
     try:
         if audio_path.stat().st_size == 0:
             return False
-        # Check for iCloud eviction marker
-        import subprocess
+        # Check for iCloud eviction marker (placeholder not yet downloaded)
         result = subprocess.run(
             ["xattr", "-p", "com.apple.icloud.itemName", str(audio_path)],
             capture_output=True,
         )
         if result.returncode == 0:
-            return False  # placeholder — real file not downloaded yet
+            # Trigger download and return False — caller will retry later
+            subprocess.run(["brctl", "download", str(audio_path)], capture_output=True)
+            return False
+        # File is local: trigger brctl download to ensure no partial-write lock,
+        # then give iCloud a moment to release any write lock before we open it.
+        subprocess.run(["brctl", "download", str(audio_path)], capture_output=True)
+        import time as _time
+        _time.sleep(0.5)
     except Exception:
         pass
     return True
@@ -349,7 +394,8 @@ def process_file(
     except Exception as exc:
         print(f"[voice] transcription failed for {audio_path.name}: {exc}", file=sys.stderr)
         if not dry_run:
-            mark_failed(audio_path, f"transcription error: {exc}")
+            # Treat as transient — model load or I/O error may resolve on retry.
+            mark_failed(audio_path, f"transcription error: {exc}", kind=FAIL_TRANSIENT)
         return False
 
     print(
@@ -362,7 +408,8 @@ def process_file(
     if not transcript.strip():
         print(f"[voice] empty transcript, skipping {audio_path.name}", file=sys.stderr)
         if not dry_run:
-            mark_failed(audio_path, "empty transcript")
+            # Permanent — re-transcribing the same audio won't produce words.
+            mark_failed(audio_path, "empty transcript", kind=FAIL_PERMANENT)
         return False
 
     append_voice_block(journal_dir, date_str, time_str, transcript, dry_run=dry_run)
@@ -371,7 +418,8 @@ def process_file(
     if scribe_exit != 0:
         print(f"[voice] Scribe exited {scribe_exit} for {audio_path.name}", file=sys.stderr)
         if not dry_run:
-            mark_failed(audio_path, f"Scribe exit code {scribe_exit}")
+            # Transient — Ollama may have been unavailable (Mac asleep, model not loaded).
+            mark_failed(audio_path, f"Scribe exit code {scribe_exit}", kind=FAIL_TRANSIENT)
         return False
 
     if not dry_run:
@@ -420,6 +468,11 @@ def parse_cli() -> argparse.Namespace:
     )
     parser.add_argument("--dry-run", action="store_true", help="Transcribe and print; do not write or mark processed")
     parser.add_argument("--force", "-f", action="store_true", help="Re-process files even if already marked .processed")
+    parser.add_argument(
+        "--retry",
+        action="store_true",
+        help="Re-process files marked .failed with kind: transient (e.g. Ollama was down, Mac was asleep)",
+    )
     parser.add_argument("--verbose", "-v", action="store_true", help="Print transcript preview and prompt details")
     return parser.parse_args()
 
@@ -490,12 +543,34 @@ def main() -> int:
         f for ext in ("*.m4a", "*.wav", "*.mp4", "*.aac")
         for f in drop_dir.glob(ext)
     )
-    pending = [f for f in candidates if args.force or (not is_processed(f) and not is_failed(f))]
-    if not args.force:
+
+    if args.force:
+        pending = list(candidates)
+    elif args.retry:
+        # Only pick up transient failures; leave permanent ones alone.
+        pending = [f for f in candidates if not is_processed(f) and (
+            not is_failed(f) or is_transient_failed(f)
+        )]
+        transient_retry = [f for f in candidates if is_transient_failed(f)]
+        permanent = [f for f in candidates if is_failed(f) and not is_transient_failed(f)]
+        if transient_retry:
+            print(f"[voice] retrying {len(transient_retry)} transient-failed file(s): "
+                  + ", ".join(f.name for f in transient_retry), file=sys.stderr)
+        if permanent:
+            print(f"[voice] skipping {len(permanent)} permanently-failed file(s) (use --force to override): "
+                  + ", ".join(f.name for f in permanent), file=sys.stderr)
+    else:
+        pending = [f for f in candidates if not is_processed(f) and not is_failed(f)]
         failed_files = [f for f in candidates if is_failed(f)]
         if failed_files:
-            print(f"[voice] {len(failed_files)} file(s) in failed state (use --force to retry): "
-                  + ", ".join(f.name for f in failed_files), file=sys.stderr)
+            transient = [f for f in failed_files if is_transient_failed(f)]
+            permanent = [f for f in failed_files if not is_transient_failed(f)]
+            if transient:
+                print(f"[voice] {len(transient)} transient-failed file(s) pending retry (use --retry): "
+                      + ", ".join(f.name for f in transient), file=sys.stderr)
+            if permanent:
+                print(f"[voice] {len(permanent)} permanently-failed file(s) (use --force to override): "
+                      + ", ".join(f.name for f in permanent), file=sys.stderr)
     # Drop iCloud placeholders — WatchPaths fires before the file downloads
     synced = [f for f in pending if is_fully_synced(f)]
     waiting = [f for f in pending if not is_fully_synced(f)]

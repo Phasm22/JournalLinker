@@ -32,18 +32,15 @@ Voice entries are first-class. A recording made at 11 PM is attributed to that d
 
 ## Quick start
 
-1. Create **`.env`** in the repo root:
-
-   ```bash
+1. Create `**.env`** in the repo root:
+  ```bash
    SCRIBE_JOURNAL_DIR="/path/to/your/daily-notes-folder"
    # optional:
    # SCRIBE_MODEL="llama3.1:8b"
    # SCRIBE_CTX="8192"
    # SCRIBE_WHISPER_MODEL="base.en"
-   ```
-
-2. Daily notes must be named **`YYYY-MM-DD.md`**.
-
+  ```
+2. Daily notes must be named `**YYYY-MM-DD.md**`.
 3. Run `just` to list all recipes, or see [Commands](#commands-just) below.
 
 ---
@@ -54,27 +51,31 @@ Install [just](https://github.com/casey/just) (`brew install just`).
 
 **Scribe**
 
-| Command | Meaning |
-|---------|---------|
-| `just scribe` | Run Scribe against today's note (venv Python) |
-| `just scribe-paste` | macOS: clipboard → Scribe → stdout |
+
+| Command                 | Meaning                                                            |
+| ----------------------- | ------------------------------------------------------------------ |
+| `just scribe`           | Run Scribe against today's note (venv Python)                      |
+| `just scribe-paste`     | macOS: clipboard → Scribe → stdout                                 |
 | `just scribe-writeback` | Read today's note from disk, insert wikilinks, write back in-place |
-| `just scribe-job` | Same wrapper the launchd agent uses (timestamped logs) |
-| `just weekly` | Generate the weekly insights note |
-| `just test` | Run pytest (Ollama mocked) |
-| `just doctor` | Paths, venv, `.env`, and log locations |
+| `just scribe-job`       | Same wrapper the launchd agent uses (timestamped logs)             |
+| `just weekly`           | Generate the weekly insights note                                  |
+| `just test`             | Run pytest (Ollama mocked)                                         |
+| `just doctor`           | Paths, venv, `.env`, and log locations                             |
+
 
 **Echo (voice)**
 
-| Command | Meaning |
-|---------|---------|
-| `just voice-install` | Install faster-whisper into the venv |
-| `just voice FILE` | Process a single recording |
-| `just voice-dry FILE` | Dry-run: transcribe and print callout, no writes |
-| `just voice-scan` | Process all pending recordings in VoiceDrop |
+
+| Command                     | Meaning                                                            |
+| --------------------------- | ------------------------------------------------------------------ |
+| `just voice-install`        | Install faster-whisper into the venv                               |
+| `just voice FILE`           | Process a single recording                                         |
+| `just voice-dry FILE`       | Dry-run: transcribe and print callout, no writes                   |
+| `just voice-scan`           | Process all pending recordings in VoiceDrop                        |
 | `just voice-reprocess FILE` | Force re-process a specific file (clears `.failed` / `.processed`) |
-| `just voice-reprocess-all` | Force re-process everything in VoiceDrop |
-| `just voice-doctor` | Check faster-whisper, VoiceDrop dir, state counts, LaunchAgent |
+| `just voice-reprocess-all`  | Force re-process everything in VoiceDrop                           |
+| `just voice-doctor`         | Check faster-whisper, VoiceDrop dir, state counts, LaunchAgent     |
+
 
 ---
 
@@ -106,12 +107,14 @@ iOS setup: **[docs/ios-setup.md](./docs/ios-setup.md)**
 ## On your Mac
 
 **Nightly Scribe job** (`com.journal-linker.scribe`)
+
 - Plist: [launchd/Scribe.example.plist](./launchd/Scribe.example.plist)
 - Runs `scheduled_run.sh` on a calendar interval; passes `--write-back` so the nightly pass saves linked output back to the active note
 - Logs: `~/Library/Logs/JournalLinker/scribe-*.log`, symlink `scribe-latest.log`
 - Lock: `.scribe-job.lock` (stale after crash: `rmdir ~/Library/Logs/JournalLinker/.scribe-job.lock`)
 
 **Voice watcher** (`com.journal-linker.voice`)
+
 - Plist: [launchd/VoiceWatch.example.plist](./launchd/VoiceWatch.example.plist)
 - Install: copy plist to `~/Library/LaunchAgents/`, fill in paths, `launchctl load`
 - Uses `WatchPaths` as the trigger edge only — all logic lives in Python
@@ -123,31 +126,35 @@ iOS setup: **[docs/ios-setup.md](./docs/ios-setup.md)**
 
 ## Env vars
 
-| Variable | Default | Meaning |
-|----------|---------|---------|
-| `SCRIBE_JOURNAL_DIR` | — | Path to daily notes folder (required) |
-| `SCRIBE_MODEL` | `llama3.1:8b` | Ollama model |
-| `SCRIBE_CTX` | `8192` | Ollama context window |
-| `SCRIBE_WHISPER_MODEL` | `base.en` | faster-whisper model (`base.en`, `small.en`, `medium.en`) |
-| `SCRIBE_VOICEDROP_DIR` | `~/…/iCloud Drive/VoiceDrop` | Folder Echo watches for recordings |
-| `SCRIBE_NIGHT_CUTOFF` | `4` | Hour (0–23) before which a recording is attributed to the previous calendar day |
+
+| Variable               | Default                      | Meaning                                                                         |
+| ---------------------- | ---------------------------- | ------------------------------------------------------------------------------- |
+| `SCRIBE_JOURNAL_DIR`   | —                            | Path to daily notes folder (required)                                           |
+| `SCRIBE_MODEL`         | `llama3.1:8b`                | Ollama model                                                                    |
+| `SCRIBE_CTX`           | `8192`                       | Ollama context window                                                           |
+| `SCRIBE_WHISPER_MODEL` | `base.en`                    | faster-whisper model (`base.en`, `small.en`, `medium.en`)                       |
+| `SCRIBE_VOICEDROP_DIR` | `~/…/iCloud Drive/VoiceDrop` | Folder Echo watches for recordings                                              |
+| `SCRIBE_NIGHT_CUTOFF`  | `4`                          | Hour (0–23) before which a recording is attributed to the previous calendar day |
+
 
 ---
 
 ## Repo layout
 
-| Path | Role |
-|------|------|
-| `Scribe.py` | Wikilink pipeline + learning store |
-| `weekly_insights.py` | Weekly reflection note generator |
-| `archivist.py` | Standalone Ollama + clipboard utility |
-| `scripts/process_voice.py` | Echo: voice-to-journal bridge |
-| `scripts/voice_watcher.sh` | launchd wrapper for Echo |
-| `scripts/scheduled_run.sh` | launchd wrapper for Scribe |
-| `launchd/` | Example plists for both agents |
-| `docs/ios-setup.md` | iOS Shortcut build guide (UTS#35 date format, troubleshooting) |
-| `scribe_learning.json` | Per-term learning store (gitignored) |
-| `JOURNAL_TEMPLATE.md` | Obsidian Templater daily note template |
-| `tests/` | Pytest suite; Ollama mocked |
+
+| Path                       | Role                                                           |
+| -------------------------- | -------------------------------------------------------------- |
+| `Scribe.py`                | Wikilink pipeline + learning store                             |
+| `weekly_insights.py`       | Weekly reflection note generator                               |
+| `archivist.py`             | Standalone Ollama + clipboard utility                          |
+| `scripts/process_voice.py` | Echo: voice-to-journal bridge                                  |
+| `scripts/voice_watcher.sh` | launchd wrapper for Echo                                       |
+| `scripts/scheduled_run.sh` | launchd wrapper for Scribe                                     |
+| `launchd/`                 | Example plists for both agents                                 |
+| `docs/ios-setup.md`        | iOS Shortcut build guide (UTS#35 date format, troubleshooting) |
+| `scribe_learning.json`     | Per-term learning store (gitignored)                           |
+| `JOURNAL_TEMPLATE.md`      | Obsidian Templater daily note template                         |
+| `tests/`                   | Pytest suite; Ollama mocked                                    |
+
 
 Contributors / AI assistants: see [CLAUDE.md](./CLAUDE.md).

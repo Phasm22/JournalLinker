@@ -11,15 +11,16 @@ if (tp.file.title.startsWith("Untitled")) {
     dateStr = tp.file.title;
 }
 
-// Navigation tied to file title
+## // Navigation tied to file title
+
 let yesterday = moment(dateStr, "YYYY-MM-DD").subtract(1, "days").format("YYYY-MM-DD");
 let tomorrow = moment(dateStr, "YYYY-MM-DD").add(1, "days").format("YYYY-MM-DD");
 -%>
----
-tags: [journal]
+
+## tags: [journal]
+
 mood: ""
 energy: ""
----
 
 # Daily Log — <% dateStr %>
 

@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  VoiceRetry.example.plist — timed retry for transient-failed voice recordings.
+
+  Fires every 15 minutes. Picks up .m4a files whose .failed marker says
+  "kind: transient" (Ollama was down, Mac was asleep, network unavailable)
+  and re-runs them through process_voice.py --retry.
+
+  Permanent failures (empty transcript, corrupt audio) are left alone.
+
+  Install:
+    cp launchd/VoiceRetry.example.plist \
+       ~/Library/LaunchAgents/com.journal-linker.voice-retry.plist
+    # Edit SCRIBE_JOURNAL_DIR and repo path below, then:
+    launchctl bootstrap gui/$UID \
+       ~/Library/LaunchAgents/com.journal-linker.voice-retry.plist
+
+  Path with apostrophe: use scripts/patch_launchagent_journal.sh or edit XML
+  directly — do not use PlistBuddy for paths containing '.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.journal-linker.voice-retry</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>/Users/tjm4/journalLinker/scripts/voice_retry.sh</string>
+	</array>
+
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>SCRIBE_JOURNAL_DIR</key>
+		<string>REPLACE_WITH_YOUR_JOURNAL_PATH</string>
+		<key>SCRIBE_MODEL</key>
+		<string>llama3.1:8b</string>
+		<key>SCRIBE_CTX</key>
+		<string>8192</string>
+	</dict>
+
+	<!-- Fire every 15 minutes. No WatchPaths — this is a poll, not an event. -->
+	<key>StartInterval</key>
+	<integer>900</integer>
+
+	<key>StandardOutPath</key>
+	<string>/tmp/scribe.voice-retry.out.log</string>
+	<key>StandardErrorPath</key>
+	<string>/tmp/scribe.voice-retry.err.log</string>
+
+	<key>WorkingDirectory</key>
+	<string>/Users/tjm4/journalLinker</string>
+</dict>
+</plist>
