@@ -13,6 +13,9 @@ SCRIBE_CTX="8192"
 SCRIBE_EMBED_MODEL="all-minilm"
 SCRIBE_EMBED_KEEP_ALIVE="5m"
 SCRIBE_EMBED_CACHE_MAX_ITEMS="512"
+SCRIBE_NTFY_TOPIC="your-topic"
+SCRIBE_DAILY_REFLECTION_WINDOW_START="16:00"
+SCRIBE_DAILY_REFLECTION_WINDOW_END="21:00"
 ```
 
 ## `Scribe.py` CLI
@@ -47,6 +50,19 @@ python3 weekly_insights.py --update-vault-map
 - `--week` selects the ISO week to summarize.
 - `--update-vault-map` runs `vault_mapper.py` after writing the insight note.
 
+## `daily_reflection.py` CLI
+
+```bash
+python3 daily_reflection.py --journal-dir "/path/to/journal"
+python3 daily_reflection.py --dry-run
+python3 daily_reflection.py --date 2026-04-08
+python3 daily_reflection.py --force-send
+```
+
+- `--date` overrides the reflected day; default is yesterday in local time.
+- `--dry-run` prints the ntfy payload without sending it.
+- `--force-send` bypasses the sent-state check for manual testing.
+
 ## `vault_mapper.py` CLI
 
 ```bash
@@ -68,6 +84,7 @@ python3 vault_mapper.py --min-cooccurrence 3
 - It ranks candidates with heuristics plus optional local embeddings.
 - It writes and reuses learning data in `scribe_learning.json`.
 - Weekly insights use ISO week boundaries and write to `Insights/Weekly Insight - YYYY-Www.md`.
+- Daily reflection push reads only the previous day's note, computes a deterministic random send time within the configured local window, and sends to ntfy at most once per day.
 - The embedding cache lives in the same learning file so repeated runs can reuse vectors.
 
 ## Notes

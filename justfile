@@ -37,6 +37,14 @@ launchagent-journal p:
 weekly:
     "{{py}}" "{{root}}/weekly_insights.py"
 
+# Dry-run the daily ntfy reflection without sending
+daily-reflection *ARGS:
+    "{{py}}" "{{root}}/daily_reflection.py" --dry-run {{ARGS}}
+
+# Real daily ntfy reflection run (same core path as the scheduled job)
+daily-reflection-send *ARGS:
+    "{{py}}" "{{root}}/daily_reflection.py" {{ARGS}}
+
 # Tests only (Ollama mocked)
 test:
     "{{py}}" -m pytest tests/

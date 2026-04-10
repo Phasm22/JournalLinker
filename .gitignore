@@ -9,6 +9,7 @@ __pycache__/
 
 # Personal learning store (remove this line if you want it in git)
 scribe_learning.json
+daily_reflection_state.json
 
 # OS / editor
 .DS_Store

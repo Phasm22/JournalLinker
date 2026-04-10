@@ -1,0 +1,10 @@
+# User unit: day-behind ntfy reflection poller.
+[Unit]
+Description=Journal Linker — daily ntfy reflection
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-%h/.config/journal-linker/env
+ExecStart=/bin/bash ${JOURNAL_LINKER_REPO}/scripts/daily_reflection.sh

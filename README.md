@@ -7,6 +7,7 @@ Three components, one feedback loop:
 - **Scribe** — inserts `[[wikilinks]]` into daily notes using a local Ollama model, re-ranked by a reinforcement learning store that tracks what links actually stuck
 - **Echo** — transcribes iPhone voice recordings with Whisper, using that same learning store as vocabulary context so your project names and proper nouns land correctly
 - **Weekly Insights** — reads the week's entries and the learning store, drafts a reflection note
+- **Daily Reflection Push** — reads yesterday's entry, drafts a short reflection, and sends it once per day through ntfy
 
 ---
 
@@ -59,6 +60,8 @@ Install [just](https://github.com/casey/just) (`brew install just`).
 | `just scribe-writeback` | Read today's note from disk, insert wikilinks, write back in-place |
 | `just scribe-job`       | Same wrapper the launchd agent uses (timestamped logs)             |
 | `just weekly`           | Generate the weekly insights note                                  |
+| `just daily-reflection` | Dry-run the day-behind ntfy reflection and print the notification   |
+| `just daily-reflection-send` | Run the real ntfy delivery path manually                      |
 | `just test`             | Run pytest (Ollama mocked)                                         |
 | `just doctor`           | Paths, venv, `.env`, and log locations                             |
 
@@ -120,6 +123,13 @@ iOS setup: **[docs/ios-setup.md](./docs/ios-setup.md)**
 - Uses `WatchPaths` as the trigger edge only — all logic lives in Python
 - Logs: `~/Library/Logs/JournalLinker/voice-*.log`, symlink `voice-latest.log`
 
+**Daily reflection push** (`com.journal-linker.daily-reflection`)
+
+- Plist: [launchd/DailyReflection.example.plist](./launchd/DailyReflection.example.plist)
+- Polls every 15 minutes; `daily_reflection.py` chooses one deterministic random send time between the configured local window bounds and sends once when that tick arrives
+- Sends a short day-behind reflection to ntfy; skips silently when yesterday's note is missing or too thin
+- Logs: `~/Library/Logs/JournalLinker/daily-reflection-*.log`, symlink `daily-reflection-latest.log`
+
 **Verify both agents:** `launchctl list | grep journal-linker`
 
 ---
@@ -135,6 +145,12 @@ iOS setup: **[docs/ios-setup.md](./docs/ios-setup.md)**
 | `SCRIBE_WHISPER_MODEL` | `base.en`                    | faster-whisper model (`base.en`, `small.en`, `medium.en`)                       |
 | `SCRIBE_VOICEDROP_DIR` | `~/…/iCloud Drive/VoiceDrop` | Folder Echo watches for recordings                                              |
 | `SCRIBE_NIGHT_CUTOFF`  | `4`                          | Hour (0–23) before which a recording is attributed to the previous calendar day |
+| `SCRIBE_NTFY_SERVER`   | `https://ntfy.sh`            | ntfy publish server                                                             |
+| `SCRIBE_NTFY_TOPIC`    | —                            | ntfy topic used for daily reflection push                                       |
+| `SCRIBE_NTFY_TOKEN`    | —                            | Optional bearer token for private ntfy topics                                   |
+| `SCRIBE_NTFY_AUTH`     | —                            | Optional raw `Authorization` header when token is not used                       |
+| `SCRIBE_DAILY_REFLECTION_WINDOW_START` | `16:00`      | Local start of the random reflection send window                                 |
+| `SCRIBE_DAILY_REFLECTION_WINDOW_END`   | `21:00`      | Local end of the random reflection send window                                   |
 
 
 ---
@@ -146,10 +162,12 @@ iOS setup: **[docs/ios-setup.md](./docs/ios-setup.md)**
 | -------------------------- | -------------------------------------------------------------- |
 | `Scribe.py`                | Wikilink pipeline + learning store                             |
 | `weekly_insights.py`       | Weekly reflection note generator                               |
+| `daily_reflection.py`      | Day-behind ntfy reflection generator + sender                  |
 | `archivist.py`             | Standalone Ollama + clipboard utility                          |
 | `scripts/process_voice.py` | Echo: voice-to-journal bridge                                  |
 | `scripts/voice_watcher.sh` | launchd wrapper for Echo                                       |
 | `scripts/scheduled_run.sh` | launchd wrapper for Scribe                                     |
+| `scripts/daily_reflection.sh` | launchd/systemd wrapper for ntfy reflection polling        |
 | `launchd/`                 | Example plists for both agents                                 |
 | `docs/ios-setup.md`        | iOS Shortcut build guide (UTS#35 date format, troubleshooting) |
 | `scribe_learning.json`     | Per-term learning store (gitignored)                           |

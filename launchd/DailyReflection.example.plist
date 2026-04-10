@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>SCRIBE_JOURNAL_DIR</key>
+		<string>REPLACE_WITH_YOUR_JOURNAL_PATH</string>
+		<key>SCRIBE_MODEL</key>
+		<string>llama3.1:8b</string>
+		<key>SCRIBE_CTX</key>
+		<string>8192</string>
+		<key>SCRIBE_NTFY_TOPIC</key>
+		<string>REPLACE_WITH_YOUR_TOPIC</string>
+		<!-- Optional -->
+		<!-- <key>SCRIBE_NTFY_TOKEN</key><string>YOUR_TOKEN</string> -->
+		<!-- <key>SCRIBE_NTFY_SERVER</key><string>https://ntfy.sh</string> -->
+		<!-- <key>SCRIBE_DAILY_REFLECTION_WINDOW_START</key><string>16:00</string> -->
+		<!-- <key>SCRIBE_DAILY_REFLECTION_WINDOW_END</key><string>21:00</string> -->
+	</dict>
+	<key>Label</key>
+	<string>com.journal-linker.daily-reflection</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>REPLACE_WITH_REPO_PATH/scripts/daily_reflection.sh</string>
+	</array>
+	<key>StartInterval</key>
+	<integer>900</integer>
+	<key>StandardErrorPath</key>
+	<string>/tmp/daily-reflection.launchd.wrapper.err.log</string>
+	<key>StandardOutPath</key>
+	<string>/tmp/daily-reflection.launchd.wrapper.out.log</string>
+	<key>WorkingDirectory</key>
+	<string>REPLACE_WITH_REPO_PATH</string>
+</dict>
+</plist>
