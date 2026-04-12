@@ -6,6 +6,7 @@ import os
 import random
 import re
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
@@ -29,22 +30,24 @@ except Exception:  # pragma: no cover - import availability depends on local run
 
 
 DEFAULT_STATE_FILE = Path(__file__).with_name("daily_reflection_state.json")
-DEFAULT_NTFY_SERVER = "https://ntfy.sh"
+DEFAULT_PUSHOVER_SERVER = "https://api.pushover.net"
 DEFAULT_WINDOW_START = "16:00"
 DEFAULT_WINDOW_END = "21:00"
-DEFAULT_TOPIC = ""
+DEFAULT_PUSHOVER_PRIORITY = "0"
 KEEP_ALIVE = "5m"
 MIN_DAILY_WORDS = 45
 MIN_CONFIDENCE_TO_SEND = 0.45
 MAX_BODY_CHARS = 360
 MAX_TITLE_CHARS = 80
 MEMORY_HIT_LIMIT = 6
+DATE_FILENAME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})\.md$")
+DEFAULT_DAILY_REFLECTION_MODEL = "llama3.1:8b"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     load_local_env(Path(__file__).with_name(".env"))
 
-    parser = argparse.ArgumentParser(description="Generate and send a once-daily day-behind ntfy reflection.")
+    parser = argparse.ArgumentParser(description="Generate and send a once-daily day-behind Pushover reflection.")
     parser.add_argument("--journal-dir", default=os.getenv("SCRIBE_JOURNAL_DIR"))
     parser.add_argument("--learning-file", default=str(DEFAULT_MEMORY_STORE_FILE))
     parser.add_argument("--state-file", default=str(DEFAULT_STATE_FILE))
@@ -133,7 +136,49 @@ def prepare_state_record(state: dict, reflection_date: date, target_send_at: dat
     record.setdefault("last_error", "")
     record.setdefault("last_attempt_at", "")
     record.setdefault("sent_at", "")
+    record.setdefault("context_hash", "")
     return record
+
+
+def extract_date_from_journal_filename(path: Path) -> str | None:
+    match = DATE_FILENAME_RE.match(path.name)
+    if not match:
+        return None
+    return match.group(1)
+
+
+def find_latest_modified_journal_note(journal_dir: Path) -> Path | None:
+    if not journal_dir.exists():
+        return None
+
+    latest_path: Path | None = None
+    latest_mtime: float | None = None
+    for note_path in journal_dir.glob("*.md"):
+        if not extract_date_from_journal_filename(note_path):
+            continue
+        try:
+            mtime = note_path.stat().st_mtime
+        except Exception:
+            continue
+        if latest_mtime is None or mtime > latest_mtime:
+            latest_mtime = mtime
+            latest_path = note_path
+    return latest_path
+
+
+def resolve_entry_target(journal_dir: Path, reflection_date: date) -> tuple[date, str]:
+    direct_path = journal_dir / f"{reflection_date.isoformat()}.md"
+    if direct_path.exists():
+        return reflection_date, "yesterday"
+
+    latest_note = find_latest_modified_journal_note(journal_dir)
+    if latest_note is None:
+        return reflection_date, "yesterday"
+
+    latest_date = parse_iso_date(extract_date_from_journal_filename(latest_note))
+    if latest_date is None:
+        return reflection_date, "yesterday"
+    return latest_date, "latest_valid"
 
 
 def find_memory_hits(cleaned_text: str, memory_store: dict) -> list[str]:
@@ -188,6 +233,12 @@ def collect_daily_entry(journal_dir: Path, reflection_date: date) -> dict:
     }
 
 
+def compute_context_hash(entry: dict) -> str:
+    cleaned_text = str(entry.get("cleaned_text", "")).strip()
+    payload = f"{entry.get('date', '')}\n{cleaned_text}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def build_daily_reflection_signals(entry: dict, memory_store: dict) -> dict:
     if not entry["exists"]:
         return {
@@ -221,6 +272,7 @@ def build_daily_reflection_signals(entry: dict, memory_store: dict) -> dict:
         "memory_hits": memory_hits,
         "top_keywords": unique_keywords[:8],
         "excerpt": excerpt,
+        "full_text": cleaned_text,
     }
 
 
@@ -241,6 +293,7 @@ def build_daily_reflection_prompt(signals: dict) -> str:
 Return JSON only.
 
 Write a calm, grounded reflection about a completed day from journal evidence.
+The goal is not to summarize the facts. The goal is to identify what the facts suggest about the shape of the day.
 
 Rules:
 - Output exactly this shape: {{"title":"...","body":"...","confidence":0.0,"should_send":true,"reason":"..."}}
@@ -249,7 +302,28 @@ Rules:
 - Include the date implicitly in the perspective of a completed day, not as urgent or current.
 - Keep the tone restrained, reflective, and concrete.
 - Do not use therapy-speak, motivational filler, or advice-list language.
-- Base everything on the provided evidence only.
+- Base everything on the provided evidence only, but you may make light interpretive inferences about what seemed central, charged, or desired.
+- Prefer the underlying pattern over the surface detail. Treat concrete details as signals of taste, mood, desire, avoidance, momentum, or restlessness.
+- Do not produce a bullet-list summary of events.
+- Avoid naming proper nouns or one-off specifics unless they are clearly central to the meaning of the day.
+- Do not over-psychologize. Avoid words like "struggle", "escape", "avoidance", or "issue" unless the evidence clearly supports them.
+- Prefer language like "drawn toward", "ready for", "wanting more of", "leaning toward", or "circling around" when the evidence is subtle.
+- If a detail seems culturally specific or taste-specific, translate it into what it implies about mood or appetite rather than just repeating the noun.
+- Ask yourself: what were these details pointing toward?
+- Good reflections sound like they noticed the thread connecting the day, not like they copied the journal.
+- Avoid stock phrasing such as "the day was marked by", "followed by", or "there was a sense of".
+- Prefer writing that begins with the felt center of the day rather than a recap of events.
+
+Interpretation examples:
+- If the note mentions wanting a short, efficient "power hour", the reflection should usually talk about wanting concentrated momentum, competence, or clean focus, not just repeat "power hour".
+- If the note mentions a specific artist, studio, genre, or media fixation, the reflection should usually name the kind of aesthetic or emotional appetite it points to, not just repeat the proper noun.
+- If the note mentions a season, trip, or upcoming change, the reflection should usually talk about anticipation, lightness, restlessness, or readiness for a shift, not just restate the event.
+
+Bad reflection:
+- "The day was productive, then there was interest in A24, and then excitement for summer."
+
+Better reflection:
+- "The day seemed to want two things at once: a clean pocket of competence and a sense of movement toward something lighter and more alive."
 - If the evidence is too thin for a real reflection, set "should_send" to false and "reason" to "insufficient daily signal".
 - Confidence should be a float from 0.0 to 1.0.
 
@@ -262,7 +336,11 @@ def request_daily_reflection(signals: dict) -> dict:
     if ollama is None:
         raise RuntimeError("The 'ollama' Python package is required for daily reflection generation.")
 
-    model = os.getenv("SCRIBE_MODEL", "llama3.1:8b").strip() or "llama3.1:8b"
+    model = (
+        os.getenv("SCRIBE_DAILY_REFLECTION_MODEL", "").strip()
+        or os.getenv("SCRIBE_MODEL", "").strip()
+        or DEFAULT_DAILY_REFLECTION_MODEL
+    )
     num_ctx_raw = os.getenv("SCRIBE_CTX", "8192")
     try:
         num_ctx = int(num_ctx_raw)
@@ -272,7 +350,7 @@ def request_daily_reflection(signals: dict) -> dict:
     response = ollama.chat(
         model=model,
         messages=[{"role": "user", "content": build_daily_reflection_prompt(signals)}],
-        options={"temperature": 0.2, "num_ctx": num_ctx},
+        options={"temperature": 0.45, "num_ctx": num_ctx},
         keep_alive=KEEP_ALIVE,
     )
     data = extract_json_obj(strip_think(response["message"]["content"]))
@@ -300,21 +378,35 @@ def build_notification_payload(reflection_date: date, reflection: dict) -> dict:
     return {"title": title, "message": message}
 
 
-def publish_ntfy(topic: str, payload: dict, server: str, auth: str = "", token: str = "") -> tuple[int, str]:
-    if not topic.strip():
-        raise ValueError("SCRIBE_NTFY_TOPIC is required for ntfy delivery.")
+def get_pushover_app_token() -> str:
+    return os.getenv("SCRIBE_PUSHOVER_APP_TOKEN", "").strip() or os.getenv("PUSHOVER_TOKEN", "").strip()
 
-    base = server.strip().rstrip("/") or DEFAULT_NTFY_SERVER
-    url = f"{base}/{topic.strip()}"
-    data = payload["message"].encode("utf-8")
+
+def get_pushover_user_key() -> str:
+    return os.getenv("SCRIBE_PUSHOVER_USER_KEY", "").strip() or os.getenv("PUSHOVER_KEY", "").strip()
+
+
+def publish_pushover(payload: dict, server: str, app_token: str, user_key: str, device: str = "", priority: str = "") -> tuple[int, str]:
+    if not app_token.strip():
+        raise ValueError("SCRIBE_PUSHOVER_APP_TOKEN is required for Pushover delivery.")
+    if not user_key.strip():
+        raise ValueError("SCRIBE_PUSHOVER_USER_KEY is required for Pushover delivery.")
+
+    base = server.strip().rstrip("/") or DEFAULT_PUSHOVER_SERVER
+    url = f"{base}/1/messages.json"
+    form_data = {
+        "token": app_token.strip(),
+        "user": user_key.strip(),
+        "title": payload["title"],
+        "message": payload["message"],
+        "priority": (priority or DEFAULT_PUSHOVER_PRIORITY).strip() or DEFAULT_PUSHOVER_PRIORITY,
+    }
+    if device.strip():
+        form_data["device"] = device.strip()
+
+    data = urllib.parse.urlencode(form_data).encode("utf-8")
     request = urllib.request.Request(url, data=data, method="POST")
-    request.add_header("Content-Type", "text/plain; charset=utf-8")
-    request.add_header("Title", payload["title"])
-
-    if token.strip():
-        request.add_header("Authorization", f"Bearer {token.strip()}")
-    elif auth.strip():
-        request.add_header("Authorization", auth.strip())
+    request.add_header("Content-Type", "application/x-www-form-urlencoded")
 
     with contextlib.closing(urllib.request.urlopen(request, timeout=15)) as response:
         status = getattr(response, "status", 200)
@@ -351,6 +443,7 @@ def run_daily_reflection(
         "reason": "",
         "reflection_date": reflection_date.isoformat(),
         "target_send_at": target_send_at.isoformat(timespec="seconds"),
+        "source": "yesterday",
         "sent": False,
         "dry_run": dry_run,
         "payload": None,
@@ -368,13 +461,23 @@ def run_daily_reflection(
         result["reason"] = "window closed"
         return result
 
-    journal_path = Path(journal_dir)
+    journal_path = Path(journal_dir).expanduser()
     memory_store = load_memory_store(Path(learning_file))
-    entry = collect_daily_entry(journal_path, reflection_date)
+    target_date, source = resolve_entry_target(journal_path, reflection_date)
+    result["reflection_date"] = target_date.isoformat()
+    result["source"] = source
+    if target_date != reflection_date:
+        record = prepare_state_record(state, target_date, target_send_at)
+    entry = collect_daily_entry(journal_path, target_date)
     signals = build_daily_reflection_signals(entry, memory_store)
     skip_reason = evaluate_skip_reason(entry, signals)
     if skip_reason:
         result["reason"] = skip_reason
+        return result
+
+    context_hash = compute_context_hash(entry)
+    if record.get("context_hash") == context_hash and not force_send:
+        result["reason"] = "no new context since last run"
         return result
 
     reflection = request_daily_reflection(signals)
@@ -392,13 +495,15 @@ def run_daily_reflection(
 
     record["attempt_count"] = int(record.get("attempt_count", 0)) + 1
     record["last_attempt_at"] = current_time.isoformat(timespec="seconds")
+    record["context_hash"] = context_hash
     try:
-        status_code, response_body = publish_ntfy(
-            topic=os.getenv("SCRIBE_NTFY_TOPIC", DEFAULT_TOPIC),
+        status_code, response_body = publish_pushover(
             payload=payload,
-            server=os.getenv("SCRIBE_NTFY_SERVER", DEFAULT_NTFY_SERVER),
-            auth=os.getenv("SCRIBE_NTFY_AUTH", ""),
-            token=os.getenv("SCRIBE_NTFY_TOKEN", ""),
+            server=os.getenv("SCRIBE_PUSHOVER_SERVER", DEFAULT_PUSHOVER_SERVER),
+            app_token=get_pushover_app_token(),
+            user_key=get_pushover_user_key(),
+            device=os.getenv("SCRIBE_PUSHOVER_DEVICE", ""),
+            priority=os.getenv("SCRIBE_PUSHOVER_PRIORITY", DEFAULT_PUSHOVER_PRIORITY),
         )
     except Exception as exc:
         record["last_error"] = str(exc)

@@ -1,0 +1,10 @@
+# Calendar trigger — edit OnCalendar to match your Mac plist (default 03:17).
+[Unit]
+Description=Journal Linker — nightly Scribe timer
+
+[Timer]
+OnCalendar=*-*-* 03:17:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

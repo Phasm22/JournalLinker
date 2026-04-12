@@ -1,0 +1,14 @@
+# User unit: nightly Scribe --write-back (same role as launchd Scribe.example.plist).
+# Install: see docs/ubuntu-setup.md
+[Unit]
+Description=Journal Linker — Scribe scheduled job (write-back)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-%h/.config/journal-linker/env
+ExecStart=/bin/bash ${JOURNAL_LINKER_REPO}/scripts/scheduled_run.sh
+
+[Install]
+WantedBy=default.target

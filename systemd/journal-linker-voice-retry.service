@@ -1,0 +1,10 @@
+# Same role as launchd VoiceRetry — transient voice failures every 15 minutes.
+[Unit]
+Description=Journal Linker — voice retry (transient failures)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-%h/.config/journal-linker/env
+ExecStart=/bin/bash ${JOURNAL_LINKER_REPO}/scripts/voice_retry.sh

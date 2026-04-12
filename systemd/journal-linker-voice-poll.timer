@@ -1,0 +1,12 @@
+# Fallback when PathChanged is unreliable: poll VoiceDrop every 2 minutes.
+# Enable this OR journal-linker-voice-watcher.path, not both, unless you accept redundant runs (lock prevents overlap).
+[Unit]
+Description=Journal Linker — voice watcher poll timer
+
+[Timer]
+OnUnitActiveSec=2min
+OnBootSec=1min
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

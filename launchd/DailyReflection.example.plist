@@ -10,11 +10,14 @@
 		<string>llama3.1:8b</string>
 		<key>SCRIBE_CTX</key>
 		<string>8192</string>
-		<key>SCRIBE_NTFY_TOPIC</key>
-		<string>REPLACE_WITH_YOUR_TOPIC</string>
+		<key>SCRIBE_PUSHOVER_APP_TOKEN</key>
+		<string>REPLACE_WITH_YOUR_PUSHOVER_APP_TOKEN</string>
+		<key>SCRIBE_PUSHOVER_USER_KEY</key>
+		<string>REPLACE_WITH_YOUR_PUSHOVER_USER_KEY</string>
 		<!-- Optional -->
-		<!-- <key>SCRIBE_NTFY_TOKEN</key><string>YOUR_TOKEN</string> -->
-		<!-- <key>SCRIBE_NTFY_SERVER</key><string>https://ntfy.sh</string> -->
+		<!-- <key>SCRIBE_PUSHOVER_DEVICE</key><string>iphone</string> -->
+		<!-- <key>SCRIBE_PUSHOVER_SERVER</key><string>https://api.pushover.net</string> -->
+		<!-- <key>SCRIBE_PUSHOVER_PRIORITY</key><string>0</string> -->
 		<!-- <key>SCRIBE_DAILY_REFLECTION_WINDOW_START</key><string>16:00</string> -->
 		<!-- <key>SCRIBE_DAILY_REFLECTION_WINDOW_END</key><string>21:00</string> -->
 	</dict>

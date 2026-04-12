@@ -1,0 +1,10 @@
+# Same as journal-linker-voice-watcher.service; used only with journal-linker-voice-poll.timer.
+[Unit]
+Description=Journal Linker — voice watcher (poll)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-%h/.config/journal-linker/env
+ExecStart=/bin/bash ${JOURNAL_LINKER_REPO}/scripts/voice_watcher.sh

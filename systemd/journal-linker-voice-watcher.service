@@ -1,0 +1,13 @@
+# Triggered by journal-linker-voice-watcher.path (Echo / VoiceDrop).
+[Unit]
+Description=Journal Linker — voice watcher (process_voice)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-%h/.config/journal-linker/env
+ExecStart=/bin/bash ${JOURNAL_LINKER_REPO}/scripts/voice_watcher.sh
+
+[Install]
+WantedBy=default.target

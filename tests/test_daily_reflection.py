@@ -58,8 +58,9 @@ class TestDailyReflection(unittest.TestCase):
 
     def make_env(self) -> dict[str, str]:
         return {
-            "SCRIBE_NTFY_TOPIC": "journal-linker-test",
-            "SCRIBE_NTFY_SERVER": "https://ntfy.sh",
+            "SCRIBE_PUSHOVER_SERVER": "https://api.pushover.net",
+            "SCRIBE_PUSHOVER_APP_TOKEN": "app-token",
+            "SCRIBE_PUSHOVER_USER_KEY": "user-key",
             "SCRIBE_DAILY_REFLECTION_WINDOW_START": "16:00",
             "SCRIBE_DAILY_REFLECTION_WINDOW_END": "21:00",
             "SCRIBE_DAILY_REFLECTION_SEED": "seed-1",
@@ -96,6 +97,43 @@ class TestDailyReflection(unittest.TestCase):
 
             self.assertEqual(result["status"], "skipped")
             self.assertEqual(result["reason"], "missing daily note")
+
+    def test_falls_back_to_latest_valid_note_when_yesterday_missing(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, self.make_env(), clear=False):
+            journal_dir = Path(d) / "journal"
+            journal_dir.mkdir()
+            latest_path = journal_dir / "2026-04-06.md"
+            latest_path.write_text(SUBSTANTIVE_DAY.replace("2026-04-08", "2026-04-06"), encoding="utf-8")
+            os.utime(latest_path, (1712700000, 1712700000))
+            older_path = journal_dir / "2026-04-04.md"
+            older_path.write_text(SUBSTANTIVE_DAY.replace("2026-04-08", "2026-04-04"), encoding="utf-8")
+            os.utime(older_path, (1712600000, 1712600000))
+            learning_file = Path(d) / "scribe_learning.json"
+            self.write_learning(learning_file)
+            state_file = Path(d) / "daily_reflection_state.json"
+
+            reflection = {
+                "title": "A calmer read on yesterday",
+                "body": "The day looks clearer with some distance. What stands out is the wish for less pressure and more room to think.",
+                "confidence": 0.7,
+                "should_send": True,
+                "reason": "",
+            }
+
+            with mock.patch.object(daily_reflection, "request_daily_reflection", return_value=reflection), mock.patch.object(
+                daily_reflection, "publish_pushover", return_value=(200, "ok")
+            ), mock.patch.object(daily_reflection, "compute_target_send_time", return_value=datetime(2026, 4, 9, 17, 0, 0)):
+                result = daily_reflection.run_daily_reflection(
+                    journal_dir=str(journal_dir),
+                    learning_file=str(learning_file),
+                    state_file=str(state_file),
+                    now=datetime(2026, 4, 9, 18, 0, 0),
+                    date_override="2026-04-08",
+                )
+
+            self.assertEqual(result["status"], "sent")
+            self.assertEqual(result["reflection_date"], "2026-04-06")
+            self.assertEqual(result["source"], "latest_valid")
 
     def test_skips_when_note_is_sparse(self):
         with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, self.make_env(), clear=False):
@@ -136,7 +174,7 @@ class TestDailyReflection(unittest.TestCase):
             }
 
             with mock.patch.object(daily_reflection, "request_daily_reflection", return_value=reflection), mock.patch.object(
-                daily_reflection, "publish_ntfy"
+                daily_reflection, "publish_pushover"
             ) as publish_mock:
                 with mock.patch.object(daily_reflection, "compute_target_send_time", return_value=datetime(2026, 4, 9, 17, 0, 0)):
                     result = daily_reflection.run_daily_reflection(
@@ -171,7 +209,7 @@ class TestDailyReflection(unittest.TestCase):
             }
 
             with mock.patch.object(daily_reflection, "request_daily_reflection", return_value=reflection), mock.patch.object(
-                daily_reflection, "publish_ntfy", return_value=(200, "ok")
+                daily_reflection, "publish_pushover", return_value=(200, "ok")
             ) as publish_mock:
                 with mock.patch.object(daily_reflection, "compute_target_send_time", return_value=datetime(2026, 4, 9, 17, 0, 0)):
                     first = daily_reflection.run_daily_reflection(
@@ -199,7 +237,7 @@ class TestDailyReflection(unittest.TestCase):
             self.assertTrue(record["sent"])
             self.assertEqual(record["attempt_count"], 1)
 
-    def test_failed_send_is_retryable(self):
+    def test_failed_send_is_not_retried_without_new_context(self):
         with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, self.make_env(), clear=False):
             journal_dir = Path(d) / "journal"
             journal_dir.mkdir()
@@ -217,7 +255,7 @@ class TestDailyReflection(unittest.TestCase):
             }
 
             with mock.patch.object(daily_reflection, "request_daily_reflection", return_value=reflection), mock.patch.object(
-                daily_reflection, "publish_ntfy", side_effect=[RuntimeError("temporary error"), (200, "ok")]
+                daily_reflection, "publish_pushover", side_effect=RuntimeError("temporary error")
             ):
                 with mock.patch.object(daily_reflection, "compute_target_send_time", return_value=datetime(2026, 4, 9, 17, 0, 0)):
                     first = daily_reflection.run_daily_reflection(
@@ -236,12 +274,57 @@ class TestDailyReflection(unittest.TestCase):
                     )
 
             self.assertEqual(first["status"], "failed")
-            self.assertEqual(second["status"], "sent")
+            self.assertEqual(second["status"], "skipped")
+            self.assertEqual(second["reason"], "no new context since last run")
 
             state = json.loads(state_file.read_text(encoding="utf-8"))
             record = state["days"]["2026-04-08"]
-            self.assertEqual(record["attempt_count"], 2)
-            self.assertEqual(record["last_error"], "")
+            self.assertEqual(record["attempt_count"], 1)
+            self.assertEqual(record["last_error"], "temporary error")
+
+    def test_identical_context_skips_after_last_run(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, self.make_env(), clear=False):
+            journal_dir = Path(d) / "journal"
+            journal_dir.mkdir()
+            (journal_dir / "2026-04-08.md").write_text(SUBSTANTIVE_DAY, encoding="utf-8")
+            learning_file = Path(d) / "scribe_learning.json"
+            self.write_learning(learning_file)
+            state_file = Path(d) / "daily_reflection_state.json"
+
+            reflection = {
+                "title": "A calmer read on yesterday",
+                "body": "The day looks clearer with a little distance. What remains is the wish for less pressure and more room to think.",
+                "confidence": 0.7,
+                "should_send": True,
+                "reason": "",
+            }
+
+            with mock.patch.object(daily_reflection, "request_daily_reflection", return_value=reflection), mock.patch.object(
+                daily_reflection, "publish_pushover", side_effect=RuntimeError("temporary error")
+            ), mock.patch.object(daily_reflection, "compute_target_send_time", return_value=datetime(2026, 4, 9, 17, 0, 0)):
+                first = daily_reflection.run_daily_reflection(
+                    journal_dir=str(journal_dir),
+                    learning_file=str(learning_file),
+                    state_file=str(state_file),
+                    now=datetime(2026, 4, 9, 18, 0, 0),
+                    date_override="2026-04-08",
+                )
+
+            with mock.patch.object(daily_reflection, "request_daily_reflection") as reflection_mock, mock.patch.object(
+                daily_reflection, "compute_target_send_time", return_value=datetime(2026, 4, 9, 17, 0, 0)
+            ):
+                second = daily_reflection.run_daily_reflection(
+                    journal_dir=str(journal_dir),
+                    learning_file=str(learning_file),
+                    state_file=str(state_file),
+                    now=datetime(2026, 4, 9, 18, 15, 0),
+                    date_override="2026-04-08",
+                )
+
+            self.assertEqual(first["status"], "failed")
+            self.assertEqual(second["status"], "skipped")
+            self.assertEqual(second["reason"], "no new context since last run")
+            reflection_mock.assert_not_called()
 
     def test_before_target_send_time_skips_without_model_call(self):
         with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, self.make_env(), clear=False):

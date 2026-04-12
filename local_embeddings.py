@@ -13,7 +13,7 @@ except Exception:  # pragma: no cover - import availability depends on local run
     ollama = None
 
 
-DEFAULT_EMBED_MODEL = "all-minilm"
+DEFAULT_EMBED_MODEL = "nomic-embed-text"
 DEFAULT_KEEP_ALIVE = "5m"
 DEFAULT_CACHE_LIMIT = 512
 CACHE_KEY = "embedding_cache"

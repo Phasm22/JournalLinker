@@ -10,10 +10,11 @@ Create a local `.env` file next to the scripts.
 SCRIBE_JOURNAL_DIR="/path/to/your/journal"
 SCRIBE_MODEL="llama3.1:8b"
 SCRIBE_CTX="8192"
-SCRIBE_EMBED_MODEL="all-minilm"
+SCRIBE_EMBED_MODEL="nomic-embed-text"
 SCRIBE_EMBED_KEEP_ALIVE="5m"
 SCRIBE_EMBED_CACHE_MAX_ITEMS="512"
-SCRIBE_NTFY_TOPIC="your-topic"
+SCRIBE_PUSHOVER_APP_TOKEN="your-app-token"
+SCRIBE_PUSHOVER_USER_KEY="your-user-key"
 SCRIBE_DAILY_REFLECTION_WINDOW_START="16:00"
 SCRIBE_DAILY_REFLECTION_WINDOW_END="21:00"
 ```
@@ -60,8 +61,9 @@ python3 daily_reflection.py --force-send
 ```
 
 - `--date` overrides the reflected day; default is yesterday in local time.
-- `--dry-run` prints the ntfy payload without sending it.
+- `--dry-run` prints the Pushover payload without sending it.
 - `--force-send` bypasses the sent-state check for manual testing.
+- Pushover credentials can be provided as either `SCRIBE_PUSHOVER_APP_TOKEN` / `SCRIBE_PUSHOVER_USER_KEY` or the older aliases `PUSHOVER_TOKEN` / `PUSHOVER_KEY`.
 
 ## `vault_mapper.py` CLI
 
@@ -84,7 +86,7 @@ python3 vault_mapper.py --min-cooccurrence 3
 - It ranks candidates with heuristics plus optional local embeddings.
 - It writes and reuses learning data in `scribe_learning.json`.
 - Weekly insights use ISO week boundaries and write to `Insights/Weekly Insight - YYYY-Www.md`.
-- Daily reflection push reads only the previous day's note, computes a deterministic random send time within the configured local window, and sends to ntfy at most once per day.
+- Daily reflection push reads only the previous day's note, computes a deterministic random send time within the configured local window, and sends to Pushover at most once per day.
 - The embedding cache lives in the same learning file so repeated runs can reuse vectors.
 
 ## Notes
