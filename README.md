@@ -1,13 +1,17 @@
 # Journal Linker
 
-A local-first knowledge pipeline for an Obsidian vault. Speak or write — entries get linked, learned from, and navigated automatically. No cloud required beyond iCloud for sync.
+**Personal scripts and workflow** around a daily Obsidian journal. This repo is my working tree: paths, env layout, Python entrypoints, and launchd/systemd units wired to **my** vault and machines. It is not a polished product — if something here is useful, copy the pieces you need and retarget `SCRIBE_JOURNAL_DIR`, models, and schedulers to your setup.
 
-Three components, one feedback loop:
+Still, the shape is simple: **local-first**. Speak or write — entries get linked, learned from, and navigated with optional pushes (Pushover, etc.). Sync is whatever you use for the vault (iCloud, Dropbox, git); the automation assumes files show up locally.
+
+One feedback loop, several moving parts:
 
 - **Scribe** — inserts `[[wikilinks]]` into daily notes using a local Ollama model, re-ranked by a reinforcement learning store that tracks what links actually stuck
 - **Echo** — transcribes iPhone voice recordings with Whisper, using that same learning store as vocabulary context so your project names and proper nouns land correctly
 - **Weekly Insights** — reads the week's entries and the learning store, drafts a reflection note
 - **Daily Reflection Push** — reads yesterday's entry, drafts a short reflection, and sends it once per day through Pushover
+
+Related automation (not always in *this* repo clone) can live under `JOURNAL_LINKER_REPO` on disk — e.g. intent routing, Telegram feedback — but Scribe, voice, reflection, and weekly insights are anchored here.
 
 ---
 
@@ -149,6 +153,18 @@ iOS setup: **[docs/ios-setup.md](./docs/ios-setup.md)**
 
 ---
 
+## On Linux (systemd)
+
+User units and env templates live under [`systemd/`](./systemd/). Typical flow:
+
+- Copy or symlink unit files into `~/.config/systemd/user/`, set `JOURNAL_LINKER_REPO` to this repo’s path in `~/.config/journal-linker/journal-linker.env`, then `systemctl --user daemon-reload` and enable the `.path` / `.timer` units you want.
+- Logs often go to `~/.local/state/journal-linker/` when `SCRIBE_JOB_LOG_DIR` is set that way (see `just doctor`).
+- After amending commits or changing remotes: `git fetch origin` before `git push --force-with-lease` so the lease matches GitHub.
+
+VoiceDrop may be a Dropbox folder instead of iCloud; override `SCRIBE_VOICEDROP_DIR` in the env file.
+
+---
+
 ## Env vars
 
 
@@ -186,11 +202,12 @@ For compatibility, `daily_reflection.py` also accepts `PUSHOVER_TOKEN` and `PUSH
 | `scripts/voice_watcher.sh` | launchd wrapper for Echo                                       |
 | `scripts/scheduled_run.sh` | launchd wrapper for Scribe                                     |
 | `scripts/daily_reflection.sh` | launchd/systemd wrapper for Pushover reflection polling    |
-| `launchd/`                 | Example plists for both agents                                 |
+| `launchd/`                 | Example plists (macOS)                                         |
+| `systemd/`                 | Example user units + `journal-linker.env.example` (Linux)      |
 | `docs/ios-setup.md`        | iOS Shortcut build guide (UTS#35 date format, troubleshooting) |
 | `scribe_learning.json`     | Per-term learning store (gitignored)                           |
 | `JOURNAL_TEMPLATE.md`      | Obsidian Templater daily note template                         |
 | `tests/`                   | Pytest suite; Ollama mocked                                    |
 
 
-Contributors / AI assistants: see [CLAUDE.md](./CLAUDE.md).
+Contributors / AI assistants: see [CLAUDE.md](./CLAUDE.md). For deeper config and CLI notes, see [TECHNICAL.md](./TECHNICAL.md).
