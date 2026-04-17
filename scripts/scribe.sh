@@ -12,7 +12,7 @@
 #   Use this in Shortcuts / launchd so you don't need a separate "write to file" step.
 #
 # Override model/context: set SCRIBE_MODEL / SCRIBE_CTX in the environment, or rely
-# on .env (Scribe loads the repo .env on startup).
+# on ~/.config/journal-linker/journal-linker.env (see journal_linker_env.py).
 
 set -euo pipefail
 

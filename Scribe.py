@@ -12,6 +12,7 @@ from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from journal_linker_env import bootstrap_journal_linker_env
 from local_embeddings import LocalEmbeddingCache, cosine_similarity as embedding_cosine_similarity, normalize_embedding_text
 
 
@@ -58,7 +59,7 @@ def get_input_text(remaining_args: list[str]) -> tuple[str, str]:
 
 
 def parse_cli() -> tuple[str, int, str | None, bool, str | None, str | None, bool, list[str]]:
-    load_local_env(Path(__file__).with_name(".env"))
+    bootstrap_journal_linker_env(repo_root=Path(__file__).resolve().parent)
 
     model = "llama3.1:8b"
     num_ctx = 8192

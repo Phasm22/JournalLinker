@@ -6,6 +6,8 @@ from collections import defaultdict
 from datetime import date, datetime
 from pathlib import Path
 
+from journal_linker_env import bootstrap_journal_linker_env
+
 
 DATE_FILE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\.md$")
 WIKILINK_RE = re.compile(r"\[\[([^\]]+)\]\]")
@@ -36,7 +38,7 @@ def load_local_env(path: Path) -> None:
 
 
 def parse_cli(argv: list[str] | None = None) -> argparse.Namespace:
-    load_local_env(Path(__file__).with_name(".env"))
+    bootstrap_journal_linker_env(repo_root=Path(__file__).resolve().parent)
     parser = argparse.ArgumentParser(description="Generate vault relationship map from journal wikilinks.")
     parser.add_argument("--journal-dir", default=os.getenv("SCRIBE_JOURNAL_DIR"))
     parser.add_argument("--learning-file", default=str(Path(__file__).with_name("scribe_learning.json")))

@@ -39,14 +39,23 @@ Tests use `importlib` to load `Scribe.py` directly as a module (not a package), 
 
 ## Environment
 
-Create `.env` in the repo root:
+Configure secrets outside the repo (recommended):
+
+```bash
+install -d -m 700 ~/.config/journal-linker
+${EDITOR:-nano} ~/.config/journal-linker/journal-linker.env
+chmod 600 ~/.config/journal-linker/journal-linker.env
 ```
+
+Minimum:
+
+```bash
 SCRIBE_JOURNAL_DIR="/path/to/journal"
 SCRIBE_MODEL="llama3.1:8b"   # optional
 SCRIBE_CTX="8192"             # optional
 ```
 
-`Scribe.py` calls `load_local_env()` at startup to read this file. Journal notes must be named `YYYY-MM-DD.md`.
+`Scribe.py` calls `bootstrap_journal_linker_env()` at startup (see `journal_linker_env.py`). Journal notes must be named `YYYY-MM-DD.md`.
 
 ## Architecture
 

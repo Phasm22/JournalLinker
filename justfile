@@ -1,7 +1,7 @@
 # Journal Linker — local Obsidian journal wikilink helper (Scribe + weekly insights).
 # Install the runner: brew install just   →   https://github.com/casey/just
 #
-# First-time: create `.env` in this repo (SCRIBE_JOURNAL_DIR=...) — see README.
+# First-time: configure env vars (recommended: ~/.config/journal-linker/journal-linker.env) — see README.
 
 set shell := ["/bin/bash", "-cu"]
 
@@ -33,7 +33,7 @@ scribe-job:
 launchagent-journal p:
     "{{root}}/scripts/patch_launchagent_journal.sh" "{{p}}"
 
-# Weekly insights note (uses .env for journal path)
+# Weekly insights note (uses the same env bootstrap as Scribe)
 weekly:
     "{{py}}" "{{root}}/weekly_insights.py"
 
@@ -94,7 +94,8 @@ doctor:
       "  Repo: {{root}}" \
       "  Python: {{py}}"
     @bash -c '[[ -x "{{py}}" ]] && echo "  Venv: OK" || echo "  Venv: missing (see README)"'
-    @bash -c '[[ -f "{{root}}/.env" ]] && echo "  .env: present" || echo "  .env: missing"'
+    @bash -c 'xdg="${XDG_CONFIG_HOME:-$HOME/.config}"; f="$xdg/journal-linker/journal-linker.env"; [[ -f "$f" ]] && echo "  user env: $f (present)" || echo "  user env: $f (missing)"'
+    @bash -c '[[ -f "{{root}}/.env" ]] && echo "  repo .env: present (legacy; set JOURNAL_LINKER_DOTENV=1 to load)" || echo "  repo .env: missing"'
     @printf '%s\n' \
       "" \
       "  Scheduled job logs:  ~/Library/Logs/JournalLinker/ (scribe-*-PID.log, scribe-latest.log)" \

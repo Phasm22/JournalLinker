@@ -4,7 +4,21 @@ This file collects the setup, configuration, and behavior details that are usefu
 
 ## Environment Variables
 
-Create a local `.env` file next to the scripts.
+Prefer keeping secrets **outside the git repo**.
+
+Default bootstrap order (implemented in `journal_linker_env.py`):
+
+1. `JOURNAL_LINKER_ENV_FILE` if set and the path exists
+2. `~/.config/journal-linker/journal-linker.env` (or `$XDG_CONFIG_HOME/journal-linker/journal-linker.env`)
+3. Legacy dev-only: repo-root `.env` if `JOURNAL_LINKER_DOTENV=1`
+
+Example user config file:
+
+```bash
+install -d -m 700 ~/.config/journal-linker
+${EDITOR:-nano} ~/.config/journal-linker/journal-linker.env
+chmod 600 ~/.config/journal-linker/journal-linker.env
+```
 
 ```bash
 SCRIBE_JOURNAL_DIR="/path/to/your/journal"
@@ -64,6 +78,20 @@ python3 daily_reflection.py --force-send
 - `--dry-run` prints the Pushover payload without sending it.
 - `--force-send` bypasses the sent-state check for manual testing.
 - Pushover credentials can be provided as either `SCRIBE_PUSHOVER_APP_TOKEN` / `SCRIBE_PUSHOVER_USER_KEY` or the older aliases `PUSHOVER_TOKEN` / `PUSHOVER_KEY`.
+
+## Intent pipeline (`scripts/process_intents.py` in `JOURNAL_LINKER_REPO`)
+
+The intent watcher runs from the journalLinker checkout referenced by `JOURNAL_LINKER_REPO`. It gates journal text, calls the routing model, then delivers to Pushover, Obsidian cortex, digest queue, and Telegram feedback queue.
+
+**Repeat notifications:** delivery is idempotent per sink and per `claude_idempotency_key`. If the ledger already records a successful Pushover (or cortex, digest, feedback queue) attempt for that key, a later run skips that sink instead of sending again.
+
+**Tuning Pushover noise:**
+
+| Variable | Default | Meaning |
+|----------|---------|--------|
+| `INTENT_PUSHOVER_URGENCIES` | *(unset → `immediate`, `today`, `soon`)* | Comma-separated subset of `immediate,today,soon,low` that may trigger a Pushover message. Example: `immediate,today` skips Pushover when the router sets `urgency=soon`. |
+
+Other useful intent variables (see the script docstring in-repo): `INTENT_GATE_MODEL`, `INTENT_ROUTING_MODEL`, `INTENT_STATE_DIR`, `INTENT_FEEDBACK_DELAY_TODAY`, `INTENT_FEEDBACK_DELAY_SOON`, `INTENT_CORTEX_DIR`, `OPENAI_API_KEY`, and the same `SCRIBE_PUSHOVER_*` keys as daily reflection.
 
 ## `vault_mapper.py` CLI
 

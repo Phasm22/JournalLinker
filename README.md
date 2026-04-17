@@ -33,14 +33,29 @@ Voice entries are first-class. A recording made at 11 PM is attributed to that d
 
 ## Quick start
 
-1. Create `**.env`** in the repo root:
-  ```bash
-   SCRIBE_JOURNAL_DIR="/path/to/your/daily-notes-folder"
-   # optional:
-   # SCRIBE_MODEL="llama3.1:8b"
-   # SCRIBE_CTX="8192"
-   # SCRIBE_WHISPER_MODEL="base.en"
-  ```
+1. Configure environment variables (recommended: **outside the git repo**):
+
+```bash
+install -d -m 700 ~/.config/journal-linker
+${EDITOR:-nano} ~/.config/journal-linker/journal-linker.env
+chmod 600 ~/.config/journal-linker/journal-linker.env
+```
+
+Put at least:
+
+```bash
+SCRIBE_JOURNAL_DIR="/path/to/your/daily-notes-folder"
+# optional:
+# SCRIBE_MODEL="llama3.1:8b"
+# SCRIBE_CTX="8192"
+# SCRIBE_WHISPER_MODEL="base.en"
+```
+
+Alternative locations (see `journal_linker_env.py`):
+
+- `JOURNAL_LINKER_ENV_FILE=/path/to/file.env` (good for systemd `EnvironmentFile=`)
+- Legacy dev: repo-root `.env` only if `JOURNAL_LINKER_DOTENV=1`
+
 2. Daily notes must be named `**YYYY-MM-DD.md**`.
 3. Run `just` to list all recipes, or see [Commands](#commands-just) below.
 
@@ -63,7 +78,7 @@ Install [just](https://github.com/casey/just) (`brew install just`).
 | `just daily-reflection` | Dry-run the day-behind Pushover reflection and print the notification |
 | `just daily-reflection-send` | Run the real Pushover delivery path manually                 |
 | `just test`             | Run pytest (Ollama mocked)                                         |
-| `just doctor`           | Paths, venv, `.env`, and log locations                             |
+| `just doctor`           | Paths, venv, env config, and log locations                         |
 
 
 **Echo (voice)**

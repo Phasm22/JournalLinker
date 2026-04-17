@@ -11,6 +11,7 @@ import urllib.request
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
+from journal_linker_env import bootstrap_journal_linker_env
 from weekly_insights import (
     DEFAULT_MEMORY_STORE_FILE,
     MIN_SUBSTANTIVE_ENTRY_WORDS,
@@ -19,7 +20,6 @@ from weekly_insights import (
     extract_json_obj,
     extract_keyword_tokens,
     load_memory_store,
-    load_local_env,
     strip_think,
 )
 
@@ -45,7 +45,7 @@ DEFAULT_DAILY_REFLECTION_MODEL = "llama3.1:8b"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    load_local_env(Path(__file__).with_name(".env"))
+    bootstrap_journal_linker_env(repo_root=Path(__file__).resolve().parent)
 
     parser = argparse.ArgumentParser(description="Generate and send a once-daily day-behind Pushover reflection.")
     parser.add_argument("--journal-dir", default=os.getenv("SCRIBE_JOURNAL_DIR"))

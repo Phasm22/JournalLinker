@@ -38,4 +38,4 @@ Recent commits use short, imperative summaries like `Add ...`, `Rewrite ...`, or
 
 ## Security & Configuration Tips
 
-Do not commit secrets or machine-specific paths. Create `.env` locally with `SCRIBE_JOURNAL_DIR` and any optional model or Pushover settings. Generated state such as `scribe_learning.json` is intentionally local and should stay out of version control.
+Do not commit secrets or machine-specific paths. Prefer `~/.config/journal-linker/journal-linker.env` (mode `0600`) or systemd `EnvironmentFile=` + `JOURNAL_LINKER_ENV_FILE=...` for secrets. Repo-root `.env` is supported only as an explicit dev escape hatch (`JOURNAL_LINKER_DOTENV=1`). Generated state such as `scribe_learning.json` is intentionally local and should stay out of version control.

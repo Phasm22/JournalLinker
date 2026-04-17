@@ -6,6 +6,7 @@ from collections import Counter
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+from journal_linker_env import bootstrap_journal_linker_env
 from local_embeddings import LocalEmbeddingCache, average_vector, cosine_similarity as embedding_cosine_similarity, normalize_embedding_text
 
 
@@ -31,7 +32,7 @@ def load_local_env(path: Path) -> None:
         os.environ[key] = value
 
 
-load_local_env(Path(__file__).with_name(".env"))
+bootstrap_journal_linker_env(repo_root=Path(__file__).resolve().parent)
 
 try:
     import ollama
@@ -126,30 +127,8 @@ STOPWORDS = {
 }
 
 
-def load_local_env(path: Path) -> None:
-    if not path.exists():
-        return
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except Exception:
-        return
-
-    for raw in lines:
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        if not key or key in os.environ:
-            continue
-        value = value.strip()
-        if len(value) >= 2 and ((value[0] == value[-1] == "\"") or (value[0] == value[-1] == "'")):
-            value = value[1:-1]
-        os.environ[key] = value
-
-
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    load_local_env(Path(__file__).with_name(".env"))
+    bootstrap_journal_linker_env(repo_root=Path(__file__).resolve().parent)
 
     parser = argparse.ArgumentParser(description="Generate a weekly Obsidian reflection note.")
     parser.add_argument("--journal-dir", default=os.getenv("SCRIBE_JOURNAL_DIR"))

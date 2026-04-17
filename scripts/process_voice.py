@@ -11,7 +11,7 @@ Usage:
     python3 scripts/process_voice.py path/to/note.m4a     # process one file
     python3 scripts/process_voice.py --dry-run             # no writes, print only
 
-Env vars (from .env or environment):
+Env vars (from environment, optional XDG env file, or legacy repo `.env`):
     SCRIBE_JOURNAL_DIR    — daily notes folder (required)
     SCRIBE_VOICEDROP_DIR  — watch folder (default: ~/Library/Mobile Documents/
                              com~apple~CloudDocs/VoiceDrop)
@@ -30,6 +30,12 @@ import sys
 import textwrap
 from datetime import datetime, timedelta
 from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from journal_linker_env import bootstrap_journal_linker_env
 
 RECENCY_LAMBDA = 0.08  # same as Scribe.py
 WHISPER_PROMPT_MAX_CHARS = 800  # ~200 tokens; Whisper decoder prefix limit is 223
@@ -435,7 +441,7 @@ def process_file(
 
 def parse_cli() -> argparse.Namespace:
     repo_root = Path(__file__).resolve().parents[1]
-    load_local_env(repo_root / ".env")
+    bootstrap_journal_linker_env(repo_root=repo_root)
 
     parser = argparse.ArgumentParser(
         description="Transcribe voice recordings and append to the Obsidian journal."
@@ -481,7 +487,11 @@ def main() -> int:
     args = parse_cli()
 
     if not args.journal_dir:
-        print("[voice] SCRIBE_JOURNAL_DIR is not set. Add it to .env or pass --journal-dir.", file=sys.stderr)
+        print(
+            "[voice] SCRIBE_JOURNAL_DIR is not set. Export it, add it to ~/.config/journal-linker/journal-linker.env, "
+            "or pass --journal-dir.",
+            file=sys.stderr,
+        )
         return 1
 
     journal_dir = Path(args.journal_dir).expanduser()
