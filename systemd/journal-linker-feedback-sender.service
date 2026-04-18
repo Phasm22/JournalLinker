@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-EnvironmentFile=%h/.config/journal-linker/env
+EnvironmentFile=%h/.config/journal-linker/journal-linker.env
 ExecStart=/bin/bash ${JOURNAL_LINKER_REPO}/scripts/feedback_sender.sh --daemon
 Restart=always
 RestartSec=10
