@@ -99,7 +99,7 @@ class TestJournalLinkerEnvBootstrap(unittest.TestCase):
                 journal_linker_env.bootstrap_journal_linker_env(repo_root=repo)
                 self.assertEqual(os.environ.get("SCRIBE_JOURNAL_DIR"), "/legacy")
 
-    def test_falls_back_to_legacy_xdg_filename(self) -> None:
+    def test_does_not_load_legacy_xdg_env_filename(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             cfg = Path(d) / "config"
             jl_dir = cfg / "journal-linker"
@@ -112,4 +112,4 @@ class TestJournalLinkerEnvBootstrap(unittest.TestCase):
                 repo = Path(d) / "repo"
                 repo.mkdir()
                 journal_linker_env.bootstrap_journal_linker_env(repo_root=repo)
-                self.assertEqual(os.environ.get("SCRIBE_JOURNAL_DIR"), "/xdg_legacy")
+                self.assertNotIn("SCRIBE_JOURNAL_DIR", os.environ)

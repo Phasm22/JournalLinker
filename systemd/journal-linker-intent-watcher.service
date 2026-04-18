@@ -6,7 +6,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-EnvironmentFile=-%h/.config/journal-linker/env
+EnvironmentFile=-%h/.config/journal-linker/journal-linker.env
 ExecStart=/bin/bash ${JOURNAL_LINKER_REPO}/scripts/intent_watcher.sh
 
 [Install]

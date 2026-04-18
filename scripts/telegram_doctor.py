@@ -2,7 +2,7 @@
 """Connectivity check for Telegram Bot API (getMe + optional getChat).
 
 Reads TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID from the environment.
-Use `just telegram-doctor` to load .env and ~/.config/journal-linker/env first."""
+Use `just telegram-doctor` to load .env and ~/.config/journal-linker/journal-linker.env first."""
 
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ def main() -> int:
 
     if not token:
         print("  FAIL: TELEGRAM_BOT_TOKEN is not set")
-        print("  Set it in .env or ~/.config/journal-linker/env (see systemd/journal-linker.env.example)")
+        print("  Set it in .env or ~/.config/journal-linker/journal-linker.env (see systemd/journal-linker.env.example)")
         return 1
 
     try:

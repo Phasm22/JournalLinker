@@ -6,7 +6,6 @@ That pattern is convenient for development but a poor default for secrets.
 Bootstrap precedence (never overwrites existing os.environ values):
 1) `JOURNAL_LINKER_ENV_FILE` if set **and the path exists**
 2) `XDG_CONFIG_HOME/journal-linker/journal-linker.env` (fallback: `~/.config/journal-linker/journal-linker.env`)
-   - Compatibility: if that file is missing, also try `.../journal-linker/env` (older filename used by earlier systemd/docs)
 3) Optional legacy: `<repo_root>/.env` ONLY if `JOURNAL_LINKER_DOTENV=1`
 
 This module is intentionally tiny and stdlib-only so every entrypoint can import it safely.
@@ -60,13 +59,8 @@ def bootstrap_journal_linker_env(*, repo_root: Path) -> None:
     xdg = (os.environ.get("XDG_CONFIG_HOME") or "").strip()
     cfg_home = Path(xdg).expanduser() if xdg else (Path.home() / ".config")
     user_env = (cfg_home / "journal-linker" / "journal-linker.env").expanduser()
-    legacy_user_env = (cfg_home / "journal-linker" / "env").expanduser()
     if user_env.exists():
         load_key_value_file(user_env)
-        os.environ["JOURNAL_LINKER_ENV_BOOTSTRAPPED"] = "1"
-        return
-    if legacy_user_env.exists():
-        load_key_value_file(legacy_user_env)
         os.environ["JOURNAL_LINKER_ENV_BOOTSTRAPPED"] = "1"
         return
 
