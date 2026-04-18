@@ -1,0 +1,10 @@
+[Unit]
+Description=Journal Linker — intent retry every 15 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+Unit=journal-linker-intent-retry.service
+
+[Install]
+WantedBy=timers.target

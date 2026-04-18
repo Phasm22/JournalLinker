@@ -73,6 +73,10 @@ voice-scan:
 voice-install:
     "{{py}}" -m pip install faster-whisper
 
+# Telegram Bot API: getMe + getChat (loads .env and ~/.config/journal-linker/env)
+telegram-doctor:
+    @bash -c 'set -a; [[ -f "{{root}}/.env" ]] && . "{{root}}/.env"; [[ -f "$HOME/.config/journal-linker/env" ]] && . "$HOME/.config/journal-linker/env"; set +a; "{{py}}" "{{root}}/scripts/telegram_doctor.py"'
+
 # Check voice pipeline health: faster-whisper, VoiceDrop dir, pending count
 voice-doctor:
     @printf '%s\n' "Journal Linker — Voice Pipeline"
@@ -84,6 +88,26 @@ voice-doctor:
       "" \
       "  Voice logs:     ~/Library/Logs/JournalLinker/ (voice-*-PID.log, voice-latest.log)" \
       "  iOS setup:      docs/ios-setup.md"
+
+# Run intent pipeline on a single note (debug / manual run)
+intent FILE:
+    "{{py}}" "{{root}}/scripts/process_intents.py" --file "{{FILE}}"
+
+# Dry-run intent pipeline: show envelope + planned route without side effects
+intent-dry FILE:
+    "{{py}}" "{{root}}/scripts/process_intents.py" --file "{{FILE}}" --dry-run --verbose
+
+# Replay transient intent failures from the retry queue
+intent-retry:
+    "{{py}}" "{{root}}/scripts/process_intents.py" --retry
+
+# Reset intent ledger and state files (dev/debug; irreversible)
+intent-reset-ledger:
+    "{{py}}" "{{root}}/scripts/process_intents.py" --reset-ledger
+
+# Prune intent ledger entries older than 30 days
+intent-prune:
+    "{{py}}" "{{root}}/scripts/process_intents.py" --prune-ledger --older-than 30d
 
 # What this is, where it lives on disk, and where scheduled runs log
 doctor:

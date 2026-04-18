@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.journal-linker.intent</string>
+
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>SCRIBE_JOURNAL_DIR</key>
+		<string>REPLACE_WITH_YOUR_JOURNAL_PATH</string>
+		<!-- Required for OpenAI routing -->
+		<key>OPENAI_API_KEY</key>
+		<string>REPLACE_WITH_YOUR_OPENAI_KEY</string>
+		<!-- Optional: Pushover credentials for notification delivery -->
+		<!-- <key>SCRIBE_PUSHOVER_APP_TOKEN</key> -->
+		<!-- <string>your-app-token</string> -->
+		<!-- <key>SCRIBE_PUSHOVER_USER_KEY</key> -->
+		<!-- <string>your-user-key</string> -->
+		<!-- Optional: override gate model (default: phi4:14b) -->
+		<!-- <key>INTENT_GATE_MODEL</key> -->
+		<!-- <string>phi4:14b</string> -->
+		<!-- Optional: explicit cortex write dir (default: <journal_dir>/cortex) -->
+		<!-- <key>INTENT_CORTEX_DIR</key> -->
+		<!-- <string>/Users/YOURNAME/path/to/cortex</string> -->
+	</dict>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>REPLACE_WITH_REPO_PATH/scripts/intent_watcher.sh</string>
+	</array>
+
+	<!-- WatchPaths fires when any file appears or changes in the journal directory.
+	     Set INTENT_NOTE_FILE in the environment or update the watcher script to
+	     pass the specific changed note path via --file. -->
+	<key>WatchPaths</key>
+	<array>
+		<string>REPLACE_WITH_YOUR_JOURNAL_PATH</string>
+	</array>
+
+	<key>StandardErrorPath</key>
+	<string>/tmp/intent-watcher.launchd.wrapper.err.log</string>
+	<key>StandardOutPath</key>
+	<string>/tmp/intent-watcher.launchd.wrapper.out.log</string>
+	<key>WorkingDirectory</key>
+	<string>REPLACE_WITH_REPO_PATH</string>
+</dict>
+</plist>

@@ -1,0 +1,14 @@
+# Fires when the journal directory changes (inotify).
+# Directory must exist before enabling: systemctl --user enable --now …
+# Path must be a literal (no env expansion). Default: ~/Dropbox/daily-notes
+# Override with: systemctl --user edit journal-linker-intent-watcher.path
+# If inotify is unreliable, use journal-linker-intent-retry.timer instead.
+[Unit]
+Description=Journal Linker — watch journal directory for intent processing
+
+[Path]
+PathChanged=/home/tj/Documents/twin-brain/TJ's PC/much thinks
+Unit=journal-linker-intent-watcher.service
+
+[Install]
+WantedBy=paths.target

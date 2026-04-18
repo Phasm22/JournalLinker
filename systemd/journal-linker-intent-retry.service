@@ -1,0 +1,13 @@
+# Activated by journal-linker-intent-retry.timer every 15 minutes.
+[Unit]
+Description=Journal Linker — intent retry (process_intents --retry)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-%h/.config/journal-linker/env
+ExecStart=/bin/bash ${JOURNAL_LINKER_REPO}/scripts/intent_retry.sh
+
+[Install]
+WantedBy=default.target

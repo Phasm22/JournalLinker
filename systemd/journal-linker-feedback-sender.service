@@ -1,0 +1,7 @@
+[Unit]
+Description=Journal Linker — send due intent feedback prompts via Telegram
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/.config/journal-linker/env
+ExecStart=/bin/bash ${JOURNAL_LINKER_REPO}/scripts/feedback_sender.sh

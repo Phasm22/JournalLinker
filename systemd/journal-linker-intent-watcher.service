@@ -1,0 +1,13 @@
+# Triggered by journal-linker-intent-watcher.path (journal directory changes).
+[Unit]
+Description=Journal Linker — intent watcher (process_intents)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-%h/.config/journal-linker/env
+ExecStart=/bin/bash ${JOURNAL_LINKER_REPO}/scripts/intent_watcher.sh
+
+[Install]
+WantedBy=default.target
