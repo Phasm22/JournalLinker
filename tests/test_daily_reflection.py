@@ -16,6 +16,8 @@ daily_reflection = importlib.util.module_from_spec(spec)
 assert spec and spec.loader
 spec.loader.exec_module(daily_reflection)
 
+LIVE_OLLAMA_SMOKE = os.getenv("JOURNAL_LINKER_LIVE_SMOKE") == "1"
+
 
 SUBSTANTIVE_DAY = """
 ---
@@ -388,6 +390,24 @@ class TestDailyReflection(unittest.TestCase):
 
             self.assertEqual(exit_code, 0)
             self.assertIn("[daily_reflection] status=dry-run", stdout.getvalue())
+
+    @unittest.skipUnless(LIVE_OLLAMA_SMOKE, "set JOURNAL_LINKER_LIVE_SMOKE=1 to run live Ollama smoke tests")
+    def test_live_ollama_smoke_for_daily_reflection(self):
+        signals = {
+            "entry_date": "2026-04-08",
+            "entry_text": "Work felt heavy but the evening was calmer.",
+            "memory_hits": [],
+            "keywords": ["work", "calm"],
+            "confidence": 0.5,
+        }
+        response = daily_reflection.ollama.chat(
+            model=os.getenv("SCRIBE_DAILY_REFLECTION_MODEL", os.getenv("SCRIBE_MODEL", "llama3.1:8b")),
+            messages=[{"role": "user", "content": daily_reflection.build_daily_reflection_prompt(signals)}],
+            options={"temperature": 0.45, "num_ctx": 128},
+            keep_alive="5m",
+        )
+        self.assertIn("message", response)
+        self.assertTrue(str(response["message"].get("content", "")).strip())
 
 
 if __name__ == "__main__":

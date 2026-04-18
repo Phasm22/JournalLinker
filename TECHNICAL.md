@@ -124,3 +124,4 @@ python3 vault_mapper.py --min-cooccurrence 3
 - Navigation links are corrected to nearby existing journal dates when `SCRIBE_JOURNAL_DIR` is set.
 - For body-only Shortcut input, Scribe updates nav links in the resolved active note file by default.
 - Scribe also updates the previous existing journal note so its `Tomorrow` points at the latest note.
+- `just test` runs plain `pytest`; `just coverage` requires `coverage` in the project venv and prints missing lines after the test run.

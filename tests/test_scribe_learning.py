@@ -14,6 +14,8 @@ scribe = importlib.util.module_from_spec(spec)
 assert spec and spec.loader
 spec.loader.exec_module(scribe)
 
+LIVE_OLLAMA_SMOKE = os.getenv("JOURNAL_LINKER_LIVE_SMOKE") == "1"
+
 
 class TestScribeLearning(unittest.TestCase):
     @classmethod
@@ -748,6 +750,52 @@ class TestScribeLearning(unittest.TestCase):
             self.assertIn("**Status:** Error", report_text)
             self.assertIn("boom", report_text)
             self.assertIn("## Traceback", report_text)
+
+    @unittest.skipUnless(LIVE_OLLAMA_SMOKE, "set JOURNAL_LINKER_LIVE_SMOKE=1 to run live Ollama smoke tests")
+    def test_live_ollama_smoke_for_scribe(self):
+        response = scribe.ollama.chat(
+            model=os.getenv("SCRIBE_MODEL", "llama3.1:8b"),
+            messages=[{"role": "user", "content": "Reply with a short sentence that contains the word journal."}],
+            options={"temperature": 0, "num_ctx": 128},
+            keep_alive="5m",
+        )
+        self.assertIn("message", response)
+        self.assertTrue(str(response["message"].get("content", "")).strip())
+
+    def test_main_writes_fixture_back_to_active_note(self):
+        fixture = Path(__file__).resolve().parent / "fixtures" / "flows" / "entry_proper_nouns.md"
+        with tempfile.TemporaryDirectory() as d:
+            journal_dir = Path(d) / "journal"
+            journal_dir.mkdir()
+            note_path = journal_dir / "2026-04-01.md"
+            note_path.write_text(fixture.read_text(encoding="utf-8"), encoding="utf-8")
+            learning_path = Path(d) / "scribe_learning.json"
+            model_response = {
+                "message": {"content": '{"links":["Marcus","Jordan","Anthropic"]}'},
+                "eval_duration": 321,
+            }
+
+            with (
+                mock.patch.object(
+                    scribe,
+                    "parse_cli",
+                    return_value=("test-model", 2048, str(journal_dir), False, "2026-04-01", None, True, []),
+                ),
+                mock.patch.object(scribe, "get_input_text", return_value=("", "stdin_pipe_empty")),
+                mock.patch.object(scribe, "get_clipboard_text", return_value=""),
+                mock.patch.object(scribe, "MEMORY_STORE_FILE", learning_path),
+                mock.patch.object(scribe.ollama, "chat", return_value=model_response),
+                mock.patch("sys.stdout", new_callable=io.StringIO) as stdout,
+                mock.patch("sys.stderr", new_callable=io.StringIO),
+            ):
+                exit_code = scribe.main()
+
+            self.assertEqual(exit_code, 0)
+            updated = note_path.read_text(encoding="utf-8")
+            self.assertIn("[[Marcus]]", updated)
+            self.assertIn("[[Jordan]]", updated)
+            self.assertIn("Anthropic", updated)
+            self.assertIn("[[Marcus]]", stdout.getvalue())
 
 
 if __name__ == "__main__":

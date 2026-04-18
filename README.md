@@ -82,6 +82,7 @@ Install [just](https://github.com/casey/just) (`brew install just`).
 | `just daily-reflection` | Dry-run the day-behind Pushover reflection and print the notification |
 | `just daily-reflection-send` | Run the real Pushover delivery path manually                 |
 | `just test`             | Run pytest (Ollama mocked)                                         |
+| `just coverage`         | Run pytest under coverage and print missing lines                  |
 | `just doctor`           | Paths, venv, env config, and log locations                         |
 
 

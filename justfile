@@ -49,6 +49,17 @@ daily-reflection-send *ARGS:
 test:
     "{{py}}" -m pytest tests/
 
+# Run pytest under coverage and print the line-by-line report
+coverage:
+    "{{py}}" -m coverage run -m pytest tests/
+    "{{py}}" -m coverage report --show-missing
+
+# Generate an HTML coverage report in htmlcov/
+coverage-html:
+    "{{py}}" -m coverage run -m pytest tests/
+    "{{py}}" -m coverage html
+    @printf '%s\n' "Coverage HTML written to htmlcov/index.html"
+
 # Process a single voice recording (test/debug). e.g. `just voice ~/path/to/2026-04-04-1430.m4a`
 voice FILE:
     "{{py}}" "{{root}}/scripts/process_voice.py" "{{FILE}}"

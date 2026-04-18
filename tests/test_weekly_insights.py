@@ -2,6 +2,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,6 +14,8 @@ spec = importlib.util.spec_from_file_location("weekly_insights", SCRIPT_PATH)
 weekly_insights = importlib.util.module_from_spec(spec)
 assert spec and spec.loader
 spec.loader.exec_module(weekly_insights)
+
+LIVE_OLLAMA_SMOKE = os.getenv("JOURNAL_LINKER_LIVE_SMOKE") == "1"
 
 
 SUBSTANTIVE_DAY_ONE = """
@@ -413,6 +416,17 @@ The whole thing felt like carrying too much at once.
                 exit_code = weekly_insights.main()
             self.assertEqual(exit_code, 0)
             self.assertIn("[weekly_insights] wrote=", write_stdout.getvalue())
+
+    @unittest.skipUnless(LIVE_OLLAMA_SMOKE, "set JOURNAL_LINKER_LIVE_SMOKE=1 to run live Ollama smoke tests")
+    def test_live_ollama_smoke_for_weekly_insights(self):
+        response = weekly_insights.ollama.chat(
+            model=os.getenv("SCRIBE_MODEL", "llama3.1:8b"),
+            messages=[{"role": "user", "content": "Reply with one short sentence about a weekly reflection."}],
+            options={"temperature": 0.2, "num_ctx": 128},
+            keep_alive="5m",
+        )
+        self.assertIn("message", response)
+        self.assertTrue(str(response["message"].get("content", "")).strip())
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
+import urllib.parse
 
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "process_intents.py"
 spec = importlib.util.spec_from_file_location("process_intents", SCRIPT_PATH)
@@ -20,6 +21,7 @@ assert spec and spec.loader
 spec.loader.exec_module(pi)
 
 FIXTURE_NOTE = Path(__file__).resolve().parent / "fixtures" / "intent_sample.md"
+LIVE_OLLAMA_SMOKE = os.getenv("JOURNAL_LINKER_LIVE_SMOKE") == "1"
 
 
 # ---------------------------------------------------------------------------
@@ -282,6 +284,38 @@ class TestParsePushoverUrgenciesAllowed(unittest.TestCase):
             self.assertEqual(pi.parse_pushover_urgencies_allowed(), {"immediate", "today"})
 
 
+class TestSendPushoverContract(unittest.TestCase):
+    def test_builds_expected_request_and_returns_response(self):
+        fake_resp = mock.Mock()
+        fake_resp.status = 200
+        fake_resp.read.return_value = b'{"status":"ok"}'
+        fake_resp.close.return_value = None
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "SCRIBE_PUSHOVER_APP_TOKEN": "app-token",
+                "SCRIBE_PUSHOVER_USER_KEY": "user-key",
+                "SCRIBE_PUSHOVER_SERVER": "https://api.pushover.net",
+                "SCRIBE_PUSHOVER_DEVICE": "phone-1",
+            },
+            clear=False,
+        ), mock.patch.object(pi.urllib.request, "urlopen", return_value=fake_resp) as urlopen_mock:
+            status, body = pi.send_pushover("Call doctor", "Follow up.", urgency="today")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(body, '{"status":"ok"}')
+        request = urlopen_mock.call_args.args[0]
+        self.assertEqual(request.full_url, "https://api.pushover.net/1/messages.json")
+        parsed = urllib.parse.parse_qs(request.data.decode("utf-8"))
+        self.assertEqual(parsed["token"], ["app-token"])
+        self.assertEqual(parsed["user"], ["user-key"])
+        self.assertEqual(parsed["title"], ["Call doctor"])
+        self.assertEqual(parsed["message"], ["Follow up."])
+        self.assertEqual(parsed["priority"], ["0"])
+        self.assertEqual(parsed["device"], ["phone-1"])
+
+
 class TestPipelinePushoverDedupe(unittest.TestCase):
     """Second watcher run must not call Pushover again for the same idempotency key."""
 
@@ -335,6 +369,20 @@ class TestPipelinePushoverDedupe(unittest.TestCase):
         self.assertEqual(e1, pi.EXIT_SUCCESS)
         self.assertEqual(e2, pi.EXIT_SUCCESS)
         self.assertEqual(mock_po.call_count, 1)
+
+    @unittest.skipUnless(LIVE_OLLAMA_SMOKE, "set JOURNAL_LINKER_LIVE_SMOKE=1 to run live Ollama smoke tests")
+    def test_live_ollama_smoke_for_intent_gate(self):
+        import ollama as live_ollama
+
+        prompt = pi.build_gate_prompt("I need to call the doctor.", "phi4")
+        response = live_ollama.chat(
+            model=os.getenv("INTENT_GATE_MODEL", pi.DEFAULT_GATE_MODEL),
+            messages=[{"role": "user", "content": prompt}],
+            options={"temperature": 0.0, "num_ctx": 128},
+            keep_alive=pi.KEEP_ALIVE,
+        )
+        self.assertIn("message", response)
+        self.assertTrue(str(response["message"].get("content", "")).strip())
 
 
 class TestPipelinePartialRetrySkipsPushover(unittest.TestCase):
