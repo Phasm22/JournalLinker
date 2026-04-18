@@ -30,7 +30,7 @@ Env vars (from .env or environment):
                                  (default: ~/.local/state/journal-linker/intents)
     INTENT_CLAUDE_IN_FLIGHT_TTL  seconds before in-flight entry is treated as stale
                                  (default: 300)
-    INTENT_ENRICHMENT_MODE       off|llmlib (default: off)
+    INTENT_ENRICHMENT_MODE       off|llmlib (default: llmlib)
     LLMLIBRARIAN_SRC             path to llmLibrarian/src (default: ~/Desktop/llmLibrarian/src)
     INTENT_MAX_INTENTS_PER_NOTE  max intents extracted per note (default: 5)
     INTENT_FEEDBACK_DELAY_TODAY  seconds before feedback prompt fires for today/immediate urgency (default: 21600 = 6h)
@@ -82,7 +82,8 @@ DEFAULT_IN_FLIGHT_TTL = 300  # seconds
 DEFAULT_MAX_INTENTS = 5
 DEFAULT_PUSHOVER_SERVER = "https://api.pushover.net"
 DEFAULT_PUSHOVER_PRIORITY = "0"
-INTENT_IDEMPOTENCY_VERSION = "2"
+DEFAULT_ENRICHMENT_MODE = "llmlib"
+INTENT_IDEMPOTENCY_VERSION = "3"
 KEEP_ALIVE = "5m"
 
 LEDGER_FILENAME = "intent_delivery_ledger.jsonl"
@@ -90,6 +91,8 @@ RUN_HISTORY_FILENAME = "intent_run_history.jsonl"
 RETRY_QUEUE_FILENAME = "intent_retry_queue.jsonl"
 DIGEST_QUEUE_FILENAME = "intent_digest_queue.jsonl"
 FEEDBACK_QUEUE_FILENAME = "intent_feedback_queue.jsonl"
+ACTION_QUEUE_FILENAME = "intent_action_queue.jsonl"
+CONSENT_FILENAME = "intent_consent.json"
 
 
 # ---------------------------------------------------------------------------
@@ -183,7 +186,9 @@ def _build_gate_prompt_phi4(text_excerpt: str) -> str:
         f"{text_excerpt}\n"
         "---\n\n"
         "Respond with JSON only, no extra text. Return an empty list if nothing actionable is found.\n"
-        '{"intents": [{"intent_raw": "<short phrase>", "category": "<task|reminder|commitment|plan>"}]}'
+        "Use category for note organization and intent_class for downstream behavior.\n"
+        "Valid intent_class values: task_intent, purchase_intent, latent_interest.\n"
+        '{"intents": [{"intent_raw": "<short phrase>", "category": "<task|reminder|commitment|plan>", "intent_class": "<task_intent|purchase_intent|latent_interest>"}]}'
     )
 
 
@@ -192,9 +197,11 @@ def _build_gate_prompt_qwen25(text_excerpt: str) -> str:
         "<|im_start|>system\n"
         "You are an intent extractor for personal journal notes. "
         "Extract ALL actionable intents (tasks, reminders, commitments, plans). "
+        "Also classify the downstream intent class. "
         "Output only a JSON object — no markdown fences, no extra text.\n"
-        'Schema: {"intents": [{"intent_raw": string, "category": string}]}\n'
+        'Schema: {"intents": [{"intent_raw": string, "category": string, "intent_class": string}]}\n'
         "Valid categories: task, reminder, commitment, plan\n"
+        "Valid intent_class: task_intent, purchase_intent, latent_interest\n"
         "Return an empty intents list if nothing actionable is found.\n"
         "<|im_end|>\n"
         "<|im_start|>user\n"
@@ -243,6 +250,19 @@ def call_gate(note_text: str, model: str, style: str, num_ctx: int = 4096) -> li
 
 
 _VALID_CATEGORIES = {"task", "reminder", "commitment", "plan", "none"}
+_VALID_INTENT_CLASSES = {"task_intent", "purchase_intent", "latent_interest", "none"}
+_VALID_ACTIONS = {
+    "notification",
+    "note_capture",
+    "digest_capture",
+    "future_action_search_enqueue",
+}
+
+
+def _fallback_intent_class(category: str) -> str:
+    if category in {"task", "reminder", "commitment", "plan"}:
+        return "task_intent"
+    return "none"
 
 
 def _parse_gate_output(data: dict) -> list[dict]:
@@ -259,8 +279,17 @@ def _parse_gate_output(data: dict) -> list[dict]:
         category = str(item.get("category", "none")).strip().lower()
         if category not in _VALID_CATEGORIES:
             category = "none"
+        intent_class = str(item.get("intent_class", "")).strip().lower()
+        if not intent_class:
+            intent_class = _fallback_intent_class(category)
+        if intent_class not in _VALID_INTENT_CLASSES:
+            intent_class = "none"
         if intent_raw:
-            valid.append({"intent_raw": intent_raw, "category": category})
+            valid.append({
+                "intent_raw": intent_raw,
+                "category": category,
+                "intent_class": intent_class,
+            })
     return valid
 
 
@@ -300,6 +329,7 @@ def compute_idempotency_key(
     category: str,
     gate_model: str,
     gate_style: str,
+    intent_class: str = "task_intent",
 ) -> str:
     """Return lowercase hex SHA-256 of a fixed-order fingerprint document.
 
@@ -312,6 +342,7 @@ def compute_idempotency_key(
         f"source_date={source_date}",
         f"intent_raw={intent_raw}",
         f"category={category}",
+        f"intent_class={intent_class}",
         f"gate_model={gate_model}",
         f"gate_style={gate_style}",
     ])
@@ -325,6 +356,7 @@ def build_envelope(
     intent_raw: str,
     category: str,
     enrichment_mode: str,
+    intent_class: str = "task_intent",
     note_text: str | None = None,
 ) -> dict:
     """Build the context envelope for a single intent."""
@@ -334,11 +366,12 @@ def build_envelope(
         "intent_raw": intent_raw,
         "surrounding_context": surrounding,
         "inferred_category": category,
+        "intent_class": intent_class,
         "timestamp": journal_timestamp,
         "source_file": source_path.expanduser().resolve().as_posix(),
         "source_stat": source_stat_str,
         "enrichment_mode": enrichment_mode,
-        "prompt_version": "1",
+        "prompt_version": "2",
     }
     return envelope
 
@@ -383,16 +416,23 @@ ROUTING_SYSTEM_PROMPT = (
     "You are a structured intent router for a personal journal system. "
     "You receive an intent envelope extracted from a daily note and decide how to route it. "
     "Always respond with valid JSON only — no markdown, no prose.\n"
+    "The envelope includes inferred_category for organization and intent_class for behavior. "
+    "Supported intent_class values are task_intent, purchase_intent, and latent_interest.\n"
     "Routing discipline (avoid noisy real-time notifications):\n"
     "- Use urgency=low and format=digest for nice-to-remember items, vague ideas, speculative or observational thoughts about the future, or anything without a hard deadline or concrete commitment.\n"
     "- Use urgency=soon only when timing matters within days but it is not worth interrupting the user now; prefer format=note or digest unless it is truly time-sensitive.\n"
     "- Reserve urgency=immediate or today for concrete, time-bound, or high-consequence actions (deadlines, appointments, money, people waiting).\n"
     "- Use format=notification only when a short ping is strictly better than a capturable note.\n"
+    "- Use action=notification for immediate actions that should interrupt the user.\n"
+    "- Use action=future_action_search_enqueue for purchasable/searchable intent, such as buying, comparing, finding, or researching an item or service.\n"
+    "- Use action=digest_capture or note_capture for latent or long-horizon interest; do not notify for latent_interest unless there is an explicit time-bound commitment.\n"
+    "- For purchase_intent, prefer future_action_search_enqueue or note_capture over notification unless money, deadline, or another person is waiting today.\n"
     "- Set feedback_prompt to empty string when urgency=low.\n"
     "- When urgency is not low, feedback_prompt MUST be a yes/no completion question phrased as 'Did you X?' — never an open-ended question starting with What, How, Why, Which, or Who. The user answers with Done, Skip, or Later buttons, so the question must have a binary yes/no answer.\n"
     "Required output schema:\n"
     '{"urgency": "immediate|today|soon|low", '
     '"format": "notification|note|digest|draft", '
+    '"action": "notification|note_capture|digest_capture|future_action_search_enqueue", '
     '"title": "<short title under 80 chars>", '
     '"body": "<1-2 sentence summary>", '
     '"defer_to": "<ISO date or empty string>", '
@@ -407,6 +447,7 @@ def call_routing_model(envelope: dict, model: str, dry_run: bool = False) -> dic
         return {
             "urgency": "today",
             "format": "note",
+            "action": "note_capture",
             "title": f"[dry-run] {envelope.get('intent_raw', 'Intent')[:60]}",
             "body": "[dry-run] No routing model call made.",
             "defer_to": "",
@@ -462,6 +503,11 @@ def _validate_claude_response(data: dict) -> dict:
     if fmt not in valid_formats:
         raise ValueError(f"Invalid format value: {fmt!r}")
 
+    action_raw = str(data.get("action", "")).strip().lower()
+    action = action_raw or _legacy_action_for_response({"urgency": urgency, "format": fmt})
+    if action not in _VALID_ACTIONS:
+        raise ValueError(f"Invalid action value: {action!r}")
+
     title = str(data.get("title", "")).strip()[:80]
     body = str(data.get("body", "")).strip()
     defer_to = str(data.get("defer_to", "")).strip()
@@ -470,6 +516,7 @@ def _validate_claude_response(data: dict) -> dict:
     return {
         "urgency": urgency,
         "format": fmt,
+        "action": action,
         "title": title,
         "body": body,
         "defer_to": defer_to,
@@ -553,6 +600,107 @@ def parse_pushover_urgencies_allowed() -> set[str]:
     return valid if valid else {"immediate", "today", "soon"}
 
 
+def resolve_enrichment_mode() -> str:
+    raw = os.getenv("INTENT_ENRICHMENT_MODE", DEFAULT_ENRICHMENT_MODE).strip().lower()
+    if raw not in {"off", "llmlib"}:
+        return DEFAULT_ENRICHMENT_MODE
+    return raw
+
+
+def _legacy_action_for_response(response: dict) -> str:
+    """Map pre-action routing responses onto the new action vocabulary.
+
+    This preserves the old urgency-driven notification behavior for stored ledger
+    rows or mocked tests that do not yet include an explicit action.
+    """
+    fmt = str(response.get("format", "digest")).strip().lower()
+    urgency = str(response.get("urgency", "low")).strip().lower()
+    if fmt == "digest" or urgency == "low":
+        return "digest_capture"
+    if fmt == "draft":
+        return "note_capture"
+    if fmt == "notification" or urgency in parse_pushover_urgencies_allowed():
+        return "notification"
+    return "note_capture"
+
+
+def normalize_action(response: dict) -> str:
+    action = str(response.get("action", "")).strip().lower()
+    if action in _VALID_ACTIONS:
+        return action
+    return _legacy_action_for_response(response)
+
+
+def _consent_path(state_dir: Path) -> Path:
+    return state_dir / CONSENT_FILENAME
+
+
+def load_consent_state(state_dir: Path) -> dict:
+    path = _consent_path(state_dir)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_consent_state(state_dir: Path, state: dict) -> None:
+    path = _consent_path(state_dir)
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=state_dir, suffix=".tmp")
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, ensure_ascii=False, indent=2, sort_keys=True)
+            fh.write("\n")
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def record_intent_class_consent(state_dir: Path, intent_class: str, allowed: bool = True) -> None:
+    state = load_consent_state(state_dir)
+    state[intent_class] = {
+        "allowed": bool(allowed),
+        "updated_at": _now_iso(),
+    }
+    save_consent_state(state_dir, state)
+
+
+def intent_class_has_consent(state_dir: Path, intent_class: str) -> bool:
+    if intent_class in {"task_intent", "none", ""}:
+        return True
+    state = load_consent_state(state_dir)
+    entry = state.get(intent_class)
+    return bool(isinstance(entry, dict) and entry.get("allowed") is True)
+
+
+def compute_feedback_timing(
+    urgency: str,
+    action: str,
+    intent_class: str,
+    now: datetime | None = None,
+) -> dict:
+    now = now or datetime.now(timezone.utc)
+    if urgency == "low" or action in {"digest_capture", "future_action_search_enqueue"}:
+        return {"policy": "do_not_surface_yet", "send_after": ""}
+    if intent_class in {"purchase_intent", "latent_interest"} and action != "notification":
+        return {"policy": "do_not_surface_yet", "send_after": ""}
+    if urgency == "immediate":
+        return {"policy": "show_now", "send_after": now.isoformat(timespec="seconds")}
+    delay_today = int(os.getenv("INTENT_FEEDBACK_DELAY_TODAY", "21600"))
+    delay_soon = int(os.getenv("INTENT_FEEDBACK_DELAY_SOON", "86400"))
+    if urgency == "today":
+        send_after = now + timedelta(seconds=delay_today)
+        return {"policy": "later_today", "send_after": send_after.isoformat(timespec="seconds")}
+    send_after = now + timedelta(seconds=delay_soon)
+    return {"policy": "tomorrow_or_later", "send_after": send_after.isoformat(timespec="seconds")}
+
+
 # ---------------------------------------------------------------------------
 # Delivery: Obsidian cortex write
 # ---------------------------------------------------------------------------
@@ -568,6 +716,9 @@ def write_cortex_note(
     surrounding_context: str = "",
     defer_to: str = "",
     feedback_prompt: str = "",
+    intent_class: str = "task_intent",
+    action: str = "note_capture",
+    consent_required: bool = False,
 ) -> Path:
     safe_title = re.sub(r'[<>:"/\\|?*]', "-", title).strip("-").strip() or "Intent"
     date_prefix = timestamp[:10] if len(timestamp) >= 10 else datetime.now().strftime("%Y-%m-%d")
@@ -584,6 +735,8 @@ def write_cortex_note(
         "---",
         f'source: "{source_link}"',
         f"category: {category}",
+        f"intent_class: {intent_class}",
+        f"action: {action}",
         f"status: open",
         f"tags: [intent, {category}]",
         f"created: {timestamp}",
@@ -592,6 +745,8 @@ def write_cortex_note(
         fm_lines.append(f"defer_to: {defer_to}")
     if feedback_prompt:
         fm_lines.append(f'feedback_prompt: "{feedback_prompt}"')
+    if consent_required:
+        fm_lines.append("consent_required: true")
     fm_lines.append(f"intent_key: {claude_idempotency_key[:16]}")
     fm_lines.append("---")
 
@@ -622,6 +777,13 @@ def append_digest_queue(state_dir: Path, entry: dict) -> None:
     _log("digest", f"queued entry for {entry.get('title', '?')!r}")
 
 
+def append_action_queue(state_dir: Path, entry: dict) -> None:
+    queue_path = state_dir / ACTION_QUEUE_FILENAME
+    with open(queue_path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    _log("action", f"queued future action for {entry.get('title', '?')!r}")
+
+
 def append_feedback_queue(state_dir: Path, entry: dict) -> None:
     queue_path = state_dir / FEEDBACK_QUEUE_FILENAME
     with open(queue_path, "a", encoding="utf-8") as fh:
@@ -649,20 +811,31 @@ def route_delivery(
     """
     urgency = claude_response["urgency"]
     fmt = claude_response["format"]
+    action = normalize_action(claude_response)
     title = claude_response["title"]
     body = claude_response["body"]
     feedback_prompt = claude_response.get("feedback_prompt", "")
     source_file = envelope["source_file"]
     timestamp = envelope["timestamp"]
     category = envelope["inferred_category"]
+    intent_class = envelope.get("intent_class", "task_intent")
 
     results: dict = {"planned_route": [], "results_per_sink": {}, "errors": []}
 
     pushover_urgencies = parse_pushover_urgencies_allowed()
     # Determine planned route
-    push_via_pushover = urgency in pushover_urgencies
+    has_class_consent = intent_class_has_consent(state_dir, intent_class)
+    consent_required = not has_class_consent
+    push_via_pushover = action == "notification" and urgency in pushover_urgencies and has_class_consent
     write_to_cortex = True  # always capture to cortex regardless of format/urgency
-    append_to_digest = fmt == "digest" or urgency == "low" or fmt == "draft"
+    append_to_digest = (
+        action == "digest_capture"
+        or fmt == "digest"
+        or urgency == "low"
+        or fmt == "draft"
+        or consent_required
+    )
+    enqueue_future_action = action == "future_action_search_enqueue" and has_class_consent
 
     if push_via_pushover:
         results["planned_route"].append("pushover")
@@ -670,8 +843,20 @@ def route_delivery(
         results["planned_route"].append("cortex")
     if append_to_digest:
         results["planned_route"].append("digest")
+    if enqueue_future_action:
+        results["planned_route"].append("action_queue")
+    if consent_required:
+        results["results_per_sink"]["consent"] = {
+            "ok": False,
+            "required": True,
+            "intent_class": intent_class,
+        }
 
-    _log("router", f"route={results['planned_route']} urgency={urgency} format={fmt}")
+    _log(
+        "router",
+        f"route={results['planned_route']} urgency={urgency} format={fmt} "
+        f"action={action} intent_class={intent_class}",
+    )
 
     if dry_run:
         _log("router", "dry-run: skipping all sink writes")
@@ -716,6 +901,9 @@ def route_delivery(
                     surrounding_context=envelope.get("surrounding_context", ""),
                     defer_to=claude_response.get("defer_to", ""),
                     feedback_prompt=feedback_prompt,
+                    intent_class=intent_class,
+                    action=action,
+                    consent_required=consent_required,
                 )
                 results["results_per_sink"]["cortex"] = {"ok": True, "path": str(note_path)}
             except Exception as exc:
@@ -739,11 +927,14 @@ def route_delivery(
                     "body": body,
                     "urgency": urgency,
                     "format": fmt,
+                    "action": action,
                     "source_file": source_file,
                     "timestamp": timestamp,
                     "category": category,
+                    "intent_class": intent_class,
                     "queued_at": _now_iso(),
                     "defer_to": claude_response.get("defer_to", ""),
+                    "consent_required": consent_required,
                 }
                 append_digest_queue(state_dir, queue_entry)
                 results["results_per_sink"]["digest"] = {"ok": True}
@@ -751,6 +942,40 @@ def route_delivery(
                 results["errors"].append({"sink": "digest", "error": str(exc)})
                 results["results_per_sink"]["digest"] = {"ok": False, "error": str(exc)}
                 _log("digest", f"ERROR: {exc}")
+
+    # Future action/search queue
+    if enqueue_future_action:
+        if prior_sink_delivered_ok(ledger_entry, "action_queue"):
+            results["results_per_sink"]["action_queue"] = {
+                "ok": True,
+                "skipped": "already_delivered",
+            }
+            _log("action", "skip: already queued for this intent key")
+        else:
+            try:
+                queue_entry = {
+                    "claude_idempotency_key": claude_idempotency_key,
+                    "intent_raw": envelope.get("intent_raw", ""),
+                    "title": title,
+                    "body": body,
+                    "urgency": urgency,
+                    "format": fmt,
+                    "action": action,
+                    "source_file": source_file,
+                    "timestamp": timestamp,
+                    "category": category,
+                    "intent_class": intent_class,
+                    "related_silo_hits": envelope.get("related_silo_hits", []),
+                    "recurrence_signal": envelope.get("recurrence_signal", False),
+                    "queued_at": _now_iso(),
+                    "state": "pending",
+                }
+                append_action_queue(state_dir, queue_entry)
+                results["results_per_sink"]["action_queue"] = {"ok": True}
+            except Exception as exc:
+                results["errors"].append({"sink": "action_queue", "error": str(exc)})
+                results["results_per_sink"]["action_queue"] = {"ok": False, "error": str(exc)}
+                _log("action", f"ERROR: {exc}")
 
     # Feedback queue — schedule a Telegram check-in for today/soon/immediate urgency
     if feedback_prompt and urgency != "low":
@@ -762,22 +987,34 @@ def route_delivery(
             _log("feedback", "skip: already enqueued for this intent key")
         else:
             try:
-                delay_today = int(os.getenv("INTENT_FEEDBACK_DELAY_TODAY", "21600"))
-                delay_soon  = int(os.getenv("INTENT_FEEDBACK_DELAY_SOON",  "86400"))
-                delay_secs = delay_soon if urgency == "soon" else delay_today
                 now = datetime.now(timezone.utc)
-                send_after = (now + timedelta(seconds=delay_secs)).isoformat(timespec="seconds")
+                timing = compute_feedback_timing(urgency, action, intent_class, now=now)
+                send_after = timing.get("send_after", "")
+                if not send_after:
+                    results["results_per_sink"]["feedback_queue"] = {
+                        "ok": True,
+                        "skipped": timing["policy"],
+                    }
+                    _log("feedback", f"skip: timing_policy={timing['policy']}")
+                    return results
                 fb_entry = {
                     "claude_idempotency_key": claude_idempotency_key,
                     "feedback_prompt": feedback_prompt,
                     "title": title,
                     "urgency": urgency,
+                    "format": fmt,
+                    "action": action,
                     "category": category,
+                    "intent_class": intent_class,
+                    "source_file": source_file,
                     "captured_at": _now_iso(),
                     "send_after": send_after,
+                    "timing_policy": timing["policy"],
                     "state": "pending",
                     "telegram_message_id": None,
                     "feedback_signal": None,
+                    "defer_count": 0,
+                    "expires_at": "",
                 }
                 append_feedback_queue(state_dir, fb_entry)
                 results["results_per_sink"]["feedback_queue"] = {"ok": True, "send_after": send_after}
@@ -1024,7 +1261,7 @@ def run_intent_pipeline(
     _log("gate", f"found {len(intents)} intent(s)")
     if verbose:
         for item in intents:
-            _log("gate", f"  [{item['category']}] {item['intent_raw']!r}")
+            _log("gate", f"  [{item['category']}/{item.get('intent_class', 'task_intent')}] {item['intent_raw']!r}")
 
     gate_run_record["gate"] = {"model": gate_model, "style": gate_style, "intent_count": len(intents)}
 
@@ -1043,12 +1280,19 @@ def run_intent_pipeline(
     for intent_index, intent_item in enumerate(intents):
         intent_raw = intent_item["intent_raw"]
         category = intent_item["category"]
+        intent_class = intent_item.get("intent_class", _fallback_intent_class(category))
 
-        _log("intent", f"[{intent_index + 1}/{len(intents)}] category={category!r} raw={intent_raw!r}")
+        _log(
+            "intent",
+            f"[{intent_index + 1}/{len(intents)}] category={category!r} "
+            f"intent_class={intent_class!r} raw={intent_raw!r}",
+        )
 
         envelope = build_envelope(
             source_path, journal_timestamp, source_stat_str,
-            intent_raw, category, enrichment_mode, note_text=note_text,
+            intent_raw, category, enrichment_mode,
+            intent_class=intent_class,
+            note_text=note_text,
         )
         if enrichment_mode == "llmlib":
             envelope = enrich_envelope(envelope)
@@ -1057,6 +1301,7 @@ def run_intent_pipeline(
             source_path, source_date,
             intent_raw, category,
             gate_model, gate_style,
+            intent_class=intent_class,
         )
 
         # If retrying with a specific key, skip intents that don't match
@@ -1079,7 +1324,14 @@ def run_intent_pipeline(
             "source_stat": source_stat_str,
             "intent_raw": intent_raw,
             "category": category,
+            "intent_class": intent_class,
             "status": "in_progress_claude",
+            "envelope": {
+                "intent_class": intent_class,
+                "related_silo_hits": envelope.get("related_silo_hits", []),
+                "recurrence_signal": envelope.get("recurrence_signal", False),
+                "_enrichment_error": envelope.get("_enrichment_error", ""),
+            },
         }
 
         # ── Claude call (with dedup) ──────────────────────────────────────
@@ -1098,6 +1350,7 @@ def run_intent_pipeline(
                 "source_stat": source_stat_str,
                 "intent_raw": intent_raw,
                 "category": category,
+                "intent_class": intent_class,
                 "claude_status": "in_flight",
                 "claude_in_flight_since": _now_iso(),
                 "claude_response": {},
@@ -1175,6 +1428,17 @@ def run_intent_pipeline(
         append_run_record(state_dir, run_record)
 
         ledger_entry["delivery_status"] = delivery_status
+        ledger_entry["title"] = clean_response.get("title", "")
+        ledger_entry["urgency"] = clean_response.get("urgency", "")
+        ledger_entry["format"] = clean_response.get("format", "")
+        ledger_entry["intent_class"] = intent_class
+        ledger_entry["action"] = normalize_action(clean_response)
+        ledger_entry["enrichment"] = {
+            "mode": enrichment_mode,
+            "related_silo_hits": envelope.get("related_silo_hits", []),
+            "recurrence_signal": envelope.get("recurrence_signal", False),
+            "_enrichment_error": envelope.get("_enrichment_error", ""),
+        }
         ledger_entry["delivery_attempts"].append({
             "run_id": run_id,
             "intent_index": intent_index,
@@ -1261,7 +1525,15 @@ def run_retry(
 # ---------------------------------------------------------------------------
 
 def cmd_reset_ledger(state_dir: Path) -> int:
-    for fname in (LEDGER_FILENAME, RUN_HISTORY_FILENAME, RETRY_QUEUE_FILENAME):
+    for fname in (
+        LEDGER_FILENAME,
+        RUN_HISTORY_FILENAME,
+        RETRY_QUEUE_FILENAME,
+        DIGEST_QUEUE_FILENAME,
+        FEEDBACK_QUEUE_FILENAME,
+        ACTION_QUEUE_FILENAME,
+        CONSENT_FILENAME,
+    ):
         p = state_dir / fname
         if p.exists():
             p.unlink()
@@ -1408,7 +1680,7 @@ def main() -> int:
     gate_model = args.gate_model
     gate_style = resolve_gate_style(gate_model)
     routing_model = args.model
-    enrichment_mode = os.getenv("INTENT_ENRICHMENT_MODE", "off").strip().lower()
+    enrichment_mode = resolve_enrichment_mode()
 
     try:
         in_flight_ttl = int(os.getenv("INTENT_CLAUDE_IN_FLIGHT_TTL", str(DEFAULT_IN_FLIGHT_TTL)))

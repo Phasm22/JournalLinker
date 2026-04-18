@@ -111,6 +111,15 @@ feedback-sender *ARGS:
       [[ -n "${JOURNAL_LINKER_ENV_FILE:-}" && -f "${JOURNAL_LINKER_ENV_FILE}" ]] && . "${JOURNAL_LINKER_ENV_FILE}"; \
       set +a; "{{py}}" "{{root}}/scripts/feedback_sender.py" {{ARGS}}'
 
+# Run Telegram feedback sender as a foreground long-polling daemon
+feedback-daemon *ARGS:
+    @bash -c 'set -a; \
+      [[ -f "{{root}}/.env" ]] && . "{{root}}/.env"; \
+      [[ -f "$HOME/.config/journal-linker/journal-linker.env" ]] && . "$HOME/.config/journal-linker/journal-linker.env"; \
+      [[ -f "$HOME/.config/journal-linker/env" ]] && . "$HOME/.config/journal-linker/env"; \
+      [[ -n "${JOURNAL_LINKER_ENV_FILE:-}" && -f "${JOURNAL_LINKER_ENV_FILE}" ]] && . "${JOURNAL_LINKER_ENV_FILE}"; \
+      set +a; "{{py}}" "{{root}}/scripts/feedback_sender.py" --daemon {{ARGS}}'
+
 # Check voice pipeline health: faster-whisper, VoiceDrop dir, pending count
 voice-doctor:
     @printf '%s\n' "Journal Linker — Voice Pipeline"

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Journal Linker — feedback sender (label: com.journal-linker.feedback).
-# Triggered by a systemd timer every 30 minutes.
+# Intended as a persistent systemd service using Telegram long polling.
 # Polls Telegram for callback responses and sends due check-in messages.
 #
 # Logs: $LOG_DIR/feedback-sender-YYYYMMDD-HHMMSS-PID.log
@@ -10,8 +10,6 @@
 #   SCRIBE_JOB_LOG_DIR   override log directory
 #   PYTHON               override Python binary
 #   FEEDBACK_SENDER_PY   override script path
-#
-# Stale lock: rmdir "$LOG_DIR/.feedback-sender.lock"
 
 set -euo pipefail
 
@@ -31,13 +29,6 @@ if ! mkdir -p "$LOG_DIR" 2>/dev/null; then
   mkdir -p "$LOG_DIR"
 fi
 
-LOCK_DIR="$LOG_DIR/.feedback-sender.lock"
-if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-  echo "feedback_sender: skipped — another job is running (lock: $LOCK_DIR). If stuck: rmdir \"$LOCK_DIR\"" >&2
-  exit 0
-fi
-trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT INT TERM HUP
-
 RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"
 LOG_FILE="$LOG_DIR/feedback-sender-$RUN_ID.log"
 LATEST_LINK="$LOG_DIR/feedback-sender-latest.log"
@@ -54,7 +45,7 @@ ts() { date "+%Y-%m-%dT%H:%M:%S%z"; }
 
 set +e
 START_EPOCH=$(date +%s)
-"$PYTHON" "$FEEDBACK_SENDER_PY" 2>&1 | tee -a "$LOG_FILE"
+"$PYTHON" "$FEEDBACK_SENDER_PY" "$@" 2>&1 | tee -a "$LOG_FILE"
 EXIT="${PIPESTATUS[0]}"
 END_EPOCH=$(date +%s)
 DURATION=$((END_EPOCH - START_EPOCH))

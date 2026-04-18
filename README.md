@@ -158,7 +158,8 @@ iOS setup: **[docs/ios-setup.md](./docs/ios-setup.md)**
 
 User units and env templates live under [`systemd/`](./systemd/). Typical flow:
 
-- Copy or symlink unit files into `~/.config/systemd/user/`, set `JOURNAL_LINKER_REPO` to this repo’s path in `~/.config/journal-linker/journal-linker.env`, then `systemctl --user daemon-reload` and enable the `.path` / `.timer` units you want.
+- Copy or symlink unit files into `~/.config/systemd/user/`, set `JOURNAL_LINKER_REPO` to this repo’s path in `~/.config/journal-linker/journal-linker.env`, then `systemctl --user daemon-reload`.
+- Enable `.path` / `.timer` units for watcher or scheduled jobs. Enable `journal-linker-feedback-sender.service` directly; it is a persistent Telegram long-polling daemon, not a timer.
 - Logs often go to `~/.local/state/journal-linker/` when `SCRIBE_JOB_LOG_DIR` is set that way (see `just doctor`).
 - After amending commits or changing remotes: `git fetch origin` before `git push --force-with-lease` so the lease matches GitHub.
 

@@ -58,14 +58,17 @@ def main() -> int:
         print("  After you tap a button, run feedback_sender (or wait for the timer) to record it.")
         return 0
 
-    rows: list[tuple[str, str, str, str]] = []
+    rows: list[tuple[str, str, str, str, str, str, str]] = []
     for key, rec in ledger.items():
         sig = rec.get("feedback_signal")
         if sig is None:
             continue
         at = rec.get("feedback_received_at") or "?"
         title = (rec.get("title") or "")[:48]
-        rows.append((at, key[:16], str(sig), title))
+        intent_class = str(rec.get("intent_class") or "")
+        action = str(rec.get("action") or "")
+        defer_count = str(rec.get("defer_count") or "")
+        rows.append((at, key[:16], str(sig), intent_class, action, defer_count, title))
 
     rows.sort(reverse=True)
 
@@ -75,9 +78,12 @@ def main() -> int:
         print("  when feedback_sender processes the tap — up to one timer interval if the service is idle.")
         return 0
 
-    print(f"  {'received_at':<26}  {'key16':<16}  signal      title")
-    for at, k16, sig, title in rows[:30]:
-        print(f"  {at:<26}  {k16:<16}  {sig:<10}  {title}")
+    print(f"  {'received_at':<26}  {'key16':<16}  {'signal':<19}  {'class':<16}  {'action':<28}  defers  title")
+    for at, k16, sig, intent_class, action, defer_count, title in rows[:30]:
+        print(
+            f"  {at:<26}  {k16:<16}  {sig:<19}  "
+            f"{intent_class:<16}  {action:<28}  {defer_count:<6}  {title}"
+        )
 
     print("")
     return 0

@@ -34,6 +34,7 @@ class TestGatePromptTemplates(unittest.TestCase):
         self.assertIn("intents", prompt)
         self.assertIn("intent_raw", prompt)
         self.assertIn("category", prompt)
+        self.assertIn("intent_class", prompt)
 
     def test_qwen25_prompt_uses_chatml(self):
         prompt = pi.build_gate_prompt("I need to call the doctor.", "qwen25")
@@ -57,11 +58,34 @@ class TestGatePromptTemplates(unittest.TestCase):
 class TestParseGateOutput(unittest.TestCase):
     def test_single_intent(self):
         out = pi._parse_gate_output({
-            "intents": [{"intent_raw": "call the doctor", "category": "task"}],
+            "intents": [{"intent_raw": "call the doctor", "category": "task", "intent_class": "task_intent"}],
         })
         self.assertEqual(len(out), 1)
         self.assertEqual(out[0]["intent_raw"], "call the doctor")
         self.assertEqual(out[0]["category"], "task")
+        self.assertEqual(out[0]["intent_class"], "task_intent")
+
+    def test_new_intent_classes_are_accepted(self):
+        out = pi._parse_gate_output({
+            "intents": [
+                {"intent_raw": "look into a new backpack", "category": "plan", "intent_class": "purchase_intent"},
+                {"intent_raw": "learn more about ceramics", "category": "plan", "intent_class": "latent_interest"},
+            ],
+        })
+        self.assertEqual(out[0]["intent_class"], "purchase_intent")
+        self.assertEqual(out[1]["intent_class"], "latent_interest")
+
+    def test_missing_intent_class_falls_back_from_category(self):
+        out = pi._parse_gate_output({
+            "intents": [{"intent_raw": "finish the report", "category": "commitment"}],
+        })
+        self.assertEqual(out[0]["intent_class"], "task_intent")
+
+    def test_invalid_intent_class_falls_back_to_none(self):
+        out = pi._parse_gate_output({
+            "intents": [{"intent_raw": "x", "category": "task", "intent_class": "INVALID"}],
+        })
+        self.assertEqual(out[0]["intent_class"], "none")
 
     def test_multiple_intents(self):
         out = pi._parse_gate_output({
@@ -109,6 +133,7 @@ class TestIdempotencyKey(unittest.TestCase):
             category="task",
             gate_model="phi4:14b",
             gate_style="phi4",
+            intent_class="task_intent",
         )
         defaults.update(overrides)
         return pi.compute_idempotency_key(**defaults)
@@ -137,6 +162,11 @@ class TestIdempotencyKey(unittest.TestCase):
         k2 = self._key(gate_model="qwen2.5:32b")
         self.assertNotEqual(k1, k2)
 
+    def test_key_changes_when_intent_class_changes(self):
+        k1 = self._key(intent_class="task_intent")
+        k2 = self._key(intent_class="purchase_intent")
+        self.assertNotEqual(k1, k2)
+
 
 # ---------------------------------------------------------------------------
 # Envelope builder
@@ -149,7 +179,8 @@ class TestEnvelopeBuilder(unittest.TestCase):
             "follow up with accountant", "task", "off",
         )
         for field in ("intent_raw", "surrounding_context", "inferred_category", "timestamp",
-                      "source_file", "source_stat", "enrichment_mode", "prompt_version"):
+                      "source_file", "source_stat", "enrichment_mode", "prompt_version",
+                      "intent_class"):
             self.assertIn(field, env, f"missing field: {field}")
 
     def test_mcp_fields_absent_when_off(self):
@@ -172,12 +203,14 @@ class TestClaudeResponseValidation(unittest.TestCase):
     def test_valid_response(self):
         resp = pi._validate_claude_response({
             "urgency": "today", "format": "notification",
+            "action": "notification",
             "title": "Follow up with accountant",
             "body": "Send the Q1 tax email before Friday.",
             "defer_to": "",
         })
         self.assertEqual(resp["urgency"], "today")
         self.assertEqual(resp["format"], "notification")
+        self.assertEqual(resp["action"], "notification")
 
     def test_invalid_urgency_raises(self):
         with self.assertRaises(ValueError):
@@ -186,6 +219,13 @@ class TestClaudeResponseValidation(unittest.TestCase):
     def test_invalid_format_raises(self):
         with self.assertRaises(ValueError):
             pi._validate_claude_response({"urgency": "low", "format": "email", "title": "x", "body": "y", "defer_to": ""})
+
+    def test_invalid_action_raises(self):
+        with self.assertRaises(ValueError):
+            pi._validate_claude_response({
+                "urgency": "low", "format": "digest", "action": "email",
+                "title": "x", "body": "y", "defer_to": "",
+            })
 
     def test_title_truncated_to_80(self):
         long_title = "A" * 200
@@ -201,20 +241,25 @@ class TestClaudeResponseValidation(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestRoutingDecisions(unittest.TestCase):
-    def _route(self, urgency, fmt, dry_run=True, ledger_entry=None):
+    def _route(self, urgency, fmt, dry_run=True, ledger_entry=None, action=None, intent_class="task_intent", consent=False):
         claude_response = {
             "urgency": urgency, "format": fmt,
             "title": "Test", "body": "Body text.", "defer_to": "",
         }
+        if action:
+            claude_response["action"] = action
         envelope = {
             "intent_raw": "x", "surrounding_context": "ctx",
-            "inferred_category": "task", "timestamp": "2026-04-16T00:00:00",
+            "inferred_category": "task", "intent_class": intent_class,
+            "timestamp": "2026-04-16T00:00:00",
             "source_file": "/tmp/2026-04-16.md", "source_stat": "1:1",
             "enrichment_mode": "off",
         }
         with tempfile.TemporaryDirectory() as tmpdir:
             state_dir = Path(tmpdir)
             cortex_dir = Path(tmpdir) / "cortex"
+            if consent:
+                pi.record_intent_class_consent(state_dir, intent_class)
             result = pi.route_delivery(
                 claude_response, envelope, cortex_dir, state_dir,
                 "deadbeef" * 8, dry_run=dry_run, ledger_entry=ledger_entry,
@@ -252,6 +297,46 @@ class TestRoutingDecisions(unittest.TestCase):
             result = self._route("soon", "note", dry_run=True)
             self.assertIn("cortex", result["planned_route"])
             self.assertNotIn("pushover", result["planned_route"])
+
+    def test_purchase_action_with_consent_routes_to_action_queue(self):
+        result = self._route(
+            "soon", "note", dry_run=True,
+            action="future_action_search_enqueue",
+            intent_class="purchase_intent",
+            consent=True,
+        )
+        self.assertIn("action_queue", result["planned_route"])
+        self.assertNotIn("pushover", result["planned_route"])
+
+    def test_purchase_action_without_consent_blocks_action_queue(self):
+        result = self._route(
+            "soon", "note", dry_run=True,
+            action="future_action_search_enqueue",
+            intent_class="purchase_intent",
+            consent=False,
+        )
+        self.assertNotIn("action_queue", result["planned_route"])
+        self.assertIn("digest", result["planned_route"])
+        self.assertTrue(result["results_per_sink"]["consent"]["required"])
+
+    def test_latent_interest_digest_action_does_not_notify(self):
+        result = self._route(
+            "low", "digest", dry_run=True,
+            action="digest_capture",
+            intent_class="latent_interest",
+        )
+        self.assertIn("digest", result["planned_route"])
+        self.assertNotIn("pushover", result["planned_route"])
+
+
+class TestEnrichmentModeResolution(unittest.TestCase):
+    def test_default_is_llmlib(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(pi.resolve_enrichment_mode(), "llmlib")
+
+    def test_explicit_off_is_respected(self):
+        with mock.patch.dict(os.environ, {"INTENT_ENRICHMENT_MODE": "off"}):
+            self.assertEqual(pi.resolve_enrichment_mode(), "off")
 
 
 # ---------------------------------------------------------------------------
@@ -858,6 +943,7 @@ class TestFeedbackQueue(unittest.TestCase):
             "intent_raw": "test intent",
             "surrounding_context": "",
             "inferred_category": "task",
+            "intent_class": "task_intent",
             "timestamp": "2026-04-16T10:00:00+00:00",
             "source_file": "/tmp/2026-04-16.md",
             "source_stat": "1:1",
@@ -924,6 +1010,54 @@ class TestFeedbackQueue(unittest.TestCase):
     def test_feedback_prompt_in_queue_entry(self):
         out = self._route("today", "note", feedback_prompt="Did you call Marcus?")
         self.assertEqual(out["entries"][0]["feedback_prompt"], "Did you call Marcus?")
+
+    def test_feedback_entry_includes_class_action_and_timing(self):
+        out = self._route("today", "note")
+        entry = out["entries"][0]
+        self.assertEqual(entry["intent_class"], "task_intent")
+        self.assertEqual(entry["action"], "notification")
+        self.assertEqual(entry["timing_policy"], "later_today")
+        self.assertEqual(entry["defer_count"], 0)
+        self.assertIn("expires_at", entry)
+
+    def test_future_action_queue_includes_enrichment_fields(self):
+        claude_response = {
+            "urgency": "soon",
+            "format": "note",
+            "action": "future_action_search_enqueue",
+            "title": "Find a backpack",
+            "body": "Compare lightweight backpacks.",
+            "defer_to": "",
+            "feedback_prompt": "",
+        }
+        envelope = {
+            "intent_raw": "look for a backpack",
+            "surrounding_context": "",
+            "inferred_category": "plan",
+            "intent_class": "purchase_intent",
+            "timestamp": "2026-04-16T10:00:00+00:00",
+            "source_file": "/tmp/2026-04-16.md",
+            "source_stat": "1:1",
+            "enrichment_mode": "llmlib",
+            "related_silo_hits": [{"title": "Travel", "snippet": "old notes"}],
+            "recurrence_signal": True,
+            "prompt_version": "2",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_dir = Path(tmpdir)
+            cortex_dir = Path(tmpdir) / "cortex"
+            pi.record_intent_class_consent(state_dir, "purchase_intent")
+            result = pi.route_delivery(
+                claude_response, envelope, cortex_dir, state_dir, "b" * 64,
+                dry_run=False,
+            )
+            queue_path = state_dir / pi.ACTION_QUEUE_FILENAME
+            entries = [json.loads(line) for line in queue_path.read_text().splitlines() if line.strip()]
+
+        self.assertIn("action_queue", result["planned_route"])
+        self.assertEqual(entries[0]["intent_class"], "purchase_intent")
+        self.assertEqual(entries[0]["related_silo_hits"], [{"title": "Travel", "snippet": "old notes"}])
+        self.assertTrue(entries[0]["recurrence_signal"])
 
 
 if __name__ == "__main__":
