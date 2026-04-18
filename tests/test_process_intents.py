@@ -29,14 +29,14 @@ FIXTURE_NOTE = Path(__file__).resolve().parent / "fixtures" / "intent_sample.md"
 class TestGatePromptTemplates(unittest.TestCase):
     def test_phi4_prompt_contains_json_schema(self):
         prompt = pi.build_gate_prompt("I need to call the doctor.", "phi4")
-        self.assertIn("has_intent", prompt)
+        self.assertIn("intents", prompt)
         self.assertIn("intent_raw", prompt)
         self.assertIn("category", prompt)
 
     def test_qwen25_prompt_uses_chatml(self):
         prompt = pi.build_gate_prompt("I need to call the doctor.", "qwen25")
         self.assertIn("<|im_start|>", prompt)
-        self.assertIn("has_intent", prompt)
+        self.assertIn("intents", prompt)
 
     def test_resolve_gate_style_auto_phi4(self):
         style = pi.resolve_gate_style("phi4:14b")
@@ -53,28 +53,45 @@ class TestGatePromptTemplates(unittest.TestCase):
 
 
 class TestParseGateOutput(unittest.TestCase):
-    def test_valid_intent(self):
+    def test_single_intent(self):
         out = pi._parse_gate_output({
-            "has_intent": True, "intent_raw": "call the doctor", "category": "task",
+            "intents": [{"intent_raw": "call the doctor", "category": "task"}],
         })
-        self.assertTrue(out["has_intent"])
-        self.assertEqual(out["intent_raw"], "call the doctor")
-        self.assertEqual(out["category"], "task")
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["intent_raw"], "call the doctor")
+        self.assertEqual(out[0]["category"], "task")
 
-    def test_no_intent(self):
-        out = pi._parse_gate_output({"has_intent": False, "intent_raw": "", "category": "none"})
-        self.assertFalse(out["has_intent"])
-        self.assertEqual(out["category"], "none")
+    def test_multiple_intents(self):
+        out = pi._parse_gate_output({
+            "intents": [
+                {"intent_raw": "call the doctor", "category": "task"},
+                {"intent_raw": "finish the report", "category": "commitment"},
+            ],
+        })
+        self.assertEqual(len(out), 2)
+        self.assertEqual(out[1]["intent_raw"], "finish the report")
+
+    def test_empty_intents_list(self):
+        out = pi._parse_gate_output({"intents": []})
+        self.assertEqual(out, [])
+
+    def test_missing_intents_key_returns_empty(self):
+        out = pi._parse_gate_output({})
+        self.assertEqual(out, [])
 
     def test_invalid_category_falls_back_to_none(self):
-        out = pi._parse_gate_output({"has_intent": True, "intent_raw": "x", "category": "INVALID"})
-        self.assertEqual(out["category"], "none")
+        out = pi._parse_gate_output({"intents": [{"intent_raw": "x", "category": "INVALID"}]})
+        self.assertEqual(out[0]["category"], "none")
 
-    def test_missing_fields_default_safely(self):
-        out = pi._parse_gate_output({})
-        self.assertFalse(out["has_intent"])
-        self.assertEqual(out["intent_raw"], "")
-        self.assertEqual(out["category"], "none")
+    def test_items_with_empty_intent_raw_are_skipped(self):
+        out = pi._parse_gate_output({"intents": [{"intent_raw": "", "category": "task"}]})
+        self.assertEqual(out, [])
+
+    def test_max_intents_cap_is_respected(self):
+        many = [{"intent_raw": f"intent {i}", "category": "task"} for i in range(20)]
+        with mock.patch.dict(os.environ, {"INTENT_MAX_INTENTS_PER_NOTE": "3"}):
+            out = pi._parse_gate_output({"intents": many})
+        self.assertEqual(len(out), 3)
 
 
 # ---------------------------------------------------------------------------
@@ -125,24 +142,22 @@ class TestIdempotencyKey(unittest.TestCase):
 
 class TestEnvelopeBuilder(unittest.TestCase):
     def test_required_fields_present(self):
-        gate_output = {"has_intent": True, "intent_raw": "follow up with accountant", "category": "task"}
         env = pi.build_envelope(
-            FIXTURE_NOTE, "2026-04-16T00:00:00", "123:456", gate_output, "off"
+            FIXTURE_NOTE, "2026-04-16T00:00:00", "123:456",
+            "follow up with accountant", "task", "off",
         )
         for field in ("intent_raw", "surrounding_context", "inferred_category", "timestamp",
                       "source_file", "source_stat", "enrichment_mode", "prompt_version"):
             self.assertIn(field, env, f"missing field: {field}")
 
     def test_mcp_fields_absent_when_off(self):
-        gate_output = {"has_intent": True, "intent_raw": "x", "category": "task"}
-        env = pi.build_envelope(FIXTURE_NOTE, "2026-04-16T00:00:00", "1:1", gate_output, "off")
+        env = pi.build_envelope(FIXTURE_NOTE, "2026-04-16T00:00:00", "1:1", "x", "task", "off")
         self.assertNotIn("recurrence_signal", env)
         self.assertNotIn("related_silo_hits", env)
 
     def test_llmlib_fields_not_in_base_envelope(self):
         # build_envelope never adds enrichment fields; enrich_envelope() does that
-        gate_output = {"has_intent": True, "intent_raw": "x", "category": "task"}
-        env = pi.build_envelope(FIXTURE_NOTE, "2026-04-16T00:00:00", "1:1", gate_output, "llmlib")
+        env = pi.build_envelope(FIXTURE_NOTE, "2026-04-16T00:00:00", "1:1", "x", "task", "llmlib")
         self.assertNotIn("recurrence_signal", env)
         self.assertNotIn("related_silo_hits", env)
 
@@ -279,7 +294,7 @@ class TestPipelinePushoverDedupe(unittest.TestCase):
         self._tmp.cleanup()
 
     def test_second_run_skips_pushover_when_prior_delivery_succeeded(self):
-        gate = {"has_intent": True, "intent_raw": "call doctor", "category": "task"}
+        gate = {"intents": [{"intent_raw": "call doctor", "category": "task"}]}
         claude = {
             "urgency": "today",
             "format": "notification",
@@ -332,7 +347,7 @@ class TestPipelinePartialRetrySkipsPushover(unittest.TestCase):
         self._tmp.cleanup()
 
     def test_second_run_retries_cortex_only(self):
-        gate = {"has_intent": True, "intent_raw": "call doctor", "category": "task"}
+        gate = {"intents": [{"intent_raw": "call doctor", "category": "task"}]}
         claude = {
             "urgency": "today",
             "format": "note",
@@ -491,12 +506,12 @@ class TestExitCodes(unittest.TestCase):
                 )
 
     def test_no_intent_returns_success(self):
-        gate = {"has_intent": False, "intent_raw": "", "category": "none"}
+        gate = {"intents": []}
         exit_code = self._run(gate)
         self.assertEqual(exit_code, pi.EXIT_SUCCESS)
 
     def test_intent_dry_run_returns_success(self):
-        gate = {"has_intent": True, "intent_raw": "call doctor", "category": "task"}
+        gate = {"intents": [{"intent_raw": "call doctor", "category": "task"}]}
         claude = {
             "urgency": "today", "format": "notification",
             "title": "Call doctor", "body": "Follow up.", "defer_to": "",
@@ -526,7 +541,7 @@ class TestExitCodes(unittest.TestCase):
         self.assertEqual(exit_code, pi.EXIT_GATE_TRANSIENT)
 
     def test_claude_error_returns_claude_transient(self):
-        gate = {"has_intent": True, "intent_raw": "call doctor", "category": "task"}
+        gate = {"intents": [{"intent_raw": "call doctor", "category": "task"}]}
         mock_ollama = mock.MagicMock()
         mock_ollama.chat.return_value = {
             "message": {"content": json.dumps(gate)}
@@ -598,7 +613,7 @@ class TestLedgerMaintenance(unittest.TestCase):
 
 class TestDryRunWorkflow(unittest.TestCase):
     def test_dry_run_full_pipeline(self):
-        gate_output = {"has_intent": True, "intent_raw": "follow up with accountant", "category": "task"}
+        gate_output = {"intents": [{"intent_raw": "follow up with accountant", "category": "task"}]}
         claude_response = {
             "urgency": "today", "format": "notification",
             "title": "Follow up with accountant",

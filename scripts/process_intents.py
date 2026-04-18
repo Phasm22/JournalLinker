@@ -18,7 +18,7 @@ Exit codes (stable contract for shell wrappers):
     20  transient gate failure (Ollama down/timeout)
     30  transient routing model failure (rate limit, network timeout)
     40  transient delivery failure (Pushover HTTP error)
-    50  partial success (cortex written but Pushover failed — retry delivery only)
+    50  partial success (some sinks succeeded, some failed — retry delivery only)
 
 Env vars (from .env or environment):
     SCRIBE_JOURNAL_DIR           journal directory (required)
@@ -32,6 +32,7 @@ Env vars (from .env or environment):
                                  (default: 300)
     INTENT_ENRICHMENT_MODE       off|llmlib (default: off)
     LLMLIBRARIAN_SRC             path to llmLibrarian/src (default: ~/Desktop/llmLibrarian/src)
+    INTENT_MAX_INTENTS_PER_NOTE  max intents extracted per note (default: 5)
     INTENT_FEEDBACK_DELAY_TODAY  seconds before feedback prompt fires for today/immediate urgency (default: 21600 = 6h)
     INTENT_FEEDBACK_DELAY_SOON   seconds before feedback prompt fires for soon urgency (default: 86400 = 24h)
     INTENT_PUSHOVER_URGENCIES    comma-separated urgencies that may trigger Pushover (default: immediate,today,soon).
@@ -78,6 +79,7 @@ DEFAULT_GATE_MODEL = "phi4:14b"
 DEFAULT_GATE_STYLE = "auto"
 DEFAULT_ROUTING_MODEL = "gpt-4o-mini"
 DEFAULT_IN_FLIGHT_TTL = 300  # seconds
+DEFAULT_MAX_INTENTS = 5
 DEFAULT_PUSHOVER_SERVER = "https://api.pushover.net"
 DEFAULT_PUSHOVER_PRIORITY = "0"
 INTENT_IDEMPOTENCY_VERSION = "2"
@@ -173,29 +175,30 @@ def _infer_gate_style(model_name: str) -> str:
 
 def _build_gate_prompt_phi4(text_excerpt: str) -> str:
     return (
-        "You are a concise intent classifier. "
-        "Read the following journal excerpt and decide whether it contains an actionable intent: "
-        "a concrete task, commitment, reminder, or plan the author intends to act on.\n\n"
+        "You are a concise intent extractor. "
+        "Read the following journal excerpt and extract ALL actionable intents: "
+        "concrete tasks, commitments, reminders, or plans the author intends to act on.\n\n"
         "Excerpt:\n"
         "---\n"
         f"{text_excerpt}\n"
         "---\n\n"
-        "Respond with JSON only, no extra text:\n"
-        '{"has_intent": true|false, "intent_raw": "<short phrase or empty string>", '
-        '"category": "<task|reminder|commitment|plan|none>"}'
+        "Respond with JSON only, no extra text. Return an empty list if nothing actionable is found.\n"
+        '{"intents": [{"intent_raw": "<short phrase>", "category": "<task|reminder|commitment|plan>"}]}'
     )
 
 
 def _build_gate_prompt_qwen25(text_excerpt: str) -> str:
     return (
         "<|im_start|>system\n"
-        "You are an intent classifier for personal journal notes. "
+        "You are an intent extractor for personal journal notes. "
+        "Extract ALL actionable intents (tasks, reminders, commitments, plans). "
         "Output only a JSON object — no markdown fences, no extra text.\n"
-        "Schema: {\"has_intent\": bool, \"intent_raw\": string, \"category\": string}\n"
-        "Valid categories: task, reminder, commitment, plan, none\n"
+        'Schema: {"intents": [{"intent_raw": string, "category": string}]}\n'
+        "Valid categories: task, reminder, commitment, plan\n"
+        "Return an empty intents list if nothing actionable is found.\n"
         "<|im_end|>\n"
         "<|im_start|>user\n"
-        "Classify the following journal excerpt:\n\n"
+        "Extract all actionable intents from this journal excerpt:\n\n"
         f"{text_excerpt}\n"
         "<|im_end|>\n"
         "<|im_start|>assistant\n"
@@ -215,8 +218,8 @@ def resolve_gate_style(model_name: str) -> str:
     return _infer_gate_style(model_name)
 
 
-def call_gate(note_text: str, model: str, style: str, num_ctx: int = 4096) -> dict:
-    """Run the gate model via Ollama. Returns {has_intent, intent_raw, category}."""
+def call_gate(note_text: str, model: str, style: str, num_ctx: int = 4096) -> list[dict]:
+    """Run the gate model via Ollama. Returns a list of {intent_raw, category} dicts."""
     try:
         import ollama  # type: ignore
     except ImportError:
@@ -239,14 +242,26 @@ def call_gate(note_text: str, model: str, style: str, num_ctx: int = 4096) -> di
     return _parse_gate_output(gate_output)
 
 
-def _parse_gate_output(data: dict) -> dict:
-    has_intent = bool(data.get("has_intent", False))
-    intent_raw = str(data.get("intent_raw", "")).strip()
-    category = str(data.get("category", "none")).strip().lower()
-    valid_categories = {"task", "reminder", "commitment", "plan", "none"}
-    if category not in valid_categories:
-        category = "none"
-    return {"has_intent": has_intent, "intent_raw": intent_raw, "category": category}
+_VALID_CATEGORIES = {"task", "reminder", "commitment", "plan", "none"}
+
+
+def _parse_gate_output(data: dict) -> list[dict]:
+    """Parse gate model output into a validated list of intent dicts."""
+    raw_list = data.get("intents", [])
+    if not isinstance(raw_list, list):
+        raw_list = []
+    max_n = int(os.getenv("INTENT_MAX_INTENTS_PER_NOTE", str(DEFAULT_MAX_INTENTS)))
+    valid: list[dict] = []
+    for item in raw_list[:max_n]:
+        if not isinstance(item, dict):
+            continue
+        intent_raw = str(item.get("intent_raw", "")).strip()
+        category = str(item.get("category", "none")).strip().lower()
+        if category not in _VALID_CATEGORIES:
+            category = "none"
+        if intent_raw:
+            valid.append({"intent_raw": intent_raw, "category": category})
+    return valid
 
 
 # ---------------------------------------------------------------------------
@@ -307,18 +322,18 @@ def build_envelope(
     source_path: Path,
     journal_timestamp: str,
     source_stat_str: str,
-    gate_output: dict,
+    intent_raw: str,
+    category: str,
     enrichment_mode: str,
+    note_text: str | None = None,
 ) -> dict:
-    """Build the context envelope sent to Claude."""
-    surrounding = extract_surrounding_context(
-        source_path.read_text(encoding="utf-8"),
-        gate_output["intent_raw"],
-    )
+    """Build the context envelope for a single intent."""
+    text = note_text if note_text is not None else source_path.read_text(encoding="utf-8")
+    surrounding = extract_surrounding_context(text, intent_raw)
     envelope: dict = {
-        "intent_raw": gate_output["intent_raw"],
+        "intent_raw": intent_raw,
         "surrounding_context": surrounding,
-        "inferred_category": gate_output["category"],
+        "inferred_category": category,
         "timestamp": journal_timestamp,
         "source_file": source_path.expanduser().resolve().as_posix(),
         "source_stat": source_stat_str,
@@ -369,18 +384,19 @@ ROUTING_SYSTEM_PROMPT = (
     "You receive an intent envelope extracted from a daily note and decide how to route it. "
     "Always respond with valid JSON only — no markdown, no prose.\n"
     "Routing discipline (avoid noisy real-time notifications):\n"
-    "- Use urgency=low and format=digest for nice-to-remember items, vague ideas, or anything without a hard deadline.\n"
+    "- Use urgency=low and format=digest for nice-to-remember items, vague ideas, speculative or observational thoughts about the future, or anything without a hard deadline or concrete commitment.\n"
     "- Use urgency=soon only when timing matters within days but it is not worth interrupting the user now; prefer format=note or digest unless it is truly time-sensitive.\n"
     "- Reserve urgency=immediate or today for concrete, time-bound, or high-consequence actions (deadlines, appointments, money, people waiting).\n"
     "- Use format=notification only when a short ping is strictly better than a capturable note.\n"
-    "- Set feedback_prompt to empty when urgency=low; otherwise one short follow-up question.\n"
+    "- Set feedback_prompt to empty string when urgency=low.\n"
+    "- When urgency is not low, feedback_prompt MUST be a yes/no completion question phrased as 'Did you X?' — never an open-ended question starting with What, How, Why, Which, or Who. The user answers with Done, Skip, or Later buttons, so the question must have a binary yes/no answer.\n"
     "Required output schema:\n"
     '{"urgency": "immediate|today|soon|low", '
     '"format": "notification|note|digest|draft", '
     '"title": "<short title under 80 chars>", '
     '"body": "<1-2 sentence summary>", '
     '"defer_to": "<ISO date or empty string>", '
-    '"feedback_prompt": "<natural follow-up question for later check-in, empty string if urgency=low>"}'
+    '"feedback_prompt": "<yes/no completion question as \'Did you X?\', or empty string if urgency=low>"}'
 )
 
 
@@ -645,7 +661,7 @@ def route_delivery(
     pushover_urgencies = parse_pushover_urgencies_allowed()
     # Determine planned route
     push_via_pushover = urgency in pushover_urgencies
-    write_to_cortex = fmt in ("note", "draft")
+    write_to_cortex = True  # always capture to cortex regardless of format/urgency
     append_to_digest = fmt == "digest" or urgency == "low" or fmt == "draft"
 
     if push_via_pushover:
@@ -914,6 +930,27 @@ class PipelineError(Exception):
         self.kind = kind
 
 
+def _intent_exit_code(delivery_result: dict, dry_run: bool) -> tuple[str, int]:
+    """Compute (delivery_status, exit_code) from a route_delivery result."""
+    errors = delivery_result.get("errors", [])
+    planned = delivery_result.get("planned_route", [])
+    results_per_sink = delivery_result.get("results_per_sink", {})
+    failed_sinks = [e["sink"] for e in errors]
+    ok_sinks = [s for s in planned if results_per_sink.get(s, {}).get("ok")]
+
+    if not planned or dry_run:
+        return "succeeded", EXIT_SUCCESS
+    if failed_sinks and ok_sinks:
+        return "partial", EXIT_PARTIAL
+    if failed_sinks and not ok_sinks:
+        status = "failed_permanent" if all(
+            "permission" in e.get("error", "").lower() or "disk" in e.get("error", "").lower()
+            for e in errors
+        ) else "failed_transient"
+        return status, EXIT_DELIVERY_TRANSIENT
+    return "succeeded", EXIT_SUCCESS
+
+
 def run_intent_pipeline(
     source_path: Path,
     *,
@@ -960,9 +997,10 @@ def run_intent_pipeline(
         return EXIT_PERMANENT
 
     journal_timestamp = infer_journal_timestamp(source_path)
+    source_date = journal_timestamp[:10]  # YYYY-MM-DD
 
     # ── Gate ──────────────────────────────────────────────────────────────
-    run_record: dict = {
+    gate_run_record: dict = {
         "run_id": run_id,
         "created_at": created_at,
         "source_path": str(source_path),
@@ -970,192 +1008,194 @@ def run_intent_pipeline(
         "source_stat": source_stat_str,
         "status": "in_progress",
     }
-    append_run_record(state_dir, run_record)
+    append_run_record(state_dir, gate_run_record)
 
     try:
-        gate_output = call_gate(note_text, gate_model, gate_style)
+        intents = call_gate(note_text, gate_model, gate_style)
     except Exception as exc:
         _log("gate", f"ERROR: {exc}")
         if verbose:
             traceback.print_exc(file=sys.stderr)
-        run_record["status"] = "failed_transient"
-        run_record["failure"] = {"stage": "gate", "kind": "transient", "detail": str(exc)}
-        append_run_record(state_dir, run_record)
+        gate_run_record["status"] = "failed_transient"
+        gate_run_record["failure"] = {"stage": "gate", "kind": "transient", "detail": str(exc)}
+        append_run_record(state_dir, gate_run_record)
         return EXIT_GATE_TRANSIENT
 
-    _log("gate", f"has_intent={gate_output['has_intent']} category={gate_output['category']!r}")
+    _log("gate", f"found {len(intents)} intent(s)")
     if verbose:
-        _log("gate", f"intent_raw={gate_output['intent_raw']!r}")
+        for item in intents:
+            _log("gate", f"  [{item['category']}] {item['intent_raw']!r}")
 
-    run_record["gate"] = {
-        "model": gate_model,
-        "style": gate_style,
-        "output": gate_output,
-    }
+    gate_run_record["gate"] = {"model": gate_model, "style": gate_style, "intent_count": len(intents)}
 
-    if not gate_output["has_intent"]:
-        _log("intent", "no intent detected — clean skip")
-        run_record["status"] = "skipped_no_intent"
-        append_run_record(state_dir, run_record)
+    if not intents:
+        _log("intent", "no intents detected — clean skip")
+        gate_run_record["status"] = "skipped_no_intent"
+        append_run_record(state_dir, gate_run_record)
         return EXIT_SUCCESS
 
-    # ── Build envelope ────────────────────────────────────────────────────
-    envelope = build_envelope(
-        source_path, journal_timestamp, source_stat_str,
-        gate_output, enrichment_mode,
-    )
-    if enrichment_mode == "llmlib":
-        envelope = enrich_envelope(envelope)
-    source_date = journal_timestamp[:10]  # YYYY-MM-DD
-    claude_idempotency_key = compute_idempotency_key(
-        source_path, source_date,
-        gate_output["intent_raw"], gate_output["category"],
-        gate_model, gate_style,
-    )
-    run_record["claude_idempotency_key"] = claude_idempotency_key
+    gate_run_record["status"] = "gate_complete"
+    append_run_record(state_dir, gate_run_record)
 
-    # If retrying and the caller provided an expected key, verify it matches
-    if existing_idempotency_key and existing_idempotency_key != claude_idempotency_key:
-        _log("intent", "fingerprint changed since retry was enqueued — treating as new job")
-        existing_idempotency_key = None
+    # ── Per-intent loop ───────────────────────────────────────────────────
+    worst_exit = EXIT_SUCCESS
 
-    _log("intent", f"idempotency_key={claude_idempotency_key[:16]}…")
+    for intent_index, intent_item in enumerate(intents):
+        intent_raw = intent_item["intent_raw"]
+        category = intent_item["category"]
 
-    ledger_entry = ledger.get(claude_idempotency_key, {})
+        _log("intent", f"[{intent_index + 1}/{len(intents)}] category={category!r} raw={intent_raw!r}")
 
-    # ── Claude call (with dedup) ──────────────────────────────────────────
-    claude_response: dict | None = None
+        envelope = build_envelope(
+            source_path, journal_timestamp, source_stat_str,
+            intent_raw, category, enrichment_mode, note_text=note_text,
+        )
+        if enrichment_mode == "llmlib":
+            envelope = enrich_envelope(envelope)
 
-    if ledger_entry.get("claude_status") == "succeeded":
-        # Reuse stored response — skip Claude call
-        stored = ledger_entry.get("claude_response", {})
-        claude_response = stored.get("parsed_json")
-        _log("claude", "reusing stored response from ledger (delivery retry)")
-    else:
-        # Mark in-flight (write run record first, then ledger)
-        run_record["status"] = "in_progress_claude"
-        append_run_record(state_dir, run_record)
-        ledger_entry = {
+        claude_idempotency_key = compute_idempotency_key(
+            source_path, source_date,
+            intent_raw, category,
+            gate_model, gate_style,
+        )
+
+        # If retrying with a specific key, skip intents that don't match
+        if existing_idempotency_key and existing_idempotency_key != claude_idempotency_key:
+            continue
+
+        _log("intent", f"idempotency_key={claude_idempotency_key[:16]}…")
+
+        ledger_entry = ledger.get(claude_idempotency_key, {})
+
+        # Per-intent run record
+        run_record: dict = {
+            "run_id": run_id,
+            "intent_index": intent_index,
+            "intent_total": len(intents),
             "claude_idempotency_key": claude_idempotency_key,
+            "created_at": created_at,
             "source_path": str(source_path),
             "journal_timestamp": journal_timestamp,
             "source_stat": source_stat_str,
-            "claude_status": "in_flight",
-            "claude_in_flight_since": _now_iso(),
-            "claude_response": {},
-            "delivery_status": "pending",
-            "delivery_attempts": [],
-            "latest_run_id": run_id,
+            "intent_raw": intent_raw,
+            "category": category,
+            "status": "in_progress_claude",
         }
+
+        # ── Claude call (with dedup) ──────────────────────────────────────
+        claude_response: dict | None = None
+
+        if ledger_entry.get("claude_status") == "succeeded":
+            stored = ledger_entry.get("claude_response", {})
+            claude_response = stored.get("parsed_json")
+            _log("claude", "reusing stored response from ledger (delivery retry)")
+        else:
+            append_run_record(state_dir, run_record)
+            ledger_entry = {
+                "claude_idempotency_key": claude_idempotency_key,
+                "source_path": str(source_path),
+                "journal_timestamp": journal_timestamp,
+                "source_stat": source_stat_str,
+                "intent_raw": intent_raw,
+                "category": category,
+                "claude_status": "in_flight",
+                "claude_in_flight_since": _now_iso(),
+                "claude_response": {},
+                "delivery_status": "pending",
+                "delivery_attempts": [],
+                "latest_run_id": run_id,
+            }
+            upsert_ledger_entry(state_dir, ledger, ledger_entry)
+
+            try:
+                claude_response = call_routing_model(envelope, routing_model, dry_run=dry_run)
+            except Exception as exc:
+                _log("claude", f"ERROR (intent {intent_index + 1}): {exc}")
+                if verbose:
+                    traceback.print_exc(file=sys.stderr)
+                ledger_entry["claude_status"] = "failed"
+                ledger_entry["claude_response"] = {"error": str(exc)}
+                upsert_ledger_entry(state_dir, ledger, ledger_entry)
+                run_record["status"] = "failed_transient"
+                run_record["failure"] = {"stage": "claude", "kind": "transient", "detail": str(exc)}
+                append_run_record(state_dir, run_record)
+                append_retry_queue(state_dir, {
+                    "run_id": run_id, "claude_idempotency_key": claude_idempotency_key,
+                    "source_path": str(source_path), "stage": "claude",
+                    "kind": "transient", "enqueued_at": _now_iso(),
+                })
+                worst_exit = max(worst_exit, EXIT_CLAUDE_TRANSIENT)
+                continue
+
+            run_record["claude"] = {
+                "model": routing_model,
+                "response_message_id": claude_response.get("_message_id", ""),
+                "stop_reason": claude_response.get("_stop_reason", ""),
+            }
+            ledger_entry["claude_status"] = "succeeded"
+            ledger_entry["claude_response"] = {
+                "message_id": claude_response.get("_message_id", ""),
+                "raw_text": "",
+                "parsed_json": {k: v for k, v in claude_response.items() if not k.startswith("_")},
+                "error": "",
+            }
+            upsert_ledger_entry(state_dir, ledger, ledger_entry)
+
+        if claude_response is None:
+            _log("intent", f"no Claude response for intent {intent_index + 1} — skipping")
+            worst_exit = max(worst_exit, EXIT_PERMANENT)
+            continue
+
+        clean_response = {k: v for k, v in claude_response.items() if not k.startswith("_")}
+        if verbose:
+            _log("claude", f"response: {json.dumps(clean_response)}")
+
+        # ── Delivery ──────────────────────────────────────────────────────
+        ledger_entry = ledger.get(claude_idempotency_key, ledger_entry)
+        delivery_result = route_delivery(
+            clean_response, envelope, cortex_dir, state_dir,
+            claude_idempotency_key, dry_run=dry_run, ledger_entry=ledger_entry,
+        )
+
+        delivery_status, intent_exit = _intent_exit_code(delivery_result, dry_run)
+        errors = delivery_result.get("errors", [])
+        planned = delivery_result.get("planned_route", [])
+        results_per_sink = delivery_result.get("results_per_sink", {})
+
+        run_record["delivery"] = {
+            "planned_route": planned,
+            "results_per_sink": results_per_sink,
+            "errors": errors,
+        }
+        run_record["status"] = (
+            "success" if intent_exit == EXIT_SUCCESS else
+            "partial" if intent_exit == EXIT_PARTIAL else
+            "failed_transient"
+        )
+        append_run_record(state_dir, run_record)
+
+        ledger_entry["delivery_status"] = delivery_status
+        ledger_entry["delivery_attempts"].append({
+            "run_id": run_id,
+            "intent_index": intent_index,
+            "attempted_at": _now_iso(),
+            "results": results_per_sink,
+            "errors": errors,
+        })
+        ledger_entry["latest_run_id"] = run_id
         upsert_ledger_entry(state_dir, ledger, ledger_entry)
 
-        try:
-            claude_response = call_routing_model(envelope, routing_model, dry_run=dry_run)
-        except Exception as exc:
-            _log("claude", f"ERROR: {exc}")
-            if verbose:
-                traceback.print_exc(file=sys.stderr)
-            ledger_entry["claude_status"] = "failed"
-            ledger_entry["claude_response"] = {"error": str(exc)}
-            upsert_ledger_entry(state_dir, ledger, ledger_entry)
-            run_record["status"] = "failed_transient"
-            run_record["failure"] = {"stage": "claude", "kind": "transient", "detail": str(exc)}
-            append_run_record(state_dir, run_record)
+        if intent_exit in (EXIT_PARTIAL, EXIT_DELIVERY_TRANSIENT):
             append_retry_queue(state_dir, {
                 "run_id": run_id, "claude_idempotency_key": claude_idempotency_key,
-                "source_path": str(source_path), "stage": "claude",
+                "source_path": str(source_path), "stage": "delivery",
                 "kind": "transient", "enqueued_at": _now_iso(),
             })
-            return EXIT_CLAUDE_TRANSIENT
 
-        # Persist Claude success before updating ledger terminal state
-        run_record["claude"] = {
-            "model": routing_model,
-            "response_message_id": claude_response.get("_message_id", ""),
-            "stop_reason": claude_response.get("_stop_reason", ""),
-        }
-        append_run_record(state_dir, run_record)
-        ledger_entry["claude_status"] = "succeeded"
-        ledger_entry["claude_response"] = {
-            "message_id": claude_response.get("_message_id", ""),
-            "raw_text": "",
-            "parsed_json": {k: v for k, v in claude_response.items() if not k.startswith("_")},
-            "error": "",
-        }
-        upsert_ledger_entry(state_dir, ledger, ledger_entry)
+        worst_exit = max(worst_exit, intent_exit)
 
-    if claude_response is None:
-        _log("intent", "no Claude response available — failing permanently")
-        return EXIT_PERMANENT
-
-    # Clean internal keys before routing
-    clean_response = {k: v for k, v in claude_response.items() if not k.startswith("_")}
-
-    if verbose:
-        _log("claude", f"response: {json.dumps(clean_response)}")
-
-    # ── Delivery ──────────────────────────────────────────────────────────
-    ledger_entry = ledger.get(claude_idempotency_key, ledger_entry)
-    delivery_result = route_delivery(
-        clean_response, envelope, cortex_dir, state_dir,
-        claude_idempotency_key, dry_run=dry_run, ledger_entry=ledger_entry,
-    )
-
-    # Determine delivery status
-    errors = delivery_result.get("errors", [])
-    planned = delivery_result.get("planned_route", [])
-    results_per_sink = delivery_result.get("results_per_sink", {})
-    failed_sinks = [e["sink"] for e in errors]
-    ok_sinks = [s for s in planned if results_per_sink.get(s, {}).get("ok")]
-
-    if not planned or dry_run:
-        delivery_status = "succeeded"
-        exit_code = EXIT_SUCCESS
-    elif failed_sinks and ok_sinks:
-        delivery_status = "partial"
-        exit_code = EXIT_PARTIAL
-    elif failed_sinks and not ok_sinks:
-        delivery_status = "failed_permanent" if all(
-            "permission" in e.get("error", "").lower() or "disk" in e.get("error", "").lower()
-            for e in errors
-        ) else "failed_transient"
-        exit_code = EXIT_DELIVERY_TRANSIENT
-    else:
-        delivery_status = "succeeded"
-        exit_code = EXIT_SUCCESS
-
-    # Persist delivery outcome to run record, then ledger
-    run_record["delivery"] = {
-        "planned_route": planned,
-        "results_per_sink": results_per_sink,
-        "errors": errors,
-    }
-    run_record["status"] = (
-        "success" if exit_code == EXIT_SUCCESS else
-        "partial" if exit_code == EXIT_PARTIAL else
-        "failed_transient"
-    )
-    append_run_record(state_dir, run_record)
-
-    ledger_entry["delivery_status"] = delivery_status
-    ledger_entry["delivery_attempts"].append({
-        "run_id": run_id,
-        "attempted_at": _now_iso(),
-        "results": results_per_sink,
-        "errors": errors,
-    })
-    ledger_entry["latest_run_id"] = run_id
-    upsert_ledger_entry(state_dir, ledger, ledger_entry)
-
-    if exit_code == EXIT_PARTIAL or (exit_code == EXIT_DELIVERY_TRANSIENT and delivery_status == "failed_transient"):
-        append_retry_queue(state_dir, {
-            "run_id": run_id, "claude_idempotency_key": claude_idempotency_key,
-            "source_path": str(source_path), "stage": "delivery",
-            "kind": "transient", "enqueued_at": _now_iso(),
-        })
-
-    _log("intent", f"done exit_code={exit_code} delivery={delivery_status}")
-    return exit_code
+    _log("intent", f"done exit_code={worst_exit}")
+    return worst_exit
 
 
 # ---------------------------------------------------------------------------

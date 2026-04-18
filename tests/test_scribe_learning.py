@@ -130,7 +130,7 @@ class TestScribeLearning(unittest.TestCase):
                 "Body"
             )
             synced = scribe.sync_daily_navigation_links(text, str(journal_dir))
-            self.assertIn("[[2026-03-05|Yesterday]] | [[2026-03-09|Tomorrow]]", synced)
+            self.assertIn("[[2026-03-05|← Yesterday]] | [[2026-03-09|Tomorrow →]]", synced)
 
     def test_load_local_env_sets_missing_values(self):
         with tempfile.TemporaryDirectory() as d:
@@ -415,11 +415,11 @@ class TestScribeLearning(unittest.TestCase):
             )
             text = (
                 "# Daily Log - 2026-03-07\n\n"
-                "[[2026-03-06|Yesterday]] | [[2026-03-08|Tomorrow]]\n\n"
+                "[[2026-03-06|← Yesterday]] | [[2026-03-08|Tomorrow →]]\n\n"
                 "Body"
             )
             synced = scribe.sync_daily_navigation_links(text, str(journal_dir))
-            self.assertIn("[[2026-03-05|Yesterday]] | [[2026-03-09|Tomorrow]]", synced)
+            self.assertIn("[[2026-03-05|← Yesterday]] | [[2026-03-09|Tomorrow →]]", synced)
 
     def test_sync_daily_navigation_links_falls_back_when_neighbors_missing(self):
         with tempfile.TemporaryDirectory() as d:
@@ -431,7 +431,7 @@ class TestScribeLearning(unittest.TestCase):
                 "Body"
             )
             synced = scribe.sync_daily_navigation_links(text, str(journal_dir))
-            self.assertIn("[[2026-03-06|Yesterday]] | [[2026-03-08|Tomorrow]]", synced)
+            self.assertIn("[[2026-03-06|← Yesterday]] | [[2026-03-08|Tomorrow →]]", synced)
 
     def test_sync_navigation_links_in_file_updates_and_is_idempotent(self):
         with tempfile.TemporaryDirectory() as d:
@@ -462,8 +462,8 @@ class TestScribeLearning(unittest.TestCase):
             content = active.read_text(encoding="utf-8")
             self.assertTrue(changed_first)
             self.assertFalse(changed_second)
-            self.assertIn("[[2026-03-05|Yesterday]] | [[2026-03-09|Tomorrow]]", content)
-            self.assertEqual(content.count("|Tomorrow]]"), 1)
+            self.assertIn("[[2026-03-05|← Yesterday]] | [[2026-03-09|Tomorrow →]]", content)
+            self.assertEqual(content.count("|Tomorrow →]]"), 1)
 
     def test_sync_yesterday_file_when_running_on_today_updates_calendar_tomorrow(self):
         with tempfile.TemporaryDirectory() as d:
@@ -484,7 +484,7 @@ class TestScribeLearning(unittest.TestCase):
             )
             self.assertTrue(changed)
             updated = yesterday.read_text(encoding="utf-8")
-            self.assertIn("[[2026-03-09|Yesterday]] | [[2026-03-11|Tomorrow]]", updated)
+            self.assertIn("[[2026-03-09|← Yesterday]] | [[2026-03-11|Tomorrow →]]", updated)
 
     def test_apply_previous_day_feedback_uses_current_date_override(self):
         with tempfile.TemporaryDirectory() as d:
@@ -608,7 +608,7 @@ class TestScribeLearning(unittest.TestCase):
                 mock.patch.object(
                     scribe,
                     "parse_cli",
-                    return_value=("test-model", 2048, str(journal_dir), False, None, None, []),
+                    return_value=("test-model", 2048, str(journal_dir), False, None, None, False, []),
                 ),
                 mock.patch.object(scribe, "today_date_str", return_value="2026-03-10"),
                 mock.patch.object(scribe, "get_input_text", return_value=("", "stdin_pipe_empty")),
@@ -643,7 +643,7 @@ class TestScribeLearning(unittest.TestCase):
                 mock.patch.object(
                     scribe,
                     "parse_cli",
-                    return_value=("test-model", 2048, str(journal_dir), False, None, None, []),
+                    return_value=("test-model", 2048, str(journal_dir), False, None, None, False, []),
                 ),
                 mock.patch.object(scribe, "today_date_str", return_value="2026-03-10"),
                 mock.patch.object(scribe, "get_input_text", return_value=(junk, "clipboard")),
@@ -679,7 +679,7 @@ class TestScribeLearning(unittest.TestCase):
                 mock.patch.object(
                     scribe,
                     "parse_cli",
-                    return_value=("test-model", 2048, str(journal_dir), False, None, None, []),
+                    return_value=("test-model", 2048, str(journal_dir), False, None, None, False, []),
                 ),
                 mock.patch.object(
                     scribe,
@@ -722,7 +722,7 @@ class TestScribeLearning(unittest.TestCase):
                 mock.patch.object(
                     scribe,
                     "parse_cli",
-                    return_value=("test-model", 2048, str(journal_dir), False, None, None, []),
+                    return_value=("test-model", 2048, str(journal_dir), False, None, None, False, []),
                 ),
                 mock.patch.object(
                     scribe,

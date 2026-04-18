@@ -89,10 +89,13 @@ def send_message(token: str, chat_id: str, text: str, reply_markup: dict) -> dic
 
 
 def answer_callback(token: str, callback_query_id: str, text: str = "") -> None:
-    _tg_request(token, "answerCallbackQuery", {
-        "callback_query_id": callback_query_id,
-        "text": text,
-    })
+    try:
+        _tg_request(token, "answerCallbackQuery", {
+            "callback_query_id": callback_query_id,
+            "text": text,
+        })
+    except Exception as exc:
+        _vlog("callback", f"answerCallbackQuery failed (stale?): {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -279,9 +282,9 @@ def send_due_messages(
         )
         reply_markup = {
             "inline_keyboard": [[
-                {"text": "✓ Confirmed", "callback_data": f"confirm:{key16}"},
-                {"text": "✗ Rejected",  "callback_data": f"reject:{key16}"},
-                {"text": "→ Deferred",  "callback_data": f"defer:{key16}"},
+                {"text": "Done",  "callback_data": f"confirm:{key16}"},
+                {"text": "Skip",  "callback_data": f"reject:{key16}"},
+                {"text": "Later", "callback_data": f"defer:{key16}"},
             ]]
         }
 
@@ -337,7 +340,7 @@ def main() -> int:
 
     _verbose = args.verbose
 
-    env_path = Path.home() / ".config" / "journal-linker" / "env"
+    env_path = Path.home() / ".config" / "journal-linker" / "journal-linker.env"
     if env_path.exists():
         for line in env_path.read_text(encoding="utf-8").splitlines():
             line = line.strip()

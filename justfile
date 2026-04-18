@@ -91,6 +91,15 @@ feedback-status:
       [[ -n "${JOURNAL_LINKER_ENV_FILE:-}" && -f "${JOURNAL_LINKER_ENV_FILE}" ]] && . "${JOURNAL_LINKER_ENV_FILE}"; \
       set +a; "{{py}}" "{{root}}/scripts/feedback_status.py"'
 
+# Poll Telegram for feedback responses and send any due check-in messages
+feedback-sender *ARGS:
+    @bash -c 'set -a; \
+      [[ -f "{{root}}/.env" ]] && . "{{root}}/.env"; \
+      [[ -f "$HOME/.config/journal-linker/journal-linker.env" ]] && . "$HOME/.config/journal-linker/journal-linker.env"; \
+      [[ -f "$HOME/.config/journal-linker/env" ]] && . "$HOME/.config/journal-linker/env"; \
+      [[ -n "${JOURNAL_LINKER_ENV_FILE:-}" && -f "${JOURNAL_LINKER_ENV_FILE}" ]] && . "${JOURNAL_LINKER_ENV_FILE}"; \
+      set +a; "{{py}}" "{{root}}/scripts/feedback_sender.py" {{ARGS}}'
+
 # Check voice pipeline health: faster-whisper, VoiceDrop dir, pending count
 voice-doctor:
     @printf '%s\n' "Journal Linker — Voice Pipeline"
