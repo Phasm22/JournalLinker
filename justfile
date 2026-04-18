@@ -73,9 +73,14 @@ voice-scan:
 voice-install:
     "{{py}}" -m pip install faster-whisper
 
-# Telegram Bot API: getMe + getChat (loads .env and ~/.config/journal-linker/env)
+# Telegram Bot API: getMe + getChat. Sources repo .env, then XDG files (later overrides), then JOURNAL_LINKER_ENV_FILE.
 telegram-doctor:
-    @bash -c 'set -a; [[ -f "{{root}}/.env" ]] && . "{{root}}/.env"; [[ -f "$HOME/.config/journal-linker/env" ]] && . "$HOME/.config/journal-linker/env"; set +a; "{{py}}" "{{root}}/scripts/telegram_doctor.py"'
+    @bash -c 'set -a; \
+      [[ -f "{{root}}/.env" ]] && . "{{root}}/.env"; \
+      [[ -f "$HOME/.config/journal-linker/journal-linker.env" ]] && . "$HOME/.config/journal-linker/journal-linker.env"; \
+      [[ -f "$HOME/.config/journal-linker/env" ]] && . "$HOME/.config/journal-linker/env"; \
+      [[ -n "${JOURNAL_LINKER_ENV_FILE:-}" && -f "${JOURNAL_LINKER_ENV_FILE}" ]] && . "${JOURNAL_LINKER_ENV_FILE}"; \
+      set +a; "{{py}}" "{{root}}/scripts/telegram_doctor.py"'
 
 # Check voice pipeline health: faster-whisper, VoiceDrop dir, pending count
 voice-doctor:
