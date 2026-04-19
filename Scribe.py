@@ -252,6 +252,8 @@ SEMANTIC_CONTEXT_LIMIT = 8
 RECENCY_LAMBDA = 0.08
 BURST_LOOKBACK_DAYS = 3
 BURST_WEIGHT = 4.0
+CLUSTER_DIVERSITY_BONUS = 10.0
+CLUSTER_DIVERSITY_MIN_BASE_SCORE = 5.0
 
 STOPWORDS = {
     "a",
@@ -307,6 +309,12 @@ def load_memory_store(path: Path) -> dict:
 
 
 def save_memory_store(path: Path, data: dict) -> None:
+    if path.exists():
+        bak = path.with_suffix(".json.bak")
+        try:
+            bak.write_bytes(path.read_bytes())
+        except Exception:
+            pass
     path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
 
 
@@ -456,6 +464,7 @@ def build_run_report_markdown(
     ollama_sec: float | None = None,
     postprocess_sec: float | None = None,
     eval_duration_ns: int | None = None,
+    cluster_diversity_count: int | None = None,
 ) -> str:
     status_label = "Success" if status == "success" else "Error"
     suggested_preview = ", ".join(ranked_terms[:12]) if ranked_terms else ", ".join(suggested_terms[:12])
@@ -495,6 +504,8 @@ def build_run_report_markdown(
         lines.append(f"- Post-process seconds: `{postprocess_sec:.3f}`")
     if eval_duration_ns is not None:
         lines.append(f"- Model eval duration ns: `{eval_duration_ns}`")
+    if cluster_diversity_count is not None:
+        lines.append(f"- Cluster diversity (distinct clusters in inserted links): `{cluster_diversity_count}`")
 
     lines.extend(
         [
@@ -565,6 +576,7 @@ def write_run_report(
     ollama_sec: float | None = None,
     postprocess_sec: float | None = None,
     eval_duration_ns: int | None = None,
+    cluster_diversity_count: int | None = None,
 ) -> Path | None:
     if base_dir is None:
         return None
@@ -607,6 +619,7 @@ def write_run_report(
         ollama_sec=ollama_sec,
         postprocess_sec=postprocess_sec,
         eval_duration_ns=eval_duration_ns,
+        cluster_diversity_count=cluster_diversity_count,
     )
     report_path.write_text(report_body, encoding="utf-8")
 
@@ -1111,6 +1124,7 @@ def rank_link_candidates(
     current_date: str | None = None,
     journal_dir: str | None = None,
     embedder: LocalEmbeddingCache | None = None,
+    cluster_map: dict[str, int] | None = None,
 ) -> list[str]:
     weights = learning.get("term_weights", {})
     term_memory = learning.get("term_memory", {})
@@ -1205,6 +1219,15 @@ def rank_link_candidates(
         scored.append((score, freq, len(term), -idx, term))
 
     scored.sort(reverse=True)
+    if cluster_map:
+        seen_clusters: set[int | None] = set()
+        for i, (base_score, freq, term_len, neg_idx, term) in enumerate(scored):
+            cid = cluster_map.get(term.lower())
+            if cid not in seen_clusters:
+                seen_clusters.add(cid)
+                if base_score > CLUSTER_DIVERSITY_MIN_BASE_SCORE:
+                    scored[i] = (base_score + CLUSTER_DIVERSITY_BONUS, freq, term_len, neg_idx, term)
+        scored.sort(reverse=True)
     return [term for _, _, _, _, term in scored[:max_links]]
 
 
@@ -1376,7 +1399,11 @@ def insert_ranked_wikilinks(
     max_links: int = 45,
     current_date: str | None = None,
     journal_dir: str | None = None,
+    cluster_map: dict[str, int] | None = None,
 ) -> tuple[str, list[str]]:
+    if cluster_map is None and journal_dir:
+        from vault_mapper import load_cluster_map
+        cluster_map = load_cluster_map(journal_dir)
     ranked_terms = rank_link_candidates(
         original,
         terms,
@@ -1384,6 +1411,7 @@ def insert_ranked_wikilinks(
         max_links=max_links,
         current_date=current_date,
         journal_dir=journal_dir,
+        cluster_map=cluster_map,
     )
     frontmatter, body = split_frontmatter(original)
     linked_body = insert_wikilinks_by_paragraph(body, ranked_terms)
@@ -1544,6 +1572,8 @@ def main() -> int:
             )
 
         memory_store_data = load_memory_store(MEMORY_STORE_FILE)
+        from vault_mapper import load_cluster_map
+        cluster_map = load_cluster_map(JOURNAL_DIR) if JOURNAL_DIR else {}
         current_date = apply_previous_day_feedback(
             memory_store_data,
             input_text,
@@ -1585,7 +1615,13 @@ def main() -> int:
             memory_store_data,
             current_date=current_date,
             journal_dir=JOURNAL_DIR,
+            cluster_map=cluster_map or None,
         )
+        cluster_diversity_count: int | None = None
+        if cluster_map and ranked_terms:
+            represented = {cluster_map.get(t.lower()) for t in ranked_terms
+                           if cluster_map.get(t.lower()) is not None}
+            cluster_diversity_count = len(represented)
         actions.append(
             {
                 "action": "Insert ranked wikilinks",
@@ -1657,6 +1693,7 @@ def main() -> int:
             ollama_sec=(t1 - t0) if t0 is not None and t1 is not None else None,
             postprocess_sec=(t2 - t1) if t1 is not None and t2 is not None else None,
             eval_duration_ns=eval_duration_ns,
+            cluster_diversity_count=cluster_diversity_count,
         )
         if report_path is not None:
             print(f"[Scribe] report={report_path}", file=sys.stderr)

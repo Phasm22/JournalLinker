@@ -116,6 +116,50 @@ def cluster_terms(cooccurrence: dict[tuple[str, str], int]) -> list[list[str]]:
     return [sorted(members) for members in groups.values() if len(members) >= 2]
 
 
+def load_cluster_map(journal_dir: str | None) -> dict[str, int]:
+    """Return {term: cluster_id} by re-running union-find over vault_relationships.json edges."""
+    if not journal_dir:
+        return {}
+    path = Path(journal_dir) / "Insights" / "vault_relationships.json"
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    entities = data.get("entities", {})
+    if not isinstance(entities, dict) or not entities:
+        return {}
+
+    parent: dict[str, str] = {}
+
+    def find(x: str) -> str:
+        while parent.get(x, x) != x:
+            parent[x] = parent.get(parent.get(x, x), x)
+            x = parent.get(x, x)
+        return x
+
+    def union(a: str, b: str) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    for term, meta in entities.items():
+        t = term.lower()
+        parent.setdefault(t, t)
+        for other, _ in meta.get("co_occurs_with", []):
+            o = other.lower()
+            parent.setdefault(o, o)
+            union(t, o)
+
+    roots = sorted(set(find(t) for t in parent))
+    cluster_ids = {root: i for i, root in enumerate(roots)}
+    try:
+        return {term: cluster_ids[find(term)] for term in parent}
+    except Exception:
+        return {}
+
+
 def load_memory_signals(learning_file: str) -> dict[str, dict]:
     """Load term_memory from scribe_learning.json; returns {} on any failure."""
     path = Path(learning_file)
