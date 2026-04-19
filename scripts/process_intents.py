@@ -30,8 +30,13 @@ Env vars (from .env or environment):
                                  (default: ~/.local/state/journal-linker/intents)
     INTENT_CLAUDE_IN_FLIGHT_TTL  seconds before in-flight entry is treated as stale
                                  (default: 300)
-    INTENT_ENRICHMENT_MODE       off|llmlib (default: llmlib)
-    LLMLIBRARIAN_SRC             path to llmLibrarian/src (default: ~/Desktop/llmLibrarian/src)
+    INTENT_ENRICHMENT_MODE       off|llmlib|mcp (default: llmlib; llmlib uses MCP)
+    LLMLIBRARIAN_MCP_HOST        llmLibrarian MCP host (default: 127.0.0.1)
+    LLMLIBRARIAN_MCP_PORT        llmLibrarian MCP port (default: 8765)
+    LLMLIBRARIAN_MCP_PATH        llmLibrarian MCP path (default: /mcp)
+    LLMLIBRARIAN_MCP_TIMEOUT     health/MCP timeout seconds (default: 2)
+    LLMLIBRARIAN_MCP_N_RESULTS   retrieval count for enrichment (default: 5)
+    LLMLIBRARIAN_MCP_SILO        optional silo slug/name; unset uses unified search
     INTENT_MAX_INTENTS_PER_NOTE  max intents extracted per note (default: 5)
     INTENT_FEEDBACK_DELAY_TODAY  seconds before feedback prompt fires for today/immediate urgency (default: 21600 = 6h)
     INTENT_FEEDBACK_DELAY_SOON   seconds before feedback prompt fires for soon urgency (default: 86400 = 24h)
@@ -48,6 +53,7 @@ Env vars (from .env or environment):
 """
 
 import argparse
+import asyncio
 import contextlib
 import hashlib
 import json
@@ -83,6 +89,11 @@ DEFAULT_MAX_INTENTS = 5
 DEFAULT_PUSHOVER_SERVER = "https://api.pushover.net"
 DEFAULT_PUSHOVER_PRIORITY = "0"
 DEFAULT_ENRICHMENT_MODE = "llmlib"
+DEFAULT_LLMLIBRARIAN_MCP_HOST = "127.0.0.1"
+DEFAULT_LLMLIBRARIAN_MCP_PORT = "8765"
+DEFAULT_LLMLIBRARIAN_MCP_PATH = "/mcp"
+DEFAULT_LLMLIBRARIAN_MCP_TIMEOUT = 2.0
+DEFAULT_LLMLIBRARIAN_MCP_N_RESULTS = 5
 INTENT_IDEMPOTENCY_VERSION = "3"
 KEEP_ALIVE = "5m"
 
@@ -118,6 +129,19 @@ def load_local_env(path: Path) -> None:
         if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
             value = value[1:-1]
         os.environ[key] = value
+
+
+def bootstrap_env(repo_root: Path) -> None:
+    """Load shared JournalLinker environment config before resolving defaults."""
+    repo_root_str = str(repo_root)
+    if repo_root_str not in sys.path:
+        sys.path.insert(0, repo_root_str)
+    try:
+        from journal_linker_env import bootstrap_journal_linker_env
+    except Exception:
+        load_local_env(repo_root / ".env")
+        return
+    bootstrap_journal_linker_env(repo_root=repo_root)
 
 
 # ---------------------------------------------------------------------------
@@ -377,34 +401,186 @@ def build_envelope(
 
 
 # ---------------------------------------------------------------------------
-# llmLibrarian enrichment (best-effort, direct import)
+# llmLibrarian enrichment (best-effort, MCP-over-HTTP)
 # ---------------------------------------------------------------------------
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except Exception:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except Exception:
+        return default
+
+
+def _llmlibrarian_mcp_base_url() -> str:
+    host = os.getenv("LLMLIBRARIAN_MCP_HOST", DEFAULT_LLMLIBRARIAN_MCP_HOST).strip()
+    port = os.getenv("LLMLIBRARIAN_MCP_PORT", DEFAULT_LLMLIBRARIAN_MCP_PORT).strip()
+    return f"http://{host}:{port}"
+
+
+def _llmlibrarian_mcp_endpoint() -> str:
+    path = os.getenv("LLMLIBRARIAN_MCP_PATH", DEFAULT_LLMLIBRARIAN_MCP_PATH).strip()
+    if not path.startswith("/"):
+        path = f"/{path}"
+    return f"{_llmlibrarian_mcp_base_url()}{path}"
+
+
+def _llmlibrarian_health_check(timeout: float | None = None) -> tuple[bool, str]:
+    """Return (ok, detail) for the llmLibrarian HTTP liveness endpoint."""
+    timeout = timeout if timeout is not None else _env_float(
+        "LLMLIBRARIAN_MCP_TIMEOUT",
+        DEFAULT_LLMLIBRARIAN_MCP_TIMEOUT,
+    )
+    url = f"{_llmlibrarian_mcp_base_url()}/healthz"
+    try:
+        request = urllib.request.Request(url, method="GET")
+        with contextlib.closing(urllib.request.urlopen(request, timeout=timeout)) as resp:
+            status = getattr(resp, "status", resp.getcode())
+            if 200 <= int(status) < 300:
+                return True, "ok"
+            return False, f"healthz returned HTTP {status}"
+    except Exception as exc:
+        return False, f"healthz failed: {exc}"
+
+
+def _mcp_tool_payload(tool_result: object) -> dict:
+    """Extract the JSON dict payload from an MCP CallToolResult."""
+    structured = getattr(tool_result, "structuredContent", None)
+    if isinstance(structured, dict):
+        return structured
+
+    content = getattr(tool_result, "content", None)
+    if isinstance(content, dict):
+        return content
+    if content is None:
+        return {"error": "MCP response had no content", "chunks": []}
+
+    for item in content:
+        if isinstance(item, dict):
+            text = item.get("text")
+            if text is None and item.get("type") == "json":
+                return item
+        else:
+            text = getattr(item, "text", None)
+        if not isinstance(text, str):
+            continue
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+
+    return {"error": "MCP response content did not contain a JSON object", "chunks": []}
+
+
+def _resolve_llmlibrarian_silo(list_silos_payload: dict, configured_silo: str) -> str:
+    silos = list_silos_payload.get("silos")
+    if not isinstance(silos, list):
+        raise ValueError("list_silos response did not include silos[]")
+    target = configured_silo.strip().lower()
+    for row in silos:
+        if not isinstance(row, dict):
+            continue
+        slug = str(row.get("slug", "")).strip()
+        candidates = {
+            slug,
+            str(row.get("name", "")).strip(),
+            str(row.get("display_name", "")).strip(),
+            str(row.get("displayName", "")).strip(),
+        }
+        if target in {c.lower() for c in candidates if c}:
+            return slug or configured_silo
+    raise ValueError(f"configured LLMLIBRARIAN_MCP_SILO not found: {configured_silo}")
+
+
+async def _query_llmlibrarian_mcp_async(query: str) -> dict:
+    from mcp import ClientSession  # type: ignore
+    from mcp.client.streamable_http import streamablehttp_client  # type: ignore
+
+    timeout = _env_float("LLMLIBRARIAN_MCP_TIMEOUT", DEFAULT_LLMLIBRARIAN_MCP_TIMEOUT)
+    n_results = _env_int("LLMLIBRARIAN_MCP_N_RESULTS", DEFAULT_LLMLIBRARIAN_MCP_N_RESULTS)
+    configured_silo = os.getenv("LLMLIBRARIAN_MCP_SILO", "").strip()
+    headers: dict[str, str] | None = None
+    token = os.getenv("LLMLIBRARIAN_MCP_AUTH_TOKEN", "").strip()
+    if token:
+        headers = {"Authorization": f"Bearer {token}"}
+
+    async with streamablehttp_client(
+        _llmlibrarian_mcp_endpoint(),
+        headers=headers,
+        timeout=timeout,
+        sse_read_timeout=timeout,
+    ) as (read_stream, write_stream, _get_session_id):
+        async with ClientSession(read_stream, write_stream) as session:
+            await session.initialize()
+
+            list_result = await session.call_tool("list_silos", {"check_staleness": False})
+            list_payload = _mcp_tool_payload(list_result)
+            if list_payload.get("error"):
+                return {"error": f"list_silos failed: {list_payload.get('error')}", "chunks": []}
+
+            silo = _resolve_llmlibrarian_silo(list_payload, configured_silo) if configured_silo else None
+            args: dict = {"query": query, "n_results": n_results}
+            if silo:
+                args["silo"] = silo
+            query_result = await session.call_tool("query_personal_knowledge", args)
+            payload = _mcp_tool_payload(query_result)
+            if not isinstance(payload.get("chunks", []), list):
+                payload["chunks"] = []
+            return payload
+
+
+def query_llmlibrarian_mcp(query: str) -> dict:
+    """Query llmLibrarian through MCP HTTP. Returns an error payload on failure."""
+    ok, detail = _llmlibrarian_health_check()
+    if not ok:
+        return {"error": detail, "chunks": []}
+    try:
+        timeout = _env_float("LLMLIBRARIAN_MCP_TIMEOUT", DEFAULT_LLMLIBRARIAN_MCP_TIMEOUT)
+        return asyncio.run(asyncio.wait_for(_query_llmlibrarian_mcp_async(query), timeout=timeout + 3.0))
+    except asyncio.TimeoutError:
+        return {"error": f"MCP query timed out after {timeout:g}s", "chunks": []}
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}", "chunks": []}
+
+
+def _chunk_title(chunk: dict) -> str:
+    return str(
+        chunk.get("title")
+        or chunk.get("source")
+        or chunk.get("silo")
+        or ""
+    )
+
 
 def enrich_envelope(envelope: dict) -> dict:
     """Query llmLibrarian for related hits. Never raises — failure is logged only."""
     intent_raw = envelope.get("intent_raw", "")
     if not intent_raw:
         return envelope
-    try:
-        llmlib_src = str(
-            Path(os.getenv("LLMLIBRARIAN_SRC", "/home/tj/Desktop/llmLibrarian/src"))
-            .expanduser()
-        )
-        if llmlib_src not in sys.path:
-            sys.path.insert(0, llmlib_src)
-        from query.core import run_retrieve  # type: ignore
-        result = run_retrieve(query=intent_raw, n_results=5)
-        chunks = result.get("chunks") or result.get("results") or []
-        hits = [
-            {"title": c.get("title", ""), "snippet": c.get("text", "")[:120]}
-            for c in chunks[:3]
-        ]
-        envelope["related_silo_hits"] = hits
-        envelope["recurrence_signal"] = len(chunks) >= 3
-        _log("enrich", f"enriched: {len(hits)} hits, recurrence={envelope['recurrence_signal']}")
-    except Exception as exc:
-        _log("enrich", f"best-effort enrichment failed (continuing): {exc}")
-        envelope["_enrichment_error"] = str(exc)
+    result = query_llmlibrarian_mcp(str(intent_raw))
+    if result.get("error"):
+        detail = str(result.get("error"))
+        _log("enrich", f"best-effort enrichment failed (continuing): {detail}")
+        envelope["_enrichment_error"] = detail
+        return envelope
+
+    chunks = result.get("chunks") or []
+    hits = [
+        {"title": _chunk_title(c), "snippet": str(c.get("text", ""))[:120]}
+        for c in chunks[:3]
+        if isinstance(c, dict)
+    ]
+    envelope["related_silo_hits"] = hits
+    envelope["recurrence_signal"] = len(chunks) >= 3
+    _log("enrich", f"enriched: {len(hits)} hits, recurrence={envelope['recurrence_signal']}")
     return envelope
 
 
@@ -429,6 +605,13 @@ ROUTING_SYSTEM_PROMPT = (
     "- For purchase_intent, prefer future_action_search_enqueue or note_capture over notification unless money, deadline, or another person is waiting today.\n"
     "- Set feedback_prompt to empty string when urgency=low.\n"
     "- When urgency is not low, feedback_prompt MUST be a yes/no completion question phrased as 'Did you X?' — never an open-ended question starting with What, How, Why, Which, or Who. The user answers with Done, Skip, or Later buttons, so the question must have a binary yes/no answer.\n"
+    "Feedback calibration: if feedback_context is present in the envelope, it contains confirmed and rejected "
+    "tap counts from the user's Telegram responses, keyed by intent_class. Use this to calibrate routing:\n"
+    "- High rejected count relative to confirmed for this intent_class: the user often dismisses these — "
+    "prefer lower urgency (soon or low) and digest_capture over notification.\n"
+    "- High confirmed count: the user engages with these — normal routing discipline applies.\n"
+    "- When rejected >= 3 and rejected > confirmed for this intent_class, avoid urgency=immediate or today "
+    "unless the intent has a clear concrete deadline, appointment, or named person waiting.\n"
     "Required output schema:\n"
     '{"urgency": "immediate|today|soon|low", '
     '"format": "notification|note|digest|draft", '
@@ -438,6 +621,27 @@ ROUTING_SYSTEM_PROMPT = (
     '"defer_to": "<ISO date or empty string>", '
     '"feedback_prompt": "<yes/no completion question as \'Did you X?\', or empty string if urgency=low>"}'
 )
+
+
+def _feedback_summary(state_dir: Path) -> dict:
+    """Return confirmed/rejected counts per intent_class from Telegram tap history."""
+    path = state_dir / "intent_feedback_learning.json"
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    summary: dict[str, dict[str, int]] = {}
+    for cls, info in data.get("approved", {}).items():
+        if cls == "unknown":
+            continue
+        summary.setdefault(cls, {"confirmed": 0, "rejected": 0})["confirmed"] = int(info.get("count", 0))
+    for cls, info in data.get("suppressed", {}).items():
+        if cls == "unknown":
+            continue
+        summary.setdefault(cls, {"confirmed": 0, "rejected": 0})["rejected"] = int(info.get("count", 0))
+    return summary
 
 
 def call_routing_model(envelope: dict, model: str, dry_run: bool = False) -> dict:
@@ -602,7 +806,7 @@ def parse_pushover_urgencies_allowed() -> set[str]:
 
 def resolve_enrichment_mode() -> str:
     raw = os.getenv("INTENT_ENRICHMENT_MODE", DEFAULT_ENRICHMENT_MODE).strip().lower()
-    if raw not in {"off", "llmlib"}:
+    if raw not in {"off", "llmlib", "mcp"}:
         return DEFAULT_ENRICHMENT_MODE
     return raw
 
@@ -1294,8 +1498,11 @@ def run_intent_pipeline(
             intent_class=intent_class,
             note_text=note_text,
         )
-        if enrichment_mode == "llmlib":
+        if enrichment_mode in {"llmlib", "mcp"}:
             envelope = enrich_envelope(envelope)
+        feedback_ctx = _feedback_summary(state_dir)
+        if feedback_ctx:
+            envelope["feedback_context"] = feedback_ctx
 
         claude_idempotency_key = compute_idempotency_key(
             source_path, source_date,
@@ -1587,7 +1794,7 @@ def _parse_older_than(value: str) -> int:
 
 def parse_cli() -> argparse.Namespace:
     repo_root = Path(__file__).resolve().parents[1]
-    load_local_env(repo_root / ".env")
+    bootstrap_env(repo_root)
 
     parser = argparse.ArgumentParser(
         description="Intent-capture pipeline: gate → package → Claude → deliver.",

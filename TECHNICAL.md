@@ -83,6 +83,8 @@ python3 daily_reflection.py --force-send
 
 The intent watcher runs from the journalLinker checkout referenced by `JOURNAL_LINKER_REPO`. It gates journal text, calls the routing model, then delivers to Pushover, Obsidian cortex, digest queue, and Telegram feedback queue.
 
+**llmLibrarian enrichment:** `INTENT_ENRICHMENT_MODE=llmlib` (or `mcp`) uses llmLibrarian over MCP HTTP, not a direct Python import. The pipeline checks `http://127.0.0.1:8765/healthz` before calling the `query_personal_knowledge` tool and degrades gracefully if the server is down. Install the client with `just intent-mcp-install`, then supervise `/home/YOU/Desktop/llmLibrarian/mcp_server.py` with `systemd/journal-linker-llmlibrarian-mcp.service` or set `INTENT_ENRICHMENT_MODE=off`.
+
 **Repeat notifications:** delivery is idempotent per sink and per `claude_idempotency_key`. If the ledger already records a successful Pushover (or cortex, digest, feedback queue) attempt for that key, a later run skips that sink instead of sending again.
 
 **Tuning Pushover noise:**

@@ -38,13 +38,19 @@ class TestFeedbackSenderCallbacks(unittest.TestCase):
             "expires_at": "",
         }
 
-    def _update(self, action, key="a" * 64):
+    def _update(self, action, key="a" * 64, include_message=False, message_id=123):
+        callback_query = {
+            "id": "callback-1",
+            "data": f"{action}:{key[:16]}",
+        }
+        if include_message:
+            callback_query["message"] = {
+                "message_id": message_id,
+                "chat": {"id": 456},
+            }
         return {
             "update_id": 1,
-            "callback_query": {
-                "id": "callback-1",
-                "data": f"{action}:{key[:16]}",
-            },
+            "callback_query": callback_query,
         }
 
     def test_confirm_records_approval_learning(self):
@@ -64,6 +70,34 @@ class TestFeedbackSenderCallbacks(unittest.TestCase):
         self.assertEqual(ledger[key]["feedback_signal"], "confirmed")
         self.assertEqual(learning["approved"]["task_intent"]["count"], 1)
 
+    def test_confirm_removes_keyboard_and_writes_tap_trace(self):
+        key = "a" * 64
+        entries = [self._entry(key)]
+        ledger = {key: {"claude_idempotency_key": key}}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_dir = Path(tmpdir)
+            with (
+                mock.patch.object(fs, "answer_callback") as answer_mock,
+                mock.patch.object(fs, "edit_message_reply_markup") as edit_mock,
+            ):
+                fs.process_callback_updates(
+                    [self._update("confirm", key, include_message=True)],
+                    entries,
+                    ledger,
+                    "token",
+                    state_dir=state_dir,
+                )
+            traces = [
+                json.loads(line)
+                for line in (state_dir / fs.FEEDBACK_TAP_TRACE_FILENAME).read_text().splitlines()
+            ]
+
+        edit_mock.assert_called_once_with("token", "456", 123)
+        answer_mock.assert_called_once_with("token", "callback-1", "✓ Noted")
+        self.assertEqual(traces[0]["claude_idempotency_key"], key)
+        self.assertTrue(traces[0]["accepted"])
+        self.assertEqual(traces[0]["resulting_signal"], "confirmed")
+
     def test_reject_records_suppression_learning(self):
         key = "b" * 64
         entry = self._entry(key)
@@ -81,6 +115,68 @@ class TestFeedbackSenderCallbacks(unittest.TestCase):
         self.assertEqual(learning["suppressed"]["purchase_intent"]["count"], 1)
         self.assertIn("Did you call Marcus?", learning["suppressed"]["purchase_intent"]["phrases"])
 
+    def test_second_tap_is_duplicate_and_does_not_change_learning(self):
+        key = "b" * 64
+        entry = self._entry(key)
+        entry["intent_class"] = "purchase_intent"
+        entries = [entry]
+        ledger = {key: {"claude_idempotency_key": key}}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_dir = Path(tmpdir)
+            with (
+                mock.patch.object(fs, "answer_callback") as answer_mock,
+                mock.patch.object(fs, "edit_message_reply_markup"),
+            ):
+                fs.process_callback_updates(
+                    [
+                        self._update("confirm", key, include_message=True),
+                        self._update("reject", key, include_message=True),
+                    ],
+                    entries,
+                    ledger,
+                    "token",
+                    state_dir=state_dir,
+                )
+            learning = fs.load_feedback_learning(state_dir)
+            traces = [
+                json.loads(line)
+                for line in (state_dir / fs.FEEDBACK_TAP_TRACE_FILENAME).read_text().splitlines()
+            ]
+
+        self.assertEqual(entries[0]["state"], "responded")
+        self.assertEqual(entries[0]["feedback_signal"], "confirmed")
+        self.assertEqual(ledger[key]["feedback_signal"], "confirmed")
+        self.assertEqual(learning["approved"]["purchase_intent"]["count"], 1)
+        self.assertEqual(learning["suppressed"], {})
+        self.assertEqual(answer_mock.call_args_list[1].args[2], fs.DUPLICATE_ACKS[2])
+        self.assertFalse(traces[1]["accepted"])
+        self.assertEqual(traces[1]["resulting_signal"], "confirmed")
+
+    def test_third_total_tap_uses_special_acknowledgement(self):
+        key = "e" * 64
+        entries = [self._entry(key)]
+        ledger = {key: {"claude_idempotency_key": key}}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_dir = Path(tmpdir)
+            with (
+                mock.patch.object(fs, "answer_callback") as answer_mock,
+                mock.patch.object(fs, "edit_message_reply_markup"),
+            ):
+                fs.process_callback_updates(
+                    [
+                        self._update("confirm", key, include_message=True),
+                        self._update("reject", key, include_message=True),
+                        self._update("defer", key, include_message=True),
+                    ],
+                    entries,
+                    ledger,
+                    "token",
+                    state_dir=state_dir,
+                )
+
+        self.assertEqual(answer_mock.call_args_list[2].args[2], fs.THIRD_TAP_ACK)
+        self.assertEqual(entries[0]["feedback_signal"], "confirmed")
+
     def test_defer_increments_count_and_requeues(self):
         key = "c" * 64
         entries = [self._entry(key)]
@@ -96,6 +192,30 @@ class TestFeedbackSenderCallbacks(unittest.TestCase):
         self.assertEqual(entries[0]["feedback_signal"], "deferred")
         self.assertEqual(entries[0]["defer_count"], 1)
         self.assertEqual(ledger[key]["feedback_signal"], "deferred")
+
+    def test_defer_removes_old_keyboard_and_writes_tap_trace(self):
+        key = "c" * 64
+        entries = [self._entry(key)]
+        ledger = {key: {"claude_idempotency_key": key}}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_dir = Path(tmpdir)
+            with (
+                mock.patch.object(fs, "answer_callback"),
+                mock.patch.object(fs, "edit_message_reply_markup") as edit_mock,
+            ):
+                fs.process_callback_updates(
+                    [self._update("defer", key, include_message=True)],
+                    entries,
+                    ledger,
+                    "token",
+                    state_dir=state_dir,
+                )
+            trace = json.loads((state_dir / fs.FEEDBACK_TAP_TRACE_FILENAME).read_text().splitlines()[0])
+
+        edit_mock.assert_called_once_with("token", "456", 123)
+        self.assertEqual(entries[0]["state"], "pending")
+        self.assertEqual(trace["resulting_signal"], "deferred")
+        self.assertTrue(trace["accepted"])
 
     def test_defer_expires_after_cap(self):
         key = "d" * 64
@@ -113,6 +233,26 @@ class TestFeedbackSenderCallbacks(unittest.TestCase):
         self.assertEqual(entries[0]["state"], "expired")
         self.assertEqual(entries[0]["feedback_signal"], "expired_defer_limit")
         self.assertEqual(ledger[key]["feedback_signal"], "expired_defer_limit")
+
+    def test_keyboard_removal_failure_does_not_block_callback(self):
+        key = "f" * 64
+        entries = [self._entry(key)]
+        ledger = {key: {"claude_idempotency_key": key}}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with (
+                mock.patch.object(fs, "answer_callback") as answer_mock,
+                mock.patch.object(fs, "edit_message_reply_markup", side_effect=RuntimeError("boom")),
+            ):
+                fs.process_callback_updates(
+                    [self._update("confirm", key, include_message=True)],
+                    entries,
+                    ledger,
+                    "token",
+                    state_dir=Path(tmpdir),
+                )
+
+        self.assertEqual(entries[0]["feedback_signal"], "confirmed")
+        answer_mock.assert_called_once_with("token", "callback-1", "✓ Noted")
 
 
 class TestFeedbackSenderLongPolling(unittest.TestCase):
@@ -190,6 +330,44 @@ class TestFeedbackSenderSendCaps(unittest.TestCase):
         self.assertEqual(send_mock.call_count, 1)
         self.assertEqual(entries[0]["state"], "sent")
         self.assertEqual(entries[1]["state"], "pending")
+
+    def test_message_text_is_prompt_with_natural_title_footer(self):
+        entry = self._pending("g" * 64, "/tmp/2026-04-16.md")
+        entry["feedback_prompt"] = "Did you pick up the smoothie for Jill?"
+        entry["title"] = "Pick up smoothie for Jill"
+        entry["category"] = "task"
+        entry["intent_class"] = "task_intent"
+        with mock.patch.object(
+            fs,
+            "send_message",
+            return_value={"result": {"message_id": 99}},
+        ) as send_mock:
+            fs.send_due_messages([entry], "token", "chat")
+
+        text = send_mock.call_args.args[2]
+        self.assertNotIn("Intent check-in", text)
+        self.assertEqual(
+            text,
+            "Did you pick up the smoothie for Jill?\n<i>(Pick up smoothie for Jill · task)</i>",
+        )
+
+    def test_message_text_html_escapes_user_content(self):
+        entry = self._pending("h" * 64, "/tmp/2026-04-16.md")
+        entry["feedback_prompt"] = "Did you pay Jill & Marcus?"
+        entry["title"] = "Pay <Jill>"
+        entry["category"] = "task > money"
+        with mock.patch.object(
+            fs,
+            "send_message",
+            return_value={"result": {"message_id": 99}},
+        ) as send_mock:
+            fs.send_due_messages([entry], "token", "chat")
+
+        text = send_mock.call_args.args[2]
+        self.assertEqual(
+            text,
+            "Did you pay Jill &amp; Marcus?\n<i>(Pay &lt;Jill&gt; · task &gt; money)</i>",
+        )
 
 
 if __name__ == "__main__":

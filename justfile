@@ -84,6 +84,60 @@ voice-scan:
 voice-install:
     "{{py}}" -m pip install faster-whisper
 
+# Install the MCP client used for llmLibrarian intent enrichment
+intent-mcp-install:
+    "{{py}}" -m pip install mcp
+
+# Smoke test: initialize → tools/list → tools/call against the live MCP server
+intent-mcp-smoke *ARGS:
+    @bash -c 'set -a; \
+      [[ -f "{{root}}/.env" ]] && . "{{root}}/.env"; \
+      [[ -f "$HOME/.config/journal-linker/journal-linker.env" ]] && . "$HOME/.config/journal-linker/journal-linker.env"; \
+      [[ -n "${JOURNAL_LINKER_ENV_FILE:-}" && -f "${JOURNAL_LINKER_ENV_FILE}" ]] && . "${JOURNAL_LINKER_ENV_FILE}"; \
+      set +a; "{{py}}" "{{root}}/scripts/mcp_smoke.py" {{ARGS}}'
+
+# Stack health: /healthz, llmlib watcher services, pal silo status, enrichment mode
+status:
+    @printf '%s\n' "Journal Linker — Stack Health"
+    @bash -c 'set -a; \
+      [[ -f "{{root}}/.env" ]] && . "{{root}}/.env"; \
+      [[ -f "$HOME/.config/journal-linker/journal-linker.env" ]] && . "$HOME/.config/journal-linker/journal-linker.env"; \
+      [[ -n "${JOURNAL_LINKER_ENV_FILE:-}" && -f "${JOURNAL_LINKER_ENV_FILE}" ]] && . "${JOURNAL_LINKER_ENV_FILE}"; \
+      set +a; \
+      host="${LLMLIBRARIAN_MCP_HOST:-127.0.0.1}"; \
+      port="${LLMLIBRARIAN_MCP_PORT:-8765}"; \
+      url="http://$host:$port/healthz"; \
+      if curl -sf --max-time 2 "$url" >/dev/null 2>&1; then \
+        printf "  %-34s %s\n" "llmLibrarian /healthz" "OK  ($url)"; \
+      else \
+        printf "  %-34s %s\n" "llmLibrarian /healthz" "DOWN  ($url)"; \
+      fi; \
+      running=$(systemctl --user list-units --type=service --state=running 2>/dev/null | grep -c "llmlibrarian-watch" || true); \
+      total=$(systemctl --user list-unit-files --type=service 2>/dev/null | grep -c "llmlibrarian-watch" || true); \
+      if [[ "${running:-0}" -ge 1 ]]; then \
+        printf "  %-34s %s\n" "llmlib watcher services" "OK  ($running/$total running)"; \
+      else \
+        printf "  %-34s %s\n" "llmlib watcher services" "DOWN  (0/$total running)"; \
+      fi; \
+      palbin="${LLMLIBRARIAN_REPO:-$HOME/Desktop/llmLibrarian}/.venv/bin/pal"; \
+      if [[ -x "$palbin" ]]; then \
+        palout=$("$palbin" ls --status 2>&1); \
+        if echo "$palout" | grep -q "No action needed"; then \
+          printf "  %-34s %s\n" "pal ls --status" "OK"; \
+        else \
+          printf "  %-34s %s\n" "pal ls --status" "ACTION NEEDED"; \
+          echo "$palout" | sed "s/^/      /"; \
+        fi; \
+      else \
+        printf "  %-34s %s\n" "pal ls --status" "not found ($palbin)"; \
+      fi; \
+      mode="${INTENT_ENRICHMENT_MODE:-llmlib}"; \
+      if [[ "$mode" == "off" ]]; then \
+        printf "  %-34s %s\n" "INTENT_ENRICHMENT_MODE" "WARNING: off (enrichment disabled)"; \
+      else \
+        printf "  %-34s %s\n" "INTENT_ENRICHMENT_MODE" "OK  ($mode)"; \
+      fi'
+
 # Telegram Bot API: getMe + getChat. Sources repo .env, then XDG files (later overrides), then JOURNAL_LINKER_ENV_FILE.
 telegram-doctor:
     @bash -c 'set -a; \

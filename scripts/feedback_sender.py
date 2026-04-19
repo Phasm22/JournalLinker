@@ -24,9 +24,12 @@ Env vars:
     INTENT_STATE_DIR     state dir (default: ~/.local/state/journal-linker/intents)
     INTENT_FEEDBACK_POLL_TIMEOUT    long-poll timeout seconds (default: 25)
     INTENT_FEEDBACK_SEND_INTERVAL   due-message scan interval seconds (default: 60)
+    INTENT_FEEDBACK_QUIET_START     quiet-hours start, local hour 0-23 (default: 22)
+    INTENT_FEEDBACK_QUIET_END       quiet-hours end, local hour 0-23 (default: 8)
 """
 
 import argparse
+import html
 import json
 import os
 import sys
@@ -42,11 +45,47 @@ FEEDBACK_QUEUE_FILENAME = "intent_feedback_queue.jsonl"
 LEDGER_FILENAME = "intent_delivery_ledger.jsonl"
 OFFSET_FILENAME = "telegram_update_offset.txt"
 FEEDBACK_LEARNING_FILENAME = "intent_feedback_learning.json"
+FEEDBACK_TAP_TRACE_FILENAME = "intent_feedback_tap_trace.jsonl"
 DEFER_DELAY_SECS = 86400  # 24h re-queue on defer
 DEFAULT_DEFER_LIMIT = 3
 DEFAULT_MAX_PER_SOURCE_PER_RUN = 1
 
+SURGICAL_EDIT_SYSTEM_PROMPT = (
+    "You are making a minimal surgical edit to a markdown journal note. "
+    "The user's reply provides a clarification or correction to something the system extracted. "
+    "Apply ONLY the correction clearly implied — fix names, fill vague references like 'someone' "
+    "if the reply makes them unambiguous. Do not rewrite, expand, or restructure. "
+    "If the reply is ambiguous or you are not confident what to change, set changed to false "
+    "and return the original text unchanged. "
+    'Return JSON only: {"changed": true/false, "text": "<full corrected section text>"}'
+)
+
 TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
+THIRD_TAP_ACK = "Yes, we now have to record taps."
+DUPLICATE_ACKS = [
+    "Already recorded.",
+    "Got this one already.",
+    "Already got it.",
+    "Logged the first tap.",
+    "This one is already filed.",
+    "First answer is still the one.",
+    "Already handled.",
+    "Yep, already saved.",
+    "No change - already recorded.",
+    "This tap is just a tap now.",
+    "Still recorded from before.",
+    "Already in the ledger.",
+    "Button enthusiasm noted.",
+    "Same answer is still saved.",
+    "Nothing changed here.",
+    "Already tucked away.",
+    "The first tap won.",
+    "Duplicate tap observed.",
+    "Still counting only the first one.",
+    "Already processed.",
+    "Recorded earlier.",
+    "No new signal from this tap.",
+]
 
 _verbose = False
 
@@ -85,7 +124,7 @@ def get_updates(token: str, offset: int, timeout: int = 0) -> list[dict]:
     result = _tg_request(token, "getUpdates", {
         "offset": offset,
         "timeout": timeout,
-        "allowed_updates": ["callback_query"],
+        "allowed_updates": ["callback_query", "message"],
     }, request_timeout=max(15, timeout + 10))
     return result.get("result", [])
 
@@ -107,6 +146,30 @@ def answer_callback(token: str, callback_query_id: str, text: str = "") -> None:
         })
     except Exception as exc:
         _vlog("callback", f"answerCallbackQuery failed (stale?): {exc}")
+
+
+def edit_message_reply_markup(token: str, chat_id: str, message_id: int | str, reply_markup: dict | None = None) -> None:
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "reply_markup": reply_markup or {"inline_keyboard": []},
+    }
+    _tg_request(token, "editMessageReplyMarkup", payload)
+
+
+def remove_callback_keyboard(token: str, callback_query: dict, entry: dict) -> None:
+    """Best-effort removal of old inline buttons after a callback is accepted."""
+    message = callback_query.get("message") or {}
+    chat = message.get("chat") or {}
+    chat_id = chat.get("id") or entry.get("telegram_chat_id", "")
+    message_id = message.get("message_id") or entry.get("telegram_message_id", "")
+    if not chat_id or not message_id:
+        _vlog("callback", "cannot remove keyboard: missing chat_id or message_id")
+        return
+    try:
+        edit_message_reply_markup(token, str(chat_id), message_id)
+    except Exception as exc:
+        _vlog("callback", f"editMessageReplyMarkup failed: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +287,34 @@ def save_feedback_learning(state_dir: Path, learning: dict) -> None:
         raise
 
 
+def _tap_trace_path(state_dir: Path) -> Path:
+    return state_dir / FEEDBACK_TAP_TRACE_FILENAME
+
+
+def count_tap_traces(state_dir: Path, key: str) -> int:
+    path = _tap_trace_path(state_dir)
+    if not path.exists():
+        return 0
+    count = 0
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if record.get("claude_idempotency_key") == key or record.get("key16") == key[:16]:
+            count += 1
+    return count
+
+
+def append_tap_trace(state_dir: Path, record: dict) -> None:
+    path = _tap_trace_path(state_dir)
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
 def _record_feedback_learning(learning: dict, entry: dict, signal_label: str, at: str) -> None:
     intent_class = str(entry.get("intent_class") or "unknown")
     phrase = str(entry.get("feedback_prompt") or entry.get("title") or "").strip()
@@ -257,6 +348,115 @@ def _env_int(name: str, default: int) -> int:
         return int(os.getenv(name, str(default)))
     except Exception:
         return default
+
+
+def _in_quiet_hours() -> bool:
+    start = _env_int("INTENT_FEEDBACK_QUIET_START", 22)
+    end = _env_int("INTENT_FEEDBACK_QUIET_END", 8)
+    h = datetime.now().hour  # local time
+    if start > end:  # wraps midnight
+        return h >= start or h < end
+    return start <= h < end
+
+
+def _next_quiet_end() -> datetime:
+    end_hour = _env_int("INTENT_FEEDBACK_QUIET_END", 8)
+    now_local = datetime.now()
+    candidate = now_local.replace(hour=end_hour, minute=0, second=0, microsecond=0)
+    if candidate <= now_local:
+        candidate += timedelta(days=1)
+    return candidate
+
+
+def _cortex_path_for_entry(entry: dict, ledger: dict) -> str | None:
+    ikey = entry.get("claude_idempotency_key", "")
+    for attempt in ledger.get(ikey, {}).get("delivery_attempts", []):
+        cortex = attempt.get("results", {}).get("cortex", {})
+        if cortex.get("ok") and cortex.get("path"):
+            return cortex["path"]
+    return None
+
+
+def _callback_message_id(callback_query: dict) -> int | str:
+    message = callback_query.get("message") or {}
+    return message.get("message_id", "")
+
+
+def _is_duplicate_callback(entry: dict, callback_query: dict) -> bool:
+    state = str(entry.get("state") or "")
+    if state in {"responded", "expired"}:
+        return True
+    if state == "pending" and entry.get("feedback_signal"):
+        return True
+    if state == "sent" and entry.get("feedback_signal"):
+        stored_message_id = entry.get("telegram_message_id")
+        callback_message_id = _callback_message_id(callback_query)
+        if stored_message_id and callback_message_id and str(stored_message_id) != str(callback_message_id):
+            return True
+    return False
+
+
+def _duplicate_ack(tap_number: int) -> str:
+    if tap_number == 3:
+        return THIRD_TAP_ACK
+    return DUPLICATE_ACKS[tap_number % len(DUPLICATE_ACKS)]
+
+
+def _record_tap(
+    state_dir: Path | None,
+    entry: dict | None,
+    callback_query: dict,
+    key16: str,
+    action: str,
+    accepted: bool,
+    prior_state: str,
+    resulting_state: str,
+    prior_signal: str,
+    resulting_signal: str,
+    acknowledgement: str,
+    tap_number: int,
+    at: str,
+) -> None:
+    if state_dir is None:
+        return
+    message = callback_query.get("message") or {}
+    record = {
+        "at": at,
+        "claude_idempotency_key": entry.get("claude_idempotency_key", "") if entry else "",
+        "key16": key16,
+        "intent_class": str(entry.get("intent_class") or "") if entry else "",
+        "action": action,
+        "accepted": accepted,
+        "prior_state": prior_state,
+        "resulting_state": resulting_state,
+        "prior_signal": prior_signal,
+        "resulting_signal": resulting_signal,
+        "callback_query_id": callback_query.get("id", ""),
+        "telegram_message_id": message.get("message_id", entry.get("telegram_message_id", "") if entry else ""),
+        "acknowledgement": acknowledgement,
+        "tap_number": tap_number,
+    }
+    append_tap_trace(state_dir, record)
+
+
+def _button_labels(entry: dict) -> tuple[str, str, str]:
+    intent_class = str(entry.get("intent_class") or "")
+    category = str(entry.get("category") or "")
+    if intent_class == "purchase_intent":
+        return ("Got it", "Pass", "Later")
+    if intent_class == "latent_interest":
+        return ("Noted", "Dismiss", "Later")
+    if category == "reminder":
+        return ("Done", "Dismiss", "Snooze")
+    return ("Done", "Skip", "Later")
+
+
+def build_feedback_message_text(entry: dict) -> str:
+    title = str(entry.get("title", "Intent") or "Intent")
+    prompt = str(entry.get("feedback_prompt", title) or title)
+    category = str(entry.get("category", "") or "").strip()
+    meta = title if not category else f"{title} · {category}"
+    return f"{html.escape(prompt)}\n<i>({html.escape(meta)})</i>"
 
 
 # ---------------------------------------------------------------------------
@@ -294,13 +494,33 @@ def process_callback_updates(
             (e for e in entries if e.get("claude_idempotency_key", "").startswith(key16)),
             None,
         )
+        now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
         if not matched:
             _vlog("callback", f"no queue entry found for key16={key16!r}")
-            answer_callback(token, cq_id, "Already processed or not found.")
+            ack = "Already processed or not found."
+            answer_callback(token, cq_id, ack)
+            _record_tap(
+                state_dir, None, cq, key16, action, False,
+                "", "", "", "", ack, 1, now_iso,
+            )
             continue
 
         ikey = matched["claude_idempotency_key"]
-        now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        prior_state = str(matched.get("state", "") or "")
+        prior_signal = str(matched.get("feedback_signal", "") or "")
+        previous_taps = count_tap_traces(state_dir, ikey) if state_dir is not None else int(matched.get("tap_count") or 0)
+        tap_number = previous_taps + 1
+        matched["tap_count"] = tap_number
+
+        if _is_duplicate_callback(matched, cq):
+            ack = _duplicate_ack(tap_number)
+            answer_callback(token, cq_id, ack)
+            _record_tap(
+                state_dir, matched, cq, key16, action, False,
+                prior_state, prior_state, prior_signal, prior_signal, ack, tap_number, now_iso,
+            )
+            _log("callback", f"duplicate tap key={key16} action={action} tap_number={tap_number}")
+            continue
 
         if action == "defer":
             defer_count = int(matched.get("defer_count") or 0) + 1
@@ -344,12 +564,19 @@ def process_callback_updates(
         else:
             _vlog("callback", f"ledger entry not found for {ikey[:16]} — signal recorded in queue only")
 
-        answer_callback(token, cq_id, {
+        ack = {
             "confirmed": "✓ Noted",
             "rejected": "✗ Noted",
             "deferred": "→ Snoozed 24h",
             "expired_defer_limit": "Expired after too many defers",
-        }.get(signal_label, "OK"))
+        }.get(signal_label, "OK")
+        answer_callback(token, cq_id, ack)
+        remove_callback_keyboard(token, cq, matched)
+        _record_tap(
+            state_dir, matched, cq, key16, action, True,
+            prior_state, str(matched.get("state", "") or ""),
+            prior_signal, signal_label, ack, tap_number, now_iso,
+        )
 
     if learning_changed and state_dir is not None and learning is not None:
         save_feedback_learning(state_dir, learning)
@@ -360,11 +587,13 @@ def send_due_messages(
     entries: list[dict],
     token: str,
     chat_id: str,
+    state_dir: Path | None = None,
 ) -> list[dict]:
     """Send Telegram messages for pending entries past their send_after time."""
     now = datetime.now(timezone.utc)
     max_per_source = _env_int("INTENT_FEEDBACK_MAX_PER_SOURCE_PER_RUN", DEFAULT_MAX_PER_SOURCE_PER_RUN)
     sent_by_source: dict[str, int] = {}
+    ledger = load_ledger(state_dir) if state_dir is not None else {}
     for entry in entries:
         if entry.get("state") != "pending":
             continue
@@ -381,6 +610,22 @@ def send_due_messages(
             _vlog("sender", f"not yet due: {entry.get('title','?')!r} send_after={send_after_str}")
             continue
 
+        # Suppress if the cortex note was deleted from Obsidian
+        cortex_path = _cortex_path_for_entry(entry, ledger)
+        if cortex_path and not Path(cortex_path).exists():
+            entry["state"] = "expired"
+            entry["feedback_signal"] = "cortex_deleted"
+            _log("sender", f"cortex deleted, suppressing: {entry.get('title','?')!r}")
+            continue
+
+        # Respect quiet hours — reschedule to next quiet-end rather than sending now
+        if _in_quiet_hours():
+            next_end = _next_quiet_end()
+            next_end_utc = next_end.astimezone(timezone.utc).isoformat(timespec="seconds")
+            entry["send_after"] = next_end_utc
+            _log("sender", f"quiet hours: rescheduled {entry.get('title','?')!r} to {next_end_utc}")
+            continue
+
         source_file = str(entry.get("source_file") or "")
         if source_file and sent_by_source.get(source_file, 0) >= max_per_source:
             _vlog("sender", f"source send cap reached for {source_file!r}")
@@ -388,21 +633,13 @@ def send_due_messages(
 
         key16 = entry["claude_idempotency_key"][:16]
         title = entry.get("title", "Intent")
-        prompt = entry.get("feedback_prompt", title)
-        category = entry.get("category", "")
-        intent_class = entry.get("intent_class", "")
-
-        text = (
-            f"📋 <b>Intent check-in</b>\n\n"
-            f"{prompt}\n"
-            f"<i>({title} · {category}"
-            f"{' · ' + intent_class if intent_class else ''})</i>"
-        )
+        text = build_feedback_message_text(entry)
+        confirm_label, reject_label, defer_label = _button_labels(entry)
         reply_markup = {
             "inline_keyboard": [[
-                {"text": "Done",  "callback_data": f"confirm:{key16}"},
-                {"text": "Skip",  "callback_data": f"reject:{key16}"},
-                {"text": "Later", "callback_data": f"defer:{key16}"},
+                {"text": confirm_label, "callback_data": f"confirm:{key16}"},
+                {"text": reject_label,  "callback_data": f"reject:{key16}"},
+                {"text": defer_label,   "callback_data": f"defer:{key16}"},
             ]]
         }
 
@@ -411,6 +648,7 @@ def send_due_messages(
             msg_id = result.get("result", {}).get("message_id")
             entry["state"] = "sent"
             entry["telegram_message_id"] = msg_id
+            entry["telegram_chat_id"] = chat_id
             if source_file:
                 sent_by_source[source_file] = sent_by_source.get(source_file, 0) + 1
             _log("sender", f"sent message_id={msg_id} for {title!r}")
@@ -420,16 +658,154 @@ def send_due_messages(
     return entries
 
 
+def _extract_journal_section(source_file: Path, intent_raw: str, context_lines: int = 40) -> str:
+    text = source_file.read_text(encoding="utf-8", errors="replace")
+    lines = text.splitlines()
+    needle = intent_raw[:50].lower()
+    for i, line in enumerate(lines):
+        if needle in line.lower():
+            start = max(0, i - context_lines // 2)
+            end = min(len(lines), i + context_lines // 2)
+            return "\n".join(lines[start:end])
+    return "\n".join(lines[-context_lines:])
+
+
+def _openai_surgical_edit(api_key: str, journal_section: str, intent_raw: str, user_reply: str) -> dict:
+    try:
+        import openai  # type: ignore
+    except ImportError:
+        raise RuntimeError("openai package not available")
+    client = openai.OpenAI(api_key=api_key)
+    completion = client.chat.completions.create(
+        model="gpt-4o-mini",
+        max_tokens=2048,
+        temperature=0,
+        messages=[
+            {"role": "system", "content": SURGICAL_EDIT_SYSTEM_PROMPT},
+            {"role": "user", "content": json.dumps({
+                "journal_section": journal_section,
+                "intent_raw": intent_raw,
+                "user_reply": user_reply,
+            }, ensure_ascii=False)},
+        ],
+        response_format={"type": "json_object"},
+    )
+    raw = completion.choices[0].message.content or ""
+    result = json.loads(raw)
+    if not isinstance(result, dict) or "changed" not in result or "text" not in result:
+        raise ValueError(f"unexpected response shape: {raw[:200]}")
+    return result
+
+
+def _send_plain(token: str, chat_id: str, text: str) -> None:
+    try:
+        _tg_request(token, "sendMessage", {"chat_id": chat_id, "text": text})
+    except Exception as exc:
+        _vlog("clarify", f"sendMessage failed: {exc}")
+
+
+def _apply_clarification(entry: dict, reply_text: str, token: str, chat_id: str) -> None:
+    source_file = entry.get("source_file", "")
+    if not source_file:
+        return
+    path = Path(source_file)
+    if not path.exists() or path.suffix != ".md":
+        _vlog("clarify", f"source file missing or not .md: {path}")
+        return
+    if path.stat().st_size > 100_000:
+        _vlog("clarify", f"source file too large: {path}")
+        return
+
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        _log("clarify", "OPENAI_API_KEY not set, skipping surgical edit")
+        return
+
+    intent_raw = str(entry.get("intent_raw") or entry.get("title") or "")
+    section = _extract_journal_section(path, intent_raw)
+
+    try:
+        result = _openai_surgical_edit(api_key, section, intent_raw, reply_text)
+    except Exception as exc:
+        _log("clarify", f"OpenAI call failed: {exc}")
+        _send_plain(token, chat_id, "⚠️ Couldn't apply edit right now.")
+        return
+
+    if not result.get("changed"):
+        _log("clarify", "model returned changed=false")
+        _send_plain(token, chat_id, "Nothing to change.")
+        return
+
+    new_section = str(result["text"])
+    original_text = path.read_text(encoding="utf-8")
+    new_text = original_text.replace(section, new_section, 1)
+    if new_text == original_text:
+        _log("clarify", "section not found verbatim, no edit applied")
+        _send_plain(token, chat_id, "✏️ Couldn't locate the exact section to patch.")
+        return
+
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as fh:
+            fh.write(new_text)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        _log("clarify", "failed to write updated note")
+        _send_plain(token, chat_id, "⚠️ Couldn't write the update.")
+        return
+
+    _log("clarify", f"surgical edit applied to {path.name}")
+    _send_plain(token, chat_id, "✏️ Updated.")
+    entry["clarification_reply"] = reply_text
+    entry["clarification_applied"] = True
+
+
+def process_message_updates(
+    updates: list[dict],
+    entries: list[dict],
+    token: str,
+    chat_id: str,
+) -> list[dict]:
+    for update in updates:
+        msg = update.get("message")
+        if not msg:
+            continue
+        reply_to = msg.get("reply_to_message")
+        if not reply_to:
+            continue
+        text = (msg.get("text") or "").strip()
+        if not text:
+            continue
+        reply_to_id = reply_to.get("message_id")
+        matched = next(
+            (e for e in entries if e.get("telegram_message_id") == reply_to_id),
+            None,
+        )
+        if not matched:
+            _vlog("clarify", f"no queue entry for reply_to_message_id={reply_to_id}")
+            continue
+        _log("clarify", f"reply to msg_id={reply_to_id}: {text[:80]!r}")
+        _apply_clarification(matched, text, token, chat_id)
+    return entries
+
+
 def _process_updates_for_state(
     state_dir: Path,
     token: str,
     updates: list[dict],
+    chat_id: str = "",
 ) -> None:
     if not updates:
         return
     entries = load_feedback_queue(state_dir)
     ledger = load_ledger(state_dir)
     entries, ledger = process_callback_updates(updates, entries, ledger, token, state_dir=state_dir)
+    if chat_id:
+        entries = process_message_updates(updates, entries, token, chat_id)
     save_ledger(state_dir, ledger)
     save_feedback_queue(state_dir, entries)
     new_offset = max(u["update_id"] for u in updates) + 1
@@ -439,7 +815,7 @@ def _process_updates_for_state(
 
 def _send_due_for_state(state_dir: Path, token: str, chat_id: str) -> None:
     entries = load_feedback_queue(state_dir)
-    entries = send_due_messages(entries, token, chat_id)
+    entries = send_due_messages(entries, token, chat_id, state_dir=state_dir)
     save_feedback_queue(state_dir, entries)
 
 
@@ -452,7 +828,7 @@ def run(state_dir: Path, token: str, chat_id: str, poll_timeout: int = 0) -> int
     updates = get_updates(token, offset, timeout=poll_timeout)
     _vlog("updates", f"received {len(updates)} updates")
 
-    _process_updates_for_state(state_dir, token, updates)
+    _process_updates_for_state(state_dir, token, updates, chat_id=chat_id)
     _send_due_for_state(state_dir, token, chat_id)
 
     return 0
@@ -478,7 +854,7 @@ def run_daemon(
             updates = get_updates(token, offset, timeout=poll_timeout)
             if updates:
                 _log("updates", f"received {len(updates)} update(s)")
-                _process_updates_for_state(state_dir, token, updates)
+                _process_updates_for_state(state_dir, token, updates, chat_id=chat_id)
 
             now = time.monotonic()
             if now >= next_send_at:

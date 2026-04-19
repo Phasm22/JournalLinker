@@ -7,6 +7,7 @@ Tests use tempfile.TemporaryDirectory for isolation.
 import importlib.util
 import json
 import os
+import sys
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -337,6 +338,26 @@ class TestEnrichmentModeResolution(unittest.TestCase):
     def test_explicit_off_is_respected(self):
         with mock.patch.dict(os.environ, {"INTENT_ENRICHMENT_MODE": "off"}):
             self.assertEqual(pi.resolve_enrichment_mode(), "off")
+
+    def test_explicit_mcp_alias_is_respected(self):
+        with mock.patch.dict(os.environ, {"INTENT_ENRICHMENT_MODE": "mcp"}):
+            self.assertEqual(pi.resolve_enrichment_mode(), "mcp")
+
+    def test_parse_cli_loads_xdg_config_before_defaults(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = Path(d) / "config"
+            env_dir = cfg / "journal-linker"
+            env_dir.mkdir(parents=True)
+            (env_dir / "journal-linker.env").write_text(
+                "INTENT_ENRICHMENT_MODE=off\n",
+                encoding="utf-8",
+            )
+            with (
+                mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(cfg)}, clear=True),
+                mock.patch.object(sys, "argv", ["process_intents.py"]),
+            ):
+                pi.parse_cli()
+                self.assertEqual(os.environ.get("INTENT_ENRICHMENT_MODE"), "off")
 
 
 # ---------------------------------------------------------------------------
@@ -884,33 +905,25 @@ class TestEnrichEnvelope(unittest.TestCase):
 
     def test_enrich_populates_hits_on_success(self):
         fake_chunks = [
-            {"title": "Note A", "text": "Some related content here"},
-            {"title": "Note B", "text": "More related content"},
-            {"title": "Note C", "text": "Even more content"},
-            {"title": "Note D", "text": "Fourth result"},
+            {"source": "Note A", "text": "Some related content here"},
+            {"source": "Note B", "text": "More related content"},
+            {"source": "Note C", "text": "Even more content"},
+            {"source": "Note D", "text": "Fourth result"},
         ]
-        fake_module = mock.MagicMock()
-        fake_module.run_retrieve.return_value = {"chunks": fake_chunks}
-
-        import sys as _sys
-        _sys.modules["query"] = mock.MagicMock()
-        _sys.modules["query.core"] = fake_module
-        try:
+        with mock.patch.object(pi, "query_llmlibrarian_mcp", return_value={"chunks": fake_chunks}) as query_mock:
             envelope = self._base_envelope()
             result = pi.enrich_envelope(envelope)
-        finally:
-            _sys.modules.pop("query.core", None)
-            _sys.modules.pop("query", None)
 
+        query_mock.assert_called_once_with("follow up with accountant")
         self.assertIn("related_silo_hits", result)
         self.assertLessEqual(len(result["related_silo_hits"]), 3)
+        self.assertEqual(result["related_silo_hits"][0]["title"], "Note A")
         self.assertTrue(result.get("recurrence_signal"))
 
     def test_enrich_continues_on_failure(self):
         """An exception inside enrich_envelope must not propagate."""
         envelope = self._base_envelope()
-        # Force an import error by pointing LLMLIBRARIAN_SRC at a nonexistent path
-        with mock.patch.dict(os.environ, {"LLMLIBRARIAN_SRC": "/nonexistent/path"}):
+        with mock.patch.object(pi, "query_llmlibrarian_mcp", return_value={"error": "healthz failed", "chunks": []}):
             result = pi.enrich_envelope(envelope)
         # Pipeline should continue; error is recorded but envelope returned
         self.assertIsInstance(result, dict)
@@ -922,6 +935,39 @@ class TestEnrichEnvelope(unittest.TestCase):
         result = pi.enrich_envelope(envelope)
         self.assertNotIn("related_silo_hits", result)
         self.assertNotIn("_enrichment_error", result)
+
+    def test_query_skips_mcp_when_health_fails(self):
+        with (
+            mock.patch.object(pi, "_llmlibrarian_health_check", return_value=(False, "connection refused")),
+            mock.patch.object(pi, "_query_llmlibrarian_mcp_async") as async_mock,
+        ):
+            result = pi.query_llmlibrarian_mcp("anything")
+        async_mock.assert_not_called()
+        self.assertEqual(result["chunks"], [])
+        self.assertIn("connection refused", result["error"])
+
+    def test_mcp_tool_payload_parses_text_content(self):
+        tool_result = mock.Mock()
+        tool_result.structuredContent = None
+        tool_result.content = [mock.Mock(text=json.dumps({"chunks": [{"text": "hit"}]}))]
+        payload = pi._mcp_tool_payload(tool_result)
+        self.assertEqual(payload["chunks"][0]["text"], "hit")
+
+    def test_resolve_configured_silo_from_list_silos(self):
+        payload = {
+            "silos": [
+                {"slug": "much-thinks-f018e152", "display_name": "Much Thinks"},
+                {"slug": "project-palindrome-f8ea9ab4", "display_name": "Project Palindrome"},
+            ]
+        }
+        self.assertEqual(
+            pi._resolve_llmlibrarian_silo(payload, "Project Palindrome"),
+            "project-palindrome-f8ea9ab4",
+        )
+
+    def test_unknown_configured_silo_fails_closed(self):
+        with self.assertRaises(ValueError):
+            pi._resolve_llmlibrarian_silo({"silos": []}, "missing")
 
 
 # ---------------------------------------------------------------------------
