@@ -204,7 +204,9 @@ def _build_gate_prompt_phi4(text_excerpt: str) -> str:
     return (
         "You are a concise intent extractor. "
         "Read the following journal excerpt and extract ALL actionable intents: "
-        "concrete tasks, commitments, reminders, or plans the author intends to act on.\n\n"
+        "concrete tasks, commitments, reminders, or plans the author intends to act on. "
+        "Do not extract items that the author says are already handled, already in another reminder system, "
+        "or mentioned only as praise/retrospective narration.\n\n"
         "Excerpt:\n"
         "---\n"
         f"{text_excerpt}\n"
@@ -221,6 +223,8 @@ def _build_gate_prompt_qwen25(text_excerpt: str) -> str:
         "<|im_start|>system\n"
         "You are an intent extractor for personal journal notes. "
         "Extract ALL actionable intents (tasks, reminders, commitments, plans). "
+        "Do not extract already-completed items, reminders the author says another system already handles, "
+        "or retrospective praise/observations with no remaining action. "
         "Also classify the downstream intent class. "
         "Output only a JSON object — no markdown fences, no extra text.\n"
         'Schema: {"intents": [{"intent_raw": string, "category": string, "intent_class": string}]}\n'
@@ -249,6 +253,78 @@ def resolve_gate_style(model_name: str) -> str:
     return _infer_gate_style(model_name)
 
 
+def _normalize_intent_text(text: str) -> str:
+    lowered = str(text or "").strip().lower()
+    lowered = re.sub(r"^did you\s+", "", lowered)
+    lowered = re.sub(r"[^\w\s]+", " ", lowered)
+    return re.sub(r"\s+", " ", lowered).strip()
+
+
+def _paragraph_chunks(note_text: str, max_chars: int = 2000, top_n: int = 3) -> list[str]:
+    body = re.sub(r"^---\n.*?\n---\n", "", note_text, flags=re.DOTALL).strip()
+    if not body:
+        return []
+    raw_parts = [p.strip() for p in re.split(r"\n\s*\n+", body) if p.strip()]
+    parts: list[str] = []
+    for part in raw_parts:
+        if len(part) <= max_chars:
+            parts.append(part)
+            continue
+        # Fall back to sentence-ish segmentation for very long paragraphs.
+        sents = re.split(r"(?<=[.!?])\s+", part)
+        buff = ""
+        for sent in sents:
+            sent = sent.strip()
+            if not sent:
+                continue
+            candidate = f"{buff} {sent}".strip() if buff else sent
+            if len(candidate) <= max_chars:
+                buff = candidate
+                continue
+            if buff:
+                parts.append(buff)
+            buff = sent[:max_chars].strip()
+        if buff:
+            parts.append(buff)
+    if not parts:
+        return []
+
+    cue_re = re.compile(
+        r"\b(need to|should|must|remember|remind|buy|order|schedule|call|email|book|plan|tomorrow|today|by\s+\w+)\b",
+        re.IGNORECASE,
+    )
+
+    scored: list[tuple[int, int, str]] = []
+    for idx, part in enumerate(parts):
+        score = 0
+        score += min(5, len(cue_re.findall(part)))
+        score += 2 if any(ch in part for ch in ("[ ]", "TODO", "- [")) else 0
+        score += 1 if len(part) > 300 else 0
+        scored.append((score, idx, part[:max_chars]))
+
+    scored.sort(key=lambda row: (row[0], row[1]), reverse=True)
+    best = [text for _, _, text in scored[:max(1, top_n)]]
+    return best
+
+
+def _dedupe_intents(intents: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for item in intents:
+        intent_raw = str(item.get("intent_raw", "")).strip()
+        category = str(item.get("category", "none")).strip().lower()
+        norm = _normalize_intent_text(intent_raw)
+        if not norm:
+            continue
+        key = (norm, category)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    max_n = int(os.getenv("INTENT_MAX_INTENTS_PER_NOTE", str(DEFAULT_MAX_INTENTS)))
+    return out[:max_n]
+
+
 def call_gate(note_text: str, model: str, style: str, num_ctx: int = 4096) -> list[dict]:
     """Run the gate model via Ollama. Returns a list of {intent_raw, category} dicts."""
     try:
@@ -259,18 +335,23 @@ def call_gate(note_text: str, model: str, style: str, num_ctx: int = 4096) -> li
             "Install it with: pip install ollama"
         )
 
-    excerpt = note_text[:2000].strip()
-    prompt = build_gate_prompt(excerpt, style)
-    _log("gate", f"calling model={model} style={style}")
-    response = ollama.chat(
-        model=model,
-        messages=[{"role": "user", "content": prompt}],
-        options={"temperature": 0.0, "num_ctx": num_ctx},
-        keep_alive=KEEP_ALIVE,
-    )
-    raw_content = response["message"]["content"]
-    gate_output = _extract_json_obj(raw_content)
-    return _parse_gate_output(gate_output)
+    chunks = _paragraph_chunks(note_text, max_chars=2000, top_n=3)
+    if not chunks:
+        chunks = [note_text[:2000].strip()]
+    merged: list[dict] = []
+    for idx, excerpt in enumerate(chunks):
+        prompt = build_gate_prompt(excerpt, style)
+        _log("gate", f"calling model={model} style={style} chunk={idx + 1}/{len(chunks)}")
+        response = ollama.chat(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            options={"temperature": 0.0, "num_ctx": num_ctx},
+            keep_alive=KEEP_ALIVE,
+        )
+        raw_content = response["message"]["content"]
+        gate_output = _extract_json_obj(raw_content)
+        merged.extend(_parse_gate_output(gate_output))
+    return _dedupe_intents(merged)
 
 
 _VALID_CATEGORIES = {"task", "reminder", "commitment", "plan", "none"}
@@ -642,6 +723,42 @@ def _feedback_summary(state_dir: Path) -> dict:
             continue
         summary.setdefault(cls, {"confirmed": 0, "rejected": 0})["rejected"] = int(info.get("count", 0))
     return summary
+
+
+def _suppression_match(state_dir: Path, intent_class: str, intent_raw: str) -> dict | None:
+    path = state_dir / "intent_feedback_learning.json"
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    suppressed = data.get("suppressed", {})
+    if not isinstance(suppressed, dict):
+        return None
+    class_data = suppressed.get(intent_class, {})
+    if not isinstance(class_data, dict):
+        return None
+    patterns = class_data.get("patterns", {})
+    if not isinstance(patterns, dict):
+        return None
+    norm_intent = _normalize_intent_text(intent_raw)
+    if not norm_intent:
+        return None
+    for pattern, meta in patterns.items():
+        pattern_norm = _normalize_intent_text(pattern)
+        if len(pattern_norm) < 6:
+            continue
+        if pattern_norm in norm_intent or norm_intent in pattern_norm:
+            md = meta if isinstance(meta, dict) else {}
+            return {
+                "pattern": pattern_norm,
+                "count": int(md.get("count", 0)),
+                "first_seen": str(md.get("first_seen", "")),
+                "last_seen": str(md.get("last_seen", "")),
+                "sample_phrase": str(md.get("sample_phrase", "")),
+            }
+    return None
 
 
 def call_routing_model(envelope: dict, model: str, dry_run: bool = False) -> dict:
@@ -1485,12 +1602,70 @@ def run_intent_pipeline(
         intent_raw = intent_item["intent_raw"]
         category = intent_item["category"]
         intent_class = intent_item.get("intent_class", _fallback_intent_class(category))
+        claude_idempotency_key = compute_idempotency_key(
+            source_path, source_date,
+            intent_raw, category,
+            gate_model, gate_style,
+            intent_class=intent_class,
+        )
 
         _log(
             "intent",
             f"[{intent_index + 1}/{len(intents)}] category={category!r} "
             f"intent_class={intent_class!r} raw={intent_raw!r}",
         )
+
+        # If retrying with a specific key, skip intents that don't match
+        if existing_idempotency_key and existing_idempotency_key != claude_idempotency_key:
+            continue
+
+        suppression = _suppression_match(state_dir, intent_class, intent_raw)
+        if suppression:
+            _log(
+                "intent",
+                f"[{intent_index + 1}/{len(intents)}] suppressed by feedback pattern={suppression['pattern']!r}",
+            )
+            ledger_entry = ledger.get(claude_idempotency_key, {})
+            prior_delivery_attempts = list(ledger_entry.get("delivery_attempts") or [])
+            prior_feedback_fields = {
+                k: ledger_entry[k]
+                for k in ("feedback_signal", "feedback_received_at", "defer_count")
+                if k in ledger_entry
+            }
+            suppressed_entry = {
+                "claude_idempotency_key": claude_idempotency_key,
+                "source_path": str(source_path),
+                "journal_timestamp": journal_timestamp,
+                "source_stat": source_stat_str,
+                "intent_raw": intent_raw,
+                "category": category,
+                "intent_class": intent_class,
+                "claude_status": "skipped_suppressed",
+                "claude_in_flight_since": "",
+                "claude_response": {},
+                "delivery_status": "suppressed_by_feedback",
+                "delivery_attempts": prior_delivery_attempts,
+                "latest_run_id": run_id,
+                "suppression": suppression,
+            }
+            suppressed_entry.update(prior_feedback_fields)
+            upsert_ledger_entry(state_dir, ledger, suppressed_entry)
+            append_run_record(state_dir, {
+                "run_id": run_id,
+                "intent_index": intent_index,
+                "intent_total": len(intents),
+                "claude_idempotency_key": claude_idempotency_key,
+                "created_at": created_at,
+                "source_path": str(source_path),
+                "journal_timestamp": journal_timestamp,
+                "source_stat": source_stat_str,
+                "intent_raw": intent_raw,
+                "category": category,
+                "intent_class": intent_class,
+                "status": "skipped_suppressed",
+                "suppression": suppression,
+            })
+            continue
 
         envelope = build_envelope(
             source_path, journal_timestamp, source_stat_str,
@@ -1503,17 +1678,6 @@ def run_intent_pipeline(
         feedback_ctx = _feedback_summary(state_dir)
         if feedback_ctx:
             envelope["feedback_context"] = feedback_ctx
-
-        claude_idempotency_key = compute_idempotency_key(
-            source_path, source_date,
-            intent_raw, category,
-            gate_model, gate_style,
-            intent_class=intent_class,
-        )
-
-        # If retrying with a specific key, skip intents that don't match
-        if existing_idempotency_key and existing_idempotency_key != claude_idempotency_key:
-            continue
 
         _log("intent", f"idempotency_key={claude_idempotency_key[:16]}…")
 
@@ -1550,6 +1714,21 @@ def run_intent_pipeline(
             _log("claude", "reusing stored response from ledger (delivery retry)")
         else:
             append_run_record(state_dir, run_record)
+            prior_delivery_attempts = list(ledger_entry.get("delivery_attempts") or [])
+            prior_delivery_status = str(ledger_entry.get("delivery_status") or "pending")
+            prior_feedback_fields = {
+                k: ledger_entry[k]
+                for k in (
+                    "feedback_signal",
+                    "feedback_received_at",
+                    "defer_count",
+                    "title",
+                    "urgency",
+                    "format",
+                    "action",
+                )
+                if k in ledger_entry
+            }
             ledger_entry = {
                 "claude_idempotency_key": claude_idempotency_key,
                 "source_path": str(source_path),
@@ -1561,10 +1740,11 @@ def run_intent_pipeline(
                 "claude_status": "in_flight",
                 "claude_in_flight_since": _now_iso(),
                 "claude_response": {},
-                "delivery_status": "pending",
-                "delivery_attempts": [],
+                "delivery_status": prior_delivery_status,
+                "delivery_attempts": prior_delivery_attempts,
                 "latest_run_id": run_id,
             }
+            ledger_entry.update(prior_feedback_fields)
             upsert_ledger_entry(state_dir, ledger, ledger_entry)
 
             try:

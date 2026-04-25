@@ -114,6 +114,10 @@ class TestFeedbackSenderCallbacks(unittest.TestCase):
 
         self.assertEqual(learning["suppressed"]["purchase_intent"]["count"], 1)
         self.assertIn("Did you call Marcus?", learning["suppressed"]["purchase_intent"]["phrases"])
+        patterns = learning["suppressed"]["purchase_intent"]["patterns"]
+        self.assertIn("call marcus", patterns)
+        self.assertEqual(patterns["call marcus"]["count"], 1)
+        self.assertEqual(patterns["call marcus"]["sample_phrase"], "call Marcus")
 
     def test_second_tap_is_duplicate_and_does_not_change_learning(self):
         key = "b" * 64
@@ -283,7 +287,7 @@ class TestFeedbackSenderLongPolling(unittest.TestCase):
             with (
                 mock.patch.object(fs, "get_updates", side_effect=[[update], KeyboardInterrupt]),
                 mock.patch.object(fs, "answer_callback"),
-                mock.patch.object(fs, "send_due_messages", side_effect=lambda entries, token, chat: entries),
+                mock.patch.object(fs, "send_due_messages", side_effect=lambda entries, token, chat, **kwargs: entries),
             ):
                 exit_code = fs.run_daemon(
                     state_dir,
@@ -298,6 +302,52 @@ class TestFeedbackSenderLongPolling(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(ledger[key]["feedback_signal"], "confirmed")
         self.assertEqual(offset, 8)
+
+
+class TestFeedbackSenderMessages(unittest.TestCase):
+    def test_freeform_text_routes_to_latest_unanswered_checkin(self):
+        old = TestFeedbackSenderCallbacks()._entry("l" * 64)
+        old["feedback_signal"] = "confirmed"
+        old["telegram_message_id"] = 100
+        old["sent_at"] = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat(timespec="seconds")
+        latest = TestFeedbackSenderCallbacks()._entry("m" * 64)
+        latest["telegram_message_id"] = 200
+        latest["sent_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        update = {
+            "update_id": 9,
+            "message": {
+                "text": "I meant beach shop",
+                "chat": {"id": "chat"},
+            },
+        }
+        with mock.patch.object(fs, "_apply_clarification") as apply_mock:
+            fs.process_message_updates([update], [old, latest], "token", "chat")
+
+        apply_mock.assert_called_once_with(latest, "I meant beach shop", "token", "chat")
+
+    def test_freeform_text_with_multiple_unanswered_prompts_disambiguation(self):
+        first = TestFeedbackSenderCallbacks()._entry("l" * 64)
+        first["telegram_message_id"] = 100
+        first["sent_at"] = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat(timespec="seconds")
+        second = TestFeedbackSenderCallbacks()._entry("m" * 64)
+        second["telegram_message_id"] = 200
+        second["sent_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        update = {
+            "update_id": 10,
+            "message": {
+                "text": "I meant beach shop",
+                "chat": {"id": "chat"},
+            },
+        }
+        with (
+            mock.patch.object(fs, "_apply_clarification") as apply_mock,
+            mock.patch.object(fs, "_send_plain") as send_plain_mock,
+        ):
+            fs.process_message_updates([update], [first, second], "token", "chat")
+
+        apply_mock.assert_not_called()
+        send_plain_mock.assert_called_once()
+        self.assertIn("multiple active check-ins", send_plain_mock.call_args.args[2])
 
 
 class TestFeedbackSenderSendCaps(unittest.TestCase):
@@ -320,16 +370,65 @@ class TestFeedbackSenderSendCaps(unittest.TestCase):
             self._pending("f" * 64, "/tmp/2026-04-16.md"),
         ]
         with mock.patch.dict(os.environ, {"INTENT_FEEDBACK_MAX_PER_SOURCE_PER_RUN": "1"}):
-            with mock.patch.object(
-                fs,
-                "send_message",
-                return_value={"result": {"message_id": 99}},
-            ) as send_mock:
+            with (
+                mock.patch.object(fs, "_in_quiet_hours", return_value=False),
+                mock.patch.object(
+                    fs,
+                    "send_message",
+                    return_value={"result": {"message_id": 99}},
+                ) as send_mock,
+            ):
                 fs.send_due_messages(entries, "token", "chat")
 
         self.assertEqual(send_mock.call_count, 1)
         self.assertEqual(entries[0]["state"], "sent")
         self.assertEqual(entries[1]["state"], "pending")
+        self.assertIn("sent_at", entries[0])
+
+    def test_unanswered_sent_entries_expire_after_silence_window(self):
+        old_sent_at = datetime.now(timezone.utc) - timedelta(hours=9)
+        key = "i" * 64
+        entry = self._pending(key, "/tmp/2026-04-16.md")
+        entry.update({
+            "state": "sent",
+            "telegram_message_id": 321,
+            "telegram_chat_id": "chat",
+            "sent_at": old_sent_at.isoformat(timespec="seconds"),
+        })
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_dir = Path(tmpdir)
+            fs.save_ledger(state_dir, {key: {"claude_idempotency_key": key}})
+            with (
+                mock.patch.dict(os.environ, {"INTENT_FEEDBACK_SILENCE_EXPIRE_TASK_HOURS": "8"}),
+                mock.patch.object(fs, "edit_message_reply_markup") as edit_mock,
+            ):
+                fs.send_due_messages([entry], "token", "chat", state_dir=state_dir)
+            ledger = fs.load_ledger(state_dir)
+
+        self.assertEqual(entry["state"], "expired")
+        self.assertEqual(entry["feedback_signal"], "expired_silence")
+        self.assertEqual(ledger[key]["feedback_signal"], "expired_silence")
+        edit_mock.assert_called_once_with("token", "chat", 321)
+
+    def test_unanswered_cap_delays_new_due_messages(self):
+        recent_sent_at = datetime.now(timezone.utc) - timedelta(minutes=10)
+        sent = self._pending("j" * 64, "/tmp/2026-04-16.md")
+        sent.update({
+            "state": "sent",
+            "sent_at": recent_sent_at.isoformat(timespec="seconds"),
+            "telegram_message_id": 123,
+        })
+        pending = self._pending("k" * 64, "/tmp/2026-04-16.md")
+        with (
+            mock.patch.dict(os.environ, {"INTENT_FEEDBACK_MAX_UNANSWERED": "1"}),
+            mock.patch.object(fs, "send_message") as send_mock,
+        ):
+            fs.send_due_messages([sent, pending], "token", "chat")
+
+        send_mock.assert_not_called()
+        self.assertEqual(pending["state"], "pending")
+        self.assertEqual(pending["backpressure_reason"], "too_many_unanswered")
+        self.assertEqual(pending["backpressure_count"], 1)
 
     def test_message_text_is_prompt_with_natural_title_footer(self):
         entry = self._pending("g" * 64, "/tmp/2026-04-16.md")
@@ -337,11 +436,14 @@ class TestFeedbackSenderSendCaps(unittest.TestCase):
         entry["title"] = "Pick up smoothie for Jill"
         entry["category"] = "task"
         entry["intent_class"] = "task_intent"
-        with mock.patch.object(
-            fs,
-            "send_message",
-            return_value={"result": {"message_id": 99}},
-        ) as send_mock:
+        with (
+            mock.patch.object(fs, "_in_quiet_hours", return_value=False),
+            mock.patch.object(
+                fs,
+                "send_message",
+                return_value={"result": {"message_id": 99}},
+            ) as send_mock,
+        ):
             fs.send_due_messages([entry], "token", "chat")
 
         text = send_mock.call_args.args[2]
@@ -356,11 +458,14 @@ class TestFeedbackSenderSendCaps(unittest.TestCase):
         entry["feedback_prompt"] = "Did you pay Jill & Marcus?"
         entry["title"] = "Pay <Jill>"
         entry["category"] = "task > money"
-        with mock.patch.object(
-            fs,
-            "send_message",
-            return_value={"result": {"message_id": 99}},
-        ) as send_mock:
+        with (
+            mock.patch.object(fs, "_in_quiet_hours", return_value=False),
+            mock.patch.object(
+                fs,
+                "send_message",
+                return_value={"result": {"message_id": 99}},
+            ) as send_mock,
+        ):
             fs.send_due_messages([entry], "token", "chat")
 
         text = send_mock.call_args.args[2]

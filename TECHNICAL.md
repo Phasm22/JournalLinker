@@ -83,7 +83,7 @@ python3 daily_reflection.py --force-send
 
 The intent watcher runs from the journalLinker checkout referenced by `JOURNAL_LINKER_REPO`. It gates journal text, calls the routing model, then delivers to Pushover, Obsidian cortex, digest queue, and Telegram feedback queue.
 
-**llmLibrarian enrichment:** `INTENT_ENRICHMENT_MODE=llmlib` (or `mcp`) uses llmLibrarian over MCP HTTP, not a direct Python import. The pipeline checks `http://127.0.0.1:8765/healthz` before calling the `query_personal_knowledge` tool and degrades gracefully if the server is down. Install the client with `just intent-mcp-install`, then supervise `/home/YOU/Desktop/llmLibrarian/mcp_server.py` with `systemd/journal-linker-llmlibrarian-mcp.service` or set `INTENT_ENRICHMENT_MODE=off`.
+**llmLibrarian enrichment:** `INTENT_ENRICHMENT_MODE=llmlib` (or `mcp`) uses llmLibrarian over MCP HTTP, not a direct Python import. If unset, the code defaults to `llmlib` (enrichment on). The pipeline checks `http://127.0.0.1:8765/healthz` before calling the `query_personal_knowledge` tool and degrades gracefully if the server is down. Install the client with `just intent-mcp-install`, then supervise `/home/YOU/Desktop/llmLibrarian/mcp_server.py` with `systemd/journal-linker-llmlibrarian-mcp.service` or set `INTENT_ENRICHMENT_MODE=off`.
 
 **Repeat notifications:** delivery is idempotent per sink and per `claude_idempotency_key`. If the ledger already records a successful Pushover (or cortex, digest, feedback queue) attempt for that key, a later run skips that sink instead of sending again.
 
@@ -94,6 +94,51 @@ The intent watcher runs from the journalLinker checkout referenced by `JOURNAL_L
 | `INTENT_PUSHOVER_URGENCIES` | *(unset → `immediate`, `today`, `soon`)* | Comma-separated subset of `immediate,today,soon,low` that may trigger a Pushover message. Example: `immediate,today` skips Pushover when the router sets `urgency=soon`. |
 
 Other useful intent variables (see the script docstring in-repo): `INTENT_GATE_MODEL`, `INTENT_ROUTING_MODEL`, `INTENT_STATE_DIR`, `INTENT_FEEDBACK_DELAY_TODAY`, `INTENT_FEEDBACK_DELAY_SOON`, `INTENT_CORTEX_DIR`, `OPENAI_API_KEY`, and the same `SCRIBE_PUSHOVER_*` keys as daily reflection.
+
+### Telegram feedback pressure controls
+
+- `INTENT_FEEDBACK_MAX_UNANSWERED` (default `3`): hard cap on unanswered sent check-ins before new due prompts are delayed.
+- `INTENT_FEEDBACK_BACKPRESSURE_DELAY_SECS` (default `900`): delay applied when cap is reached.
+- `INTENT_FEEDBACK_SILENCE_EXPIRE_TASK_HOURS` (default `8`)
+- `INTENT_FEEDBACK_SILENCE_EXPIRE_REMINDER_HOURS` (default `8`)
+- `INTENT_FEEDBACK_SILENCE_EXPIRE_PLAN_HOURS` (default `24`)
+- `INTENT_FEEDBACK_SILENCE_EXPIRE_COMMITMENT_HOURS` (default `72`)
+
+### Handoff verification checklist
+
+Run `just handoff-check` and confirm:
+
+1. `llmLibrarian /healthz` is `OK`.
+2. `INTENT_ENRICHMENT_MODE` is not `off` unless intentionally disabled.
+3. `unanswered sent check-ins` is at or below cap.
+4. `pal ls --status` does not report repair actions.
+5. If needed, run:
+
+```bash
+llmli repair tjs-pc-7f8e4e9d
+llmli add --full /home/tj/Documents/twin-brain/TJ's\ PC
+```
+
+### Intent ledger ingestion prep (llmLibrarian-friendly)
+
+`intent_delivery_ledger.jsonl` is append-style operational state. For retrieval/indexing, generate a stable markdown snapshot:
+
+```bash
+just intent-ledger-snapshot
+```
+
+This writes `<INTENT_STATE_DIR>/intent_ledger_snapshot.md` with:
+
+- weekly counts by `feedback_signal` (`confirmed`, `rejected`, `deferred`, etc.),
+- weekly counts by `intent_class`,
+- recent feedback events (timestamp, signal, class, title, source path).
+
+Recommended indexing pattern:
+
+1. Keep `intent_delivery_ledger.jsonl` as mutable runtime state.
+2. Rebuild `intent_ledger_snapshot.md` daily (or after notable feedback bursts).
+3. Index the snapshot in llmLibrarian as a text source/silo for pattern queries.
+4. If you rotate/prune ledger rows, regenerate the snapshot after rotation to keep retrieval aligned.
 
 ## `vault_mapper.py` CLI
 
@@ -108,6 +153,7 @@ python3 vault_mapper.py --min-cooccurrence 3
 - `--learning-file` selects the shared learning file used for strength scoring.
 - `--output-dir` changes where the markdown and JSON outputs are written.
 - `--min-cooccurrence` controls the minimum link co-occurrence threshold for edges.
+- Suggested cadence: run with weekly insight generation (`python3 weekly_insights.py --update-vault-map`) so `vault_map.md` and weekly summaries stay synchronized.
 
 ## Behavior
 

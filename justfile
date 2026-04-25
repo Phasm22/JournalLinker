@@ -138,6 +138,36 @@ status:
         printf "  %-34s %s\n" "INTENT_ENRICHMENT_MODE" "OK  ($mode)"; \
       fi'
 
+# Cross-project handoff quickcheck: status + queue pressure + actionable repairs
+handoff-check:
+    @printf '%s\n' "Journal Linker — Handoff Quickcheck"
+    @just status
+    @bash -c 'set -a; \
+      [[ -f "{{root}}/.env" ]] && . "{{root}}/.env"; \
+      [[ -f "$HOME/.config/journal-linker/journal-linker.env" ]] && . "$HOME/.config/journal-linker/journal-linker.env"; \
+      [[ -n "${JOURNAL_LINKER_ENV_FILE:-}" && -f "${JOURNAL_LINKER_ENV_FILE}" ]] && . "${JOURNAL_LINKER_ENV_FILE}"; \
+      set +a; \
+      state_dir="${INTENT_STATE_DIR:-$HOME/.local/state/journal-linker/intents}"; \
+      max_unanswered="${INTENT_FEEDBACK_MAX_UNANSWERED:-3}"; \
+      ledger="$state_dir/intent_delivery_ledger.jsonl"; \
+      if [[ -f "$ledger" ]]; then \
+        unanswered=$("{{py}}" -c "import json, pathlib; p=pathlib.Path(r'''$ledger'''); rows=[json.loads(l) for l in p.read_text(encoding='utf-8', errors='ignore').splitlines() if l.strip().startswith('{')]; print(sum(1 for r in rows if str(r.get('delivery_status','')).strip().lower()=='sent' and r.get('feedback_signal') in (None,'','none')))" 2>/dev/null || echo 0); \
+        printf "  %-34s %s\n" "unanswered sent check-ins" "$unanswered (cap=$max_unanswered)"; \
+      else \
+        printf "  %-34s %s\n" "intent_delivery_ledger.jsonl" "missing ($ledger)"; \
+      fi; \
+      mode="${INTENT_ENRICHMENT_MODE:-llmlib}"; \
+      silo="${LLMLIBRARIAN_MCP_SILO:-<all-available>}"; \
+      printf "  %-34s %s\n" "llmLibrarian silo target" "$silo"; \
+      printf "%s\n" ""; \
+      printf "%s\n" "If llmLibrarian returns inconsistent results:"; \
+      printf "%s\n" "  llmli repair tjs-pc-7f8e4e9d"; \
+      printf "%s\n" "  llmli add --full /home/tj/Documents/twin-brain/TJ\\'s\\ PC"; \
+      if [[ "$mode" != "off" ]]; then \
+        printf "%s\n" ""; \
+        printf "%s\n" "Enrichment is enabled; if context is unexpectedly thin, verify cortex is indexed in llmLibrarian excludes/archetypes."; \
+      fi'
+
 # Telegram Bot API: getMe + getChat. Sources repo .env, then XDG files (later overrides), then JOURNAL_LINKER_ENV_FILE.
 telegram-doctor:
     @bash -c 'set -a; \
@@ -193,6 +223,14 @@ intent-dry FILE:
 # Replay transient intent failures from the retry queue
 intent-retry:
     "{{py}}" "{{root}}/scripts/process_intents.py" --retry
+
+# Build markdown snapshot from intent_delivery_ledger.jsonl for llmLibrarian indexing
+intent-ledger-snapshot *ARGS:
+    @bash -c 'set -a; \
+      [[ -f "{{root}}/.env" ]] && . "{{root}}/.env"; \
+      [[ -f "$HOME/.config/journal-linker/journal-linker.env" ]] && . "$HOME/.config/journal-linker/journal-linker.env"; \
+      [[ -n "${JOURNAL_LINKER_ENV_FILE:-}" && -f "${JOURNAL_LINKER_ENV_FILE}" ]] && . "${JOURNAL_LINKER_ENV_FILE}"; \
+      set +a; "{{py}}" "{{root}}/scripts/intent_ledger_snapshot.py" {{ARGS}}'
 
 # Reset intent ledger and state files (dev/debug; irreversible)
 intent-reset-ledger:

@@ -32,6 +32,7 @@ import argparse
 import html
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -49,6 +50,14 @@ FEEDBACK_TAP_TRACE_FILENAME = "intent_feedback_tap_trace.jsonl"
 DEFER_DELAY_SECS = 86400  # 24h re-queue on defer
 DEFAULT_DEFER_LIMIT = 3
 DEFAULT_MAX_PER_SOURCE_PER_RUN = 1
+DEFAULT_MAX_UNANSWERED = 3
+DEFAULT_BACKPRESSURE_DELAY_SECS = 21600  # 6h pause when the unanswered pile is full
+DEFAULT_SILENCE_EXPIRY_HOURS = {
+    "task": 8,
+    "reminder": 8,
+    "plan": 24,
+    "commitment": 72,
+}
 
 SURGICAL_EDIT_SYSTEM_PROMPT = (
     "You are making a minimal surgical edit to a markdown journal note. "
@@ -341,6 +350,28 @@ def _record_feedback_learning(learning: dict, entry: dict, signal_label: str, at
         "action": entry.get("action", ""),
     })
     del examples[:-20]
+    if signal_label != "rejected":
+        return
+    normalized = _normalize_suppression_phrase(intent_raw or phrase)
+    if not normalized:
+        return
+    patterns = bucket.setdefault("patterns", {})
+    existing = patterns.get(normalized) or {}
+    first_seen = str(existing.get("first_seen", "")).strip() or at
+    patterns[normalized] = {
+        "count": int(existing.get("count", 0)) + 1,
+        "first_seen": first_seen,
+        "last_seen": at,
+        "sample_phrase": (intent_raw or phrase)[:200],
+    }
+
+
+def _normalize_suppression_phrase(text: str) -> str:
+    lowered = str(text or "").strip().lower()
+    lowered = re.sub(r"^did you\s+", "", lowered)
+    lowered = re.sub(r"[^\w\s]+", " ", lowered)
+    lowered = re.sub(r"\s+", " ", lowered).strip()
+    return lowered
 
 
 def _env_int(name: str, default: int) -> int:
@@ -348,6 +379,80 @@ def _env_int(name: str, default: int) -> int:
         return int(os.getenv(name, str(default)))
     except Exception:
         return default
+
+
+def _parse_iso_datetime(raw: str) -> datetime | None:
+    try:
+        dt = datetime.fromisoformat(str(raw or ""))
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _silence_expiry_hours(entry: dict) -> int:
+    category = str(entry.get("category") or "").strip().lower()
+    if category not in DEFAULT_SILENCE_EXPIRY_HOURS:
+        category = "task"
+    env_name = f"INTENT_FEEDBACK_SILENCE_EXPIRE_{category.upper()}_HOURS"
+    return max(1, _env_int(env_name, DEFAULT_SILENCE_EXPIRY_HOURS[category]))
+
+
+def _is_unanswered_sent(entry: dict) -> bool:
+    return entry.get("state") == "sent" and not entry.get("feedback_signal")
+
+
+def _expire_entry_for_silence(
+    entry: dict,
+    ledger: dict,
+    now_iso: str,
+    token: str = "",
+    chat_id: str = "",
+) -> None:
+    entry["state"] = "expired"
+    entry["feedback_signal"] = "expired_silence"
+    entry["expires_at"] = now_iso
+    ikey = entry.get("claude_idempotency_key", "")
+    if ikey in ledger:
+        ledger[ikey]["feedback_signal"] = "expired_silence"
+        ledger[ikey]["feedback_received_at"] = now_iso
+        ledger[ikey]["silence_expired_at"] = now_iso
+    msg_id = entry.get("telegram_message_id")
+    if token and chat_id and msg_id:
+        try:
+            edit_message_reply_markup(token, chat_id, msg_id)
+        except Exception as exc:
+            _vlog("sender", f"failed to remove expired keyboard for {ikey[:16]}: {exc}")
+
+
+def expire_silent_entries(
+    entries: list[dict],
+    ledger: dict,
+    token: str = "",
+    chat_id: str = "",
+    now: datetime | None = None,
+) -> int:
+    """Mark sent check-ins expired once silence is old enough to be signal."""
+    now = now or datetime.now(timezone.utc)
+    now_iso = now.isoformat(timespec="seconds")
+    expired = 0
+    for entry in entries:
+        if not _is_unanswered_sent(entry):
+            continue
+        sent_at = (
+            _parse_iso_datetime(entry.get("sent_at", ""))
+            or _parse_iso_datetime(entry.get("send_after", ""))
+            or _parse_iso_datetime(entry.get("captured_at", ""))
+        )
+        if sent_at is None:
+            continue
+        if (now - sent_at).total_seconds() < _silence_expiry_hours(entry) * 3600:
+            continue
+        _expire_entry_for_silence(entry, ledger, now_iso, token=token, chat_id=chat_id)
+        expired += 1
+        _log("sender", f"expired unanswered check-in for {entry.get('title','?')!r}")
+    return expired
 
 
 def _in_quiet_hours() -> bool:
@@ -592,17 +697,20 @@ def send_due_messages(
     """Send Telegram messages for pending entries past their send_after time."""
     now = datetime.now(timezone.utc)
     max_per_source = _env_int("INTENT_FEEDBACK_MAX_PER_SOURCE_PER_RUN", DEFAULT_MAX_PER_SOURCE_PER_RUN)
+    max_unanswered = max(0, _env_int("INTENT_FEEDBACK_MAX_UNANSWERED", DEFAULT_MAX_UNANSWERED))
+    backpressure_delay = max(60, _env_int("INTENT_FEEDBACK_BACKPRESSURE_DELAY_SECS", DEFAULT_BACKPRESSURE_DELAY_SECS))
     sent_by_source: dict[str, int] = {}
     ledger = load_ledger(state_dir) if state_dir is not None else {}
+    ledger_changed = False
+    if expire_silent_entries(entries, ledger, token=token, chat_id=chat_id, now=now):
+        ledger_changed = True
+    unanswered_count = sum(1 for entry in entries if _is_unanswered_sent(entry))
     for entry in entries:
         if entry.get("state") != "pending":
             continue
         send_after_str = entry.get("send_after", "")
-        try:
-            send_after = datetime.fromisoformat(send_after_str)
-            if send_after.tzinfo is None:
-                send_after = send_after.replace(tzinfo=timezone.utc)
-        except (ValueError, TypeError):
+        send_after = _parse_iso_datetime(send_after_str)
+        if send_after is None:
             _log("sender", f"invalid send_after {send_after_str!r} — skipping entry")
             continue
 
@@ -610,11 +718,28 @@ def send_due_messages(
             _vlog("sender", f"not yet due: {entry.get('title','?')!r} send_after={send_after_str}")
             continue
 
+        if max_unanswered and unanswered_count >= max_unanswered:
+            delayed_until = (now + timedelta(seconds=backpressure_delay)).isoformat(timespec="seconds")
+            entry["send_after"] = delayed_until
+            entry["backpressure_count"] = int(entry.get("backpressure_count") or 0) + 1
+            entry["backpressure_reason"] = "too_many_unanswered"
+            _log(
+                "sender",
+                f"backpressure: delayed {entry.get('title','?')!r} to {delayed_until} "
+                f"because {unanswered_count} check-in(s) are unanswered",
+            )
+            continue
+
         # Suppress if the cortex note was deleted from Obsidian
         cortex_path = _cortex_path_for_entry(entry, ledger)
         if cortex_path and not Path(cortex_path).exists():
             entry["state"] = "expired"
             entry["feedback_signal"] = "cortex_deleted"
+            ikey = entry.get("claude_idempotency_key", "")
+            if ikey in ledger:
+                ledger[ikey]["feedback_signal"] = "cortex_deleted"
+                ledger[ikey]["feedback_received_at"] = now.isoformat(timespec="seconds")
+                ledger_changed = True
             _log("sender", f"cortex deleted, suppressing: {entry.get('title','?')!r}")
             continue
 
@@ -649,12 +774,16 @@ def send_due_messages(
             entry["state"] = "sent"
             entry["telegram_message_id"] = msg_id
             entry["telegram_chat_id"] = chat_id
+            entry["sent_at"] = now.isoformat(timespec="seconds")
             if source_file:
                 sent_by_source[source_file] = sent_by_source.get(source_file, 0) + 1
+            unanswered_count += 1
             _log("sender", f"sent message_id={msg_id} for {title!r}")
         except Exception as exc:
             _log("sender", f"ERROR sending for {title!r}: {exc}")
 
+    if ledger_changed and state_dir is not None:
+        save_ledger(state_dir, ledger)
     return entries
 
 
@@ -764,6 +893,30 @@ def _apply_clarification(entry: dict, reply_text: str, token: str, chat_id: str)
     entry["clarification_applied"] = True
 
 
+def _latest_unanswered_sent_entry(entries: list[dict]) -> dict | None:
+    candidates = [e for e in entries if _is_unanswered_sent(e)]
+    if not candidates:
+        return None
+
+    def sort_key(entry: dict) -> tuple[datetime, int]:
+        sent_at = (
+            _parse_iso_datetime(entry.get("sent_at", ""))
+            or _parse_iso_datetime(entry.get("send_after", ""))
+            or datetime.fromtimestamp(0, tz=timezone.utc)
+        )
+        try:
+            msg_id = int(entry.get("telegram_message_id") or 0)
+        except Exception:
+            msg_id = 0
+        return sent_at, msg_id
+
+    return max(candidates, key=sort_key)
+
+
+def _unanswered_sent_entries(entries: list[dict]) -> list[dict]:
+    return [e for e in entries if _is_unanswered_sent(e)]
+
+
 def process_message_updates(
     updates: list[dict],
     entries: list[dict],
@@ -774,21 +927,39 @@ def process_message_updates(
         msg = update.get("message")
         if not msg:
             continue
-        reply_to = msg.get("reply_to_message")
-        if not reply_to:
+        chat = msg.get("chat") or {}
+        if chat_id and chat.get("id") and str(chat.get("id")) != str(chat_id):
             continue
+        reply_to = msg.get("reply_to_message")
         text = (msg.get("text") or "").strip()
         if not text:
             continue
-        reply_to_id = reply_to.get("message_id")
-        matched = next(
-            (e for e in entries if e.get("telegram_message_id") == reply_to_id),
-            None,
-        )
-        if not matched:
-            _vlog("clarify", f"no queue entry for reply_to_message_id={reply_to_id}")
-            continue
-        _log("clarify", f"reply to msg_id={reply_to_id}: {text[:80]!r}")
+        if reply_to:
+            reply_to_id = reply_to.get("message_id")
+            matched = next(
+                (e for e in entries if e.get("telegram_message_id") == reply_to_id),
+                None,
+            )
+            if not matched:
+                _vlog("clarify", f"no queue entry for reply_to_message_id={reply_to_id}")
+                continue
+            _log("clarify", f"reply to msg_id={reply_to_id}: {text[:80]!r}")
+        else:
+            unanswered = _unanswered_sent_entries(entries)
+            if not unanswered:
+                _vlog("clarify", f"freeform message with no active check-in: {text[:80]!r}")
+                _send_plain(token, chat_id, "Got it. Reply to a specific check-in if you want me to patch the source note.")
+                continue
+            if len(unanswered) > 1:
+                _log("clarify", f"freeform ambiguous with {len(unanswered)} unanswered check-ins")
+                _send_plain(
+                    token,
+                    chat_id,
+                    "I have multiple active check-ins. Reply to the specific message you want me to patch.",
+                )
+                continue
+            matched = unanswered[0]
+            _log("clarify", f"freeform routed to msg_id={matched.get('telegram_message_id')}: {text[:80]!r}")
         _apply_clarification(matched, text, token, chat_id)
     return entries
 

@@ -36,11 +36,13 @@ class TestGatePromptTemplates(unittest.TestCase):
         self.assertIn("intent_raw", prompt)
         self.assertIn("category", prompt)
         self.assertIn("intent_class", prompt)
+        self.assertIn("already handled", prompt)
 
     def test_qwen25_prompt_uses_chatml(self):
         prompt = pi.build_gate_prompt("I need to call the doctor.", "qwen25")
         self.assertIn("<|im_start|>", prompt)
         self.assertIn("intents", prompt)
+        self.assertIn("another system already handles", prompt)
 
     def test_resolve_gate_style_auto_phi4(self):
         style = pi.resolve_gate_style("phi4:14b")
@@ -119,6 +121,33 @@ class TestParseGateOutput(unittest.TestCase):
         with mock.patch.dict(os.environ, {"INTENT_MAX_INTENTS_PER_NOTE": "3"}):
             out = pi._parse_gate_output({"intents": many})
         self.assertEqual(len(out), 3)
+
+
+class TestGateChunking(unittest.TestCase):
+    def test_paragraph_chunks_prioritize_actionable_late_content(self):
+        note = (
+            "Just reflecting on the week and writing a lot of background text.\n\n"
+            + ("filler words " * 300)
+            + "\n\nNeed to call the dentist tomorrow morning."
+        )
+        chunks = pi._paragraph_chunks(note, max_chars=2000, top_n=2)
+        self.assertGreaterEqual(len(chunks), 1)
+        self.assertTrue(any("call the dentist" in chunk.lower() for chunk in chunks))
+
+    def test_call_gate_merges_and_dedupes_intents_across_chunks(self):
+        note = "Filler.\n\nNeed to buy bike shoes.\n\nAlso need to buy bike shoes."
+        mock_ollama = mock.MagicMock()
+        mock_ollama.chat.side_effect = [
+            {"message": {"content": '{"intents":[{"intent_raw":"buy bike shoes","category":"task","intent_class":"purchase_intent"}]}'}},
+            {"message": {"content": '{"intents":[{"intent_raw":"buy bike shoes","category":"task","intent_class":"purchase_intent"}]}'}},
+        ]
+        with (
+            mock.patch.dict("sys.modules", {"ollama": mock_ollama}),
+            mock.patch.object(pi, "_paragraph_chunks", return_value=["Need to buy bike shoes.", "Also need to buy bike shoes."]),
+        ):
+            intents = pi.call_gate(note, model="phi4:14b", style="phi4")
+        self.assertEqual(len(intents), 1)
+        self.assertEqual(intents[0]["intent_raw"], "buy bike shoes")
 
 
 # ---------------------------------------------------------------------------
@@ -476,6 +505,60 @@ class TestPipelinePushoverDedupe(unittest.TestCase):
         self.assertEqual(e2, pi.EXIT_SUCCESS)
         self.assertEqual(mock_po.call_count, 1)
 
+    def test_rejected_pattern_suppresses_future_repeat_before_routing(self):
+        gate = {"intents": [{"intent_raw": "buy bike shoes", "category": "task", "intent_class": "purchase_intent"}]}
+        mock_ollama = mock.MagicMock()
+        mock_ollama.chat.return_value = {"message": {"content": json.dumps(gate)}}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_dir = Path(tmpdir)
+            (state_dir / "intent_feedback_learning.json").write_text(
+                json.dumps(
+                    {
+                        "approved": {},
+                        "suppressed": {
+                            "purchase_intent": {
+                                "count": 1,
+                                "phrases": {"Did you buy bike shoes?": 1},
+                                "patterns": {
+                                    "buy bike shoes": {
+                                        "count": 1,
+                                        "first_seen": "2026-04-24T12:00:00+00:00",
+                                        "last_seen": "2026-04-24T12:00:00+00:00",
+                                        "sample_phrase": "buy bike shoes",
+                                    }
+                                },
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.dict("sys.modules", {"ollama": mock_ollama}):
+                with (
+                    mock.patch.object(pi, "call_routing_model") as routing_mock,
+                    mock.patch.object(pi, "send_pushover") as pushover_mock,
+                ):
+                    exit_code = pi.run_intent_pipeline(
+                        FIXTURE_NOTE,
+                        gate_model="phi4:14b",
+                        gate_style="phi4",
+                        routing_model="gpt-4o-mini",
+                        cortex_dir=Path(tmpdir) / "cortex",
+                        state_dir=state_dir,
+                        enrichment_mode="off",
+                        in_flight_ttl=300,
+                        dry_run=False,
+                        verbose=False,
+                    )
+            ledger = pi.load_ledger(state_dir)
+
+        self.assertEqual(exit_code, pi.EXIT_SUCCESS)
+        routing_mock.assert_not_called()
+        pushover_mock.assert_not_called()
+        only = next(iter(ledger.values()))
+        self.assertEqual(only["delivery_status"], "suppressed_by_feedback")
+        self.assertEqual(only["claude_status"], "skipped_suppressed")
+
     @unittest.skipUnless(LIVE_OLLAMA_SMOKE, "set JOURNAL_LINKER_LIVE_SMOKE=1 to run live Ollama smoke tests")
     def test_live_ollama_smoke_for_intent_gate(self):
         import ollama as live_ollama
@@ -717,6 +800,56 @@ class TestExitCodes(unittest.TestCase):
                         verbose=False,
                     )
         self.assertEqual(exit_code, pi.EXIT_CLAUDE_TRANSIENT)
+
+    def test_claude_retry_preserves_prior_delivery_attempts(self):
+        gate = {"intents": [{"intent_raw": "rename file", "category": "task"}]}
+        mock_ollama = mock.MagicMock()
+        mock_ollama.chat.return_value = {
+            "message": {"content": json.dumps(gate)}
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_dir = Path(tmpdir)
+            note_path = state_dir / "2026-04-16.md"
+            note_path.write_text("I need to rename file.\n", encoding="utf-8")
+            key = pi.compute_idempotency_key(
+                note_path,
+                "2026-04-16",
+                "rename file",
+                "task",
+                "phi4:14b",
+                "phi4",
+                intent_class="task_intent",
+            )
+            pi.save_ledger(state_dir, {
+                key: {
+                    "claude_idempotency_key": key,
+                    "claude_status": "failed",
+                    "delivery_status": "succeeded",
+                    "delivery_attempts": [
+                        {"results": {"feedback_queue": {"ok": True}}},
+                    ],
+                    "feedback_signal": "confirmed",
+                },
+            })
+            with mock.patch.dict("sys.modules", {"ollama": mock_ollama}):
+                with mock.patch.object(pi, "call_routing_model", side_effect=ConnectionError("routing timeout")):
+                    exit_code = pi.run_intent_pipeline(
+                        note_path,
+                        gate_model="phi4:14b",
+                        gate_style="phi4",
+                        routing_model="gpt-4o-mini",
+                        cortex_dir=state_dir / "cortex",
+                        state_dir=state_dir,
+                        enrichment_mode="off",
+                        in_flight_ttl=300,
+                        dry_run=False,
+                        verbose=False,
+                    )
+            reloaded = pi.load_ledger(state_dir)[key]
+
+        self.assertEqual(exit_code, pi.EXIT_CLAUDE_TRANSIENT)
+        self.assertEqual(reloaded["delivery_attempts"][0]["results"]["feedback_queue"]["ok"], True)
+        self.assertEqual(reloaded["feedback_signal"], "confirmed")
 
 
 # ---------------------------------------------------------------------------
