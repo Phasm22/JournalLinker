@@ -94,6 +94,7 @@ DEFAULT_LLMLIBRARIAN_MCP_PORT = "8765"
 DEFAULT_LLMLIBRARIAN_MCP_PATH = "/mcp"
 DEFAULT_LLMLIBRARIAN_MCP_TIMEOUT = 2.0
 DEFAULT_LLMLIBRARIAN_MCP_N_RESULTS = 5
+DEFAULT_LOCAL_CORTEX_HITS = 3
 INTENT_IDEMPOTENCY_VERSION = "3"
 KEEP_ALIVE = "5m"
 
@@ -258,6 +259,19 @@ def _normalize_intent_text(text: str) -> str:
     lowered = re.sub(r"^did you\s+", "", lowered)
     lowered = re.sub(r"[^\w\s]+", " ", lowered)
     return re.sub(r"\s+", " ", lowered).strip()
+
+
+def _suppression_patterns_match(pattern_norm: str, norm_intent: str) -> bool:
+    if not pattern_norm or not norm_intent:
+        return False
+    if pattern_norm in norm_intent or norm_intent in pattern_norm:
+        return True
+    pattern_terms = {term for term in pattern_norm.split() if len(term) >= 4}
+    intent_terms = {term for term in norm_intent.split() if len(term) >= 4}
+    if not pattern_terms or not intent_terms:
+        return False
+    overlap = pattern_terms & intent_terms
+    return len(overlap) >= 2
 
 
 def _paragraph_chunks(note_text: str, max_chars: int = 2000, top_n: int = 3) -> list[str]:
@@ -641,26 +655,112 @@ def _chunk_title(chunk: dict) -> str:
     )
 
 
+def _cortex_root_for_enrichment(envelope: dict) -> Path | None:
+    raw = os.getenv("INTENT_CORTEX_DIR", "").strip()
+    if raw:
+        path = Path(raw).expanduser()
+        return path if path.exists() else None
+    source_file = str(envelope.get("source_file") or "").strip()
+    if not source_file:
+        return None
+    source_path = Path(source_file).expanduser()
+    journal_dir = source_path.parent
+    path = journal_dir / "cortex"
+    return path if path.exists() else None
+
+
+def _lexical_terms(text: str) -> list[str]:
+    words = re.findall(r"[a-z0-9]+", str(text or "").lower())
+    return [w for w in words if len(w) >= 3]
+
+
+def _search_local_cortex(envelope: dict, max_hits: int = DEFAULT_LOCAL_CORTEX_HITS) -> list[dict]:
+    cortex_dir = _cortex_root_for_enrichment(envelope)
+    if cortex_dir is None:
+        return []
+    base_terms = set(_lexical_terms(envelope.get("intent_raw", "")))
+    base_terms.update(_lexical_terms(envelope.get("surrounding_context", "")))
+    if not base_terms:
+        return []
+
+    scored: list[tuple[int, float, str, Path, str]] = []
+    for path in cortex_dir.rglob("*.md"):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        doc_terms = _lexical_terms(text)
+        if not doc_terms:
+            continue
+        doc_term_set = set(doc_terms)
+        overlap = base_terms & doc_term_set
+        if not overlap:
+            continue
+        density = len(overlap) / max(1, len(base_terms))
+        snippet = ""
+        lowered = text.lower()
+        for term in sorted(overlap, key=len, reverse=True):
+            idx = lowered.find(term)
+            if idx >= 0:
+                start = max(0, idx - 60)
+                end = min(len(text), idx + 180)
+                snippet = " ".join(text[start:end].split())
+                break
+        if not snippet:
+            snippet = " ".join(text[:180].split())
+        rel = path.relative_to(cortex_dir).as_posix()
+        scored.append((len(overlap), density, rel, path, snippet[:180]))
+
+    scored.sort(key=lambda row: (-row[0], -row[1], row[2]))
+    hits: list[dict] = []
+    for overlap_count, density, rel, _path, snippet in scored[:max_hits]:
+        hits.append({
+            "title": f"cortex/{rel}",
+            "snippet": snippet,
+            "source": "cortex",
+            "score": round(density, 2),
+            "overlap_terms": overlap_count,
+        })
+    return hits
+
+
 def enrich_envelope(envelope: dict) -> dict:
     """Query llmLibrarian for related hits. Never raises — failure is logged only."""
     intent_raw = envelope.get("intent_raw", "")
     if not intent_raw:
         return envelope
+    local_cortex_hits = _search_local_cortex(envelope)
+    if local_cortex_hits:
+        envelope["related_cortex_hits"] = local_cortex_hits
     result = query_llmlibrarian_mcp(str(intent_raw))
     if result.get("error"):
         detail = str(result.get("error"))
         _log("enrich", f"best-effort enrichment failed (continuing): {detail}")
         envelope["_enrichment_error"] = detail
+        if local_cortex_hits:
+            envelope["related_silo_hits"] = local_cortex_hits
+            envelope["recurrence_signal"] = len(local_cortex_hits) >= 3
         return envelope
 
     chunks = result.get("chunks") or []
-    hits = [
+    llmlib_hits = [
         {"title": _chunk_title(c), "snippet": str(c.get("text", ""))[:120]}
         for c in chunks[:3]
         if isinstance(c, dict)
     ]
+    seen_titles: set[str] = set()
+    hits: list[dict] = []
+    for hit in local_cortex_hits + llmlib_hits:
+        title = str(hit.get("title", "")).strip()
+        if title and title in seen_titles:
+            continue
+        if title:
+            seen_titles.add(title)
+        hits.append(hit)
+        if len(hits) >= 3:
+            break
     envelope["related_silo_hits"] = hits
-    envelope["recurrence_signal"] = len(chunks) >= 3
+    envelope["recurrence_signal"] = len(local_cortex_hits) + len(chunks) >= 3
     _log("enrich", f"enriched: {len(hits)} hits, recurrence={envelope['recurrence_signal']}")
     return envelope
 
@@ -685,9 +785,17 @@ ROUTING_SYSTEM_PROMPT = (
     "- Use action=digest_capture or note_capture for latent or long-horizon interest; do not notify for latent_interest unless there is an explicit time-bound commitment.\n"
     "- For purchase_intent, prefer future_action_search_enqueue or note_capture over notification unless money, deadline, or another person is waiting today.\n"
     "- Set feedback_prompt to empty string when urgency=low.\n"
-    "- When urgency is not low, feedback_prompt MUST be a yes/no completion question phrased as 'Did you X?' — never an open-ended question starting with What, How, Why, Which, or Who. The user answers with Done, Skip, or Later buttons, so the question must have a binary yes/no answer.\n"
-    "Feedback calibration: if feedback_context is present in the envelope, it contains confirmed and rejected "
-    "tap counts from the user's Telegram responses, keyed by intent_class. Use this to calibrate routing:\n"
+    "- When urgency is not low, write feedback_prompt in the same voice and register as the surrounding_context "
+    "from the envelope — mirror the user's actual vocabulary, rhythm, and sentence style. The question must "
+    "have a binary yes/no answer (user taps Done, Skip, or Later) but should NOT default to 'Did you X?' "
+    "unless that is how the user naturally writes. Short, casual, first-person phrasing is preferred over "
+    "analytical. Good examples: 'you get those SPDs sorted?', 'ended up renaming that file?', "
+    "'commit to the shoe thing?'. Never start with What, How, Why, Which, or Who.\n"
+    "Feedback calibration: if feedback_context is present in the envelope, it contains confirmed/rejected "
+    "tap counts and style_examples (recent confirmed feedback_prompt phrases) from the user's Telegram "
+    "responses, keyed by intent_class. Use this to calibrate routing:\n"
+    "- style_examples shows phrasings the user has already responded to positively — use these alongside "
+    "surrounding_context as voice calibration for feedback_prompt.\n"
     "- High rejected count relative to confirmed for this intent_class: the user often dismisses these — "
     "prefer lower urgency (soon or low) and digest_capture over notification.\n"
     "- High confirmed count: the user engages with these — normal routing discipline applies.\n"
@@ -700,12 +808,12 @@ ROUTING_SYSTEM_PROMPT = (
     '"title": "<short title under 80 chars>", '
     '"body": "<1-2 sentence summary>", '
     '"defer_to": "<ISO date or empty string>", '
-    '"feedback_prompt": "<yes/no completion question as \'Did you X?\', or empty string if urgency=low>"}'
+    '"feedback_prompt": "<binary yes/no question in the user\'s natural voice, or empty string if urgency=low>"}'
 )
 
 
 def _feedback_summary(state_dir: Path) -> dict:
-    """Return confirmed/rejected counts per intent_class from Telegram tap history."""
+    """Return confirmed/rejected counts + recent confirmed phrase examples per intent_class."""
     path = state_dir / "intent_feedback_learning.json"
     if not path.exists():
         return {}
@@ -713,11 +821,18 @@ def _feedback_summary(state_dir: Path) -> dict:
         data = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return {}
-    summary: dict[str, dict[str, int]] = {}
+    summary: dict[str, dict] = {}
     for cls, info in data.get("approved", {}).items():
         if cls == "unknown":
             continue
         summary.setdefault(cls, {"confirmed": 0, "rejected": 0})["confirmed"] = int(info.get("count", 0))
+        examples = info.get("examples") or []
+        phrases = [
+            e["phrase"] for e in examples
+            if isinstance(e, dict) and e.get("phrase")
+        ][-3:]
+        if phrases:
+            summary[cls]["style_examples"] = phrases
     for cls, info in data.get("suppressed", {}).items():
         if cls == "unknown":
             continue
@@ -726,6 +841,32 @@ def _feedback_summary(state_dir: Path) -> dict:
 
 
 def _suppression_match(state_dir: Path, intent_class: str, intent_raw: str) -> dict | None:
+    norm_intent = _normalize_intent_text(intent_raw)
+    if not norm_intent:
+        return None
+    matches: list[dict] = []
+
+    learning_match = _suppression_match_from_learning(state_dir, intent_class, norm_intent)
+    if learning_match:
+        matches.append(learning_match)
+
+    ledger_match = _suppression_match_from_ledger(state_dir, intent_class, norm_intent)
+    if ledger_match:
+        matches.append(ledger_match)
+
+    if not matches:
+        return None
+    matches.sort(
+        key=lambda row: (
+            -int(row.get("count", 0)),
+            str(row.get("source", "")),
+            str(row.get("pattern", "")),
+        )
+    )
+    return matches[0]
+
+
+def _suppression_match_from_learning(state_dir: Path, intent_class: str, norm_intent: str) -> dict | None:
     path = state_dir / "intent_feedback_learning.json"
     if not path.exists():
         return None
@@ -742,14 +883,11 @@ def _suppression_match(state_dir: Path, intent_class: str, intent_raw: str) -> d
     patterns = class_data.get("patterns", {})
     if not isinstance(patterns, dict):
         return None
-    norm_intent = _normalize_intent_text(intent_raw)
-    if not norm_intent:
-        return None
     for pattern, meta in patterns.items():
         pattern_norm = _normalize_intent_text(pattern)
         if len(pattern_norm) < 6:
             continue
-        if pattern_norm in norm_intent or norm_intent in pattern_norm:
+        if _suppression_patterns_match(pattern_norm, norm_intent):
             md = meta if isinstance(meta, dict) else {}
             return {
                 "pattern": pattern_norm,
@@ -757,8 +895,55 @@ def _suppression_match(state_dir: Path, intent_class: str, intent_raw: str) -> d
                 "first_seen": str(md.get("first_seen", "")),
                 "last_seen": str(md.get("last_seen", "")),
                 "sample_phrase": str(md.get("sample_phrase", "")),
+                "source": "feedback_learning",
             }
     return None
+
+
+def _suppression_match_from_ledger(state_dir: Path, intent_class: str, norm_intent: str) -> dict | None:
+    suppressive_signals = {"rejected", "cortex_deleted", "expired_silence", "expired_defer_limit"}
+    patterns: dict[str, dict] = {}
+    for record in load_ledger(state_dir).values():
+        if str(record.get("intent_class") or "") != intent_class:
+            continue
+        signal = str(record.get("feedback_signal") or "").strip().lower()
+        if signal not in suppressive_signals:
+            continue
+        sample = str(record.get("intent_raw") or record.get("title") or "").strip()
+        pattern_norm = _normalize_intent_text(sample)
+        if len(pattern_norm) < 6:
+            continue
+        existing = patterns.get(pattern_norm) or {
+            "count": 0,
+            "first_seen": "",
+            "last_seen": "",
+            "sample_phrase": sample[:200],
+            "signal": signal,
+        }
+        existing["count"] = int(existing.get("count", 0)) + 1
+        seen_at = str(record.get("feedback_received_at") or record.get("updated_at") or record.get("created_at") or "")
+        if seen_at and (not existing.get("first_seen") or seen_at < str(existing.get("first_seen"))):
+            existing["first_seen"] = seen_at
+        if seen_at and seen_at > str(existing.get("last_seen") or ""):
+            existing["last_seen"] = seen_at
+        patterns[pattern_norm] = existing
+
+    matches: list[dict] = []
+    for pattern_norm, meta in patterns.items():
+        if _suppression_patterns_match(pattern_norm, norm_intent):
+            matches.append({
+                "pattern": pattern_norm,
+                "count": int(meta.get("count", 0)),
+                "first_seen": str(meta.get("first_seen", "")),
+                "last_seen": str(meta.get("last_seen", "")),
+                "sample_phrase": str(meta.get("sample_phrase", "")),
+                "signal": str(meta.get("signal", "")),
+                "source": "delivery_ledger",
+            })
+    if not matches:
+        return None
+    matches.sort(key=lambda row: (-int(row.get("count", 0)), str(row.get("pattern", ""))))
+    return matches[0]
 
 
 def call_routing_model(envelope: dict, model: str, dry_run: bool = False) -> dict:
@@ -796,7 +981,7 @@ def call_routing_model(envelope: dict, model: str, dry_run: bool = False) -> dic
     completion = client.chat.completions.create(
         model=model,
         max_tokens=512,
-        temperature=0,
+        temperature=0.4,
         messages=[
             {"role": "system", "content": ROUTING_SYSTEM_PROMPT},
             {"role": "user", "content": user_content},

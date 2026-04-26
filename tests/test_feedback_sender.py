@@ -448,10 +448,8 @@ class TestFeedbackSenderSendCaps(unittest.TestCase):
 
         text = send_mock.call_args.args[2]
         self.assertNotIn("Intent check-in", text)
-        self.assertEqual(
-            text,
-            "Did you pick up the smoothie for Jill?\n<i>(Pick up smoothie for Jill · task)</i>",
-        )
+        self.assertNotIn("<i>", text)
+        self.assertEqual(text, "Did you pick up the smoothie for Jill?")
 
     def test_message_text_html_escapes_user_content(self):
         entry = self._pending("h" * 64, "/tmp/2026-04-16.md")
@@ -469,10 +467,8 @@ class TestFeedbackSenderSendCaps(unittest.TestCase):
             fs.send_due_messages([entry], "token", "chat")
 
         text = send_mock.call_args.args[2]
-        self.assertEqual(
-            text,
-            "Did you pay Jill &amp; Marcus?\n<i>(Pay &lt;Jill&gt; · task &gt; money)</i>",
-        )
+        self.assertNotIn("<i>", text)
+        self.assertEqual(text, "Did you pay Jill &amp; Marcus?")
 
 
 if __name__ == "__main__":

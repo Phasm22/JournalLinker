@@ -559,9 +559,7 @@ def _button_labels(entry: dict) -> tuple[str, str, str]:
 def build_feedback_message_text(entry: dict) -> str:
     title = str(entry.get("title", "Intent") or "Intent")
     prompt = str(entry.get("feedback_prompt", title) or title)
-    category = str(entry.get("category", "") or "").strip()
-    meta = title if not category else f"{title} · {category}"
-    return f"{html.escape(prompt)}\n<i>({html.escape(meta)})</i>"
+    return html.escape(prompt)
 
 
 # ---------------------------------------------------------------------------

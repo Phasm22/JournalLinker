@@ -1053,6 +1053,26 @@ class TestEnrichEnvelope(unittest.TestCase):
         self.assertEqual(result["related_silo_hits"][0]["title"], "Note A")
         self.assertTrue(result.get("recurrence_signal"))
 
+    def test_enrich_includes_local_cortex_hits_when_available(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            journal_dir = Path(tmpdir)
+            cortex_dir = journal_dir / "cortex" / "task"
+            cortex_dir.mkdir(parents=True)
+            source_file = journal_dir / "2026-04-16.md"
+            source_file.write_text("follow up with accountant this week", encoding="utf-8")
+            (cortex_dir / "Accountant Followup.md").write_text(
+                "Need to follow up with accountant about tax paperwork and quarterly estimates.",
+                encoding="utf-8",
+            )
+            envelope = self._base_envelope()
+            envelope["source_file"] = str(source_file)
+            with mock.patch.object(pi, "query_llmlibrarian_mcp", return_value={"chunks": []}):
+                result = pi.enrich_envelope(envelope)
+
+        self.assertIn("related_cortex_hits", result)
+        self.assertEqual(result["related_cortex_hits"][0]["source"], "cortex")
+        self.assertTrue(result["related_silo_hits"][0]["title"].startswith("cortex/"))
+
     def test_enrich_continues_on_failure(self):
         """An exception inside enrich_envelope must not propagate."""
         envelope = self._base_envelope()
@@ -1101,6 +1121,29 @@ class TestEnrichEnvelope(unittest.TestCase):
     def test_unknown_configured_silo_fails_closed(self):
         with self.assertRaises(ValueError):
             pi._resolve_llmlibrarian_silo({"silos": []}, "missing")
+
+
+class TestSuppressionMatching(unittest.TestCase):
+    def test_suppression_match_uses_ledger_feedback_signal(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_dir = Path(tmpdir)
+            pi.save_ledger(state_dir, {
+                "k1": {
+                    "claude_idempotency_key": "k1",
+                    "intent_class": "task_intent",
+                    "intent_raw": "call accountant tomorrow",
+                    "title": "Call accountant",
+                    "feedback_signal": "rejected",
+                    "feedback_received_at": "2026-04-20T10:00:00+00:00",
+                }
+            })
+            result = pi._suppression_match(state_dir, "task_intent", "call accountant about taxes")
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result["source"], "delivery_ledger")
+        self.assertEqual(result["signal"], "rejected")
+        self.assertEqual(result["pattern"], "call accountant tomorrow")
 
 
 # ---------------------------------------------------------------------------
