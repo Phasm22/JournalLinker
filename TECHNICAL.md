@@ -33,6 +33,22 @@ SCRIBE_DAILY_REFLECTION_WINDOW_START="16:00"
 SCRIBE_DAILY_REFLECTION_WINDOW_END="21:00"
 ```
 
+## Offline corpus sampling (no intent pipeline / no time)
+
+To **list, date-filter, randomly sample, or export previews** of `YYYY-MM-DD.md` notes (and optional cortex trees with `--recursive`) without running `process_intents`, watchers, or Telegram, use:
+
+```bash
+python3 scripts/corpus_sample.py --journal-dir "$SCRIBE_JOURNAL_DIR" --from-date 2025-01-01 --sample 20 --seed 1 --format jsonl --preview-chars 300
+```
+
+Multiple roots (e.g. daily vault + cortex):
+
+```bash
+python3 scripts/corpus_sample.py --roots ~/Journal ~/Journal/cortex --recursive --format paths | head
+```
+
+See `python3 scripts/corpus_sample.py --help`. Output formats: `paths`, `jsonl` (good for Parquet/CSV pipelines), or full `text`.
+
 ## `Scribe.py` CLI
 
 ```bash
