@@ -1,0 +1,3 @@
+# Local venv: uv venv && uv pip install -r requirements-dev.txt
+pytest
+ollama
