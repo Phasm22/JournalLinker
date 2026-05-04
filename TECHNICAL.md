@@ -137,6 +137,7 @@ Other useful intent variables (see the script docstring in-repo): `INTENT_GATE_M
 | 1. Credentials | `python3 scripts/telegram_smoke_test.py` | `getMe` only — safe with daemon running. |
 | 2. Inbound ping | `python3 scripts/telegram_smoke_test.py --send "journalLinker smoke"` | One outbound message; still no `getUpdates`. |
 | 3. Long-poll trial | `./scripts/telegram_live_trial.sh --minutes 30 --verbose` | Stop systemd feedback sender first; exercises callbacks/replies/reaction spike. |
+| 3b. **Manual two-shot (no long wait)** | `python3 scripts/telegram_enqueue_immediate_checkin.py --prompt "…" --tick` then after you tap/react, `python3 scripts/feedback_sender.py --verbose` | Appends a **due-now** queue row (real `INTENT_STATE_DIR`), first tick sends the check-in; second tick records your interaction. Stop `journal-linker-feedback-sender.service` first if running. |
 | 4. Unit tests | `.venv/bin/python -m pytest tests/test_feedback_sender.py -q` | Mocked HTTP — no real Telegram. |
 | 5. Reply trace | `…/intent_feedback_reply_trace.jsonl` | One line per routed clarifying reply (sanitized preview). |
 | 6. Reaction audit | `…/intent_feedback_reaction_audit.jsonl` | One line per `message_reaction` processing attempt (`accepted`, `duplicate`, `unmapped_emoji`, etc.). |
