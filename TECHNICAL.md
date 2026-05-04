@@ -81,7 +81,16 @@ python3 daily_reflection.py --force-send
 
 ## Intent pipeline (`scripts/process_intents.py` in `JOURNAL_LINKER_REPO`)
 
-The intent watcher runs from the journalLinker checkout referenced by `JOURNAL_LINKER_REPO`. It gates journal text, calls the routing model, then delivers to Pushover, Obsidian cortex, digest queue, and Telegram feedback queue.
+The intent watcher runs from the journalLinker checkout referenced by `JOURNAL_LINKER_REPO`. It gates journal text, calls the routing model, then delivers to Pushover, Obsidian cortex, optional digest queue file, and optional Telegram feedback queue.
+
+**Digest and Telegram scheduling (capture-first):**
+
+| Variable | Default | Meaning |
+|----------|---------|--------|
+| `INTENT_DIGEST_MODE` | unset → **on** | Set to `off`, `false`, `0`, or `no` to **stop appending** to `intent_digest_queue.jsonl`. There is **no in-repo consumer** for that file—disabling avoids a silent growing JSONL log when you only care about cortex capture. |
+| `INTENT_FEEDBACK_MODE` | unset → **on** | Set to `off` (same tokens as above) to **skip scheduling** Telegram feedback check-ins (`intent_feedback_queue.jsonl`). Cortex and Pushover behavior are unchanged. |
+
+Unset behavior preserves legacy pipelines; set flags in `~/.config/journal-linker/journal-linker.env` as needed.
 
 **llmLibrarian enrichment:** `INTENT_ENRICHMENT_MODE=llmlib` (or `mcp`) uses llmLibrarian over MCP HTTP, not a direct Python import. If unset, the code defaults to `llmlib` (enrichment on). The pipeline checks `http://127.0.0.1:8765/healthz` before calling the `query_personal_knowledge` tool and degrades gracefully if the server is down. Install the client with `just intent-mcp-install`, then supervise `/home/YOU/Desktop/llmLibrarian/mcp_server.py` with `systemd/journal-linker-llmlibrarian-mcp.service` or set `INTENT_ENRICHMENT_MODE=off`.
 

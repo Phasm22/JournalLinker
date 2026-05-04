@@ -322,6 +322,11 @@ class TestRoutingDecisions(unittest.TestCase):
         result = self._route("low", "note")
         self.assertIn("digest", result["planned_route"])
 
+    def test_digest_mode_off_excludes_digest_from_route(self):
+        with mock.patch.dict(os.environ, {"INTENT_DIGEST_MODE": "off"}):
+            result = self._route("low", "note", dry_run=True)
+        self.assertNotIn("digest", result["planned_route"])
+
     def test_soon_note_excludes_pushover_when_env_restricts(self):
         with mock.patch.dict(os.environ, {"INTENT_PUSHOVER_URGENCIES": "immediate,today"}):
             result = self._route("soon", "note", dry_run=True)
@@ -357,6 +362,24 @@ class TestRoutingDecisions(unittest.TestCase):
         )
         self.assertIn("digest", result["planned_route"])
         self.assertNotIn("pushover", result["planned_route"])
+
+
+class TestIntentDeliveryEnvFlags(unittest.TestCase):
+    def test_digest_queue_append_enabled_defaults_true(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(pi.digest_queue_append_enabled())
+
+    def test_digest_queue_append_disabled_when_off(self):
+        with mock.patch.dict(os.environ, {"INTENT_DIGEST_MODE": "off"}):
+            self.assertFalse(pi.digest_queue_append_enabled())
+
+    def test_feedback_queue_enqueue_defaults_true(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(pi.feedback_queue_enqueue_enabled())
+
+    def test_feedback_queue_enqueue_disabled_when_off(self):
+        with mock.patch.dict(os.environ, {"INTENT_FEEDBACK_MODE": "off"}):
+            self.assertFalse(pi.feedback_queue_enqueue_enabled())
 
 
 class TestEnrichmentModeResolution(unittest.TestCase):
@@ -1232,6 +1255,15 @@ class TestFeedbackQueue(unittest.TestCase):
     def test_feedback_prompt_in_queue_entry(self):
         out = self._route("today", "note", feedback_prompt="Did you call Marcus?")
         self.assertEqual(out["entries"][0]["feedback_prompt"], "Did you call Marcus?")
+
+    def test_feedback_queue_entry_includes_intent_raw(self):
+        out = self._route("today", "note", feedback_prompt="Follow up?")
+        self.assertEqual(out["entries"][0]["intent_raw"], "test intent")
+
+    def test_feedback_not_scheduled_when_intent_feedback_mode_off(self):
+        with mock.patch.dict(os.environ, {"INTENT_FEEDBACK_MODE": "off"}):
+            out = self._route("today", "note")
+        self.assertEqual(len(out["entries"]), 0)
 
     def test_feedback_entry_includes_class_action_and_timing(self):
         out = self._route("today", "note")

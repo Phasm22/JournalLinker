@@ -38,6 +38,8 @@ Env vars (from .env or environment):
     LLMLIBRARIAN_MCP_N_RESULTS   retrieval count for enrichment (default: 5)
     LLMLIBRARIAN_MCP_SILO        optional silo slug/name; unset uses unified search
     INTENT_MAX_INTENTS_PER_NOTE  max intents extracted per note (default: 5)
+    INTENT_DIGEST_MODE           off|false|0 disables appending intent_digest_queue.jsonl (unset => on, legacy).
+    INTENT_FEEDBACK_MODE         off|false|0 disables scheduling Telegram feedback check-ins (unset => on).
     INTENT_FEEDBACK_DELAY_TODAY  seconds before feedback prompt fires for today/immediate urgency (default: 21600 = 6h)
     INTENT_FEEDBACK_DELAY_SOON   seconds before feedback prompt fires for soon urgency (default: 86400 = 24h)
     INTENT_PUSHOVER_URGENCIES    comma-separated urgencies that may trigger Pushover (default: immediate,today,soon).
@@ -1113,6 +1115,25 @@ def resolve_enrichment_mode() -> str:
     return raw
 
 
+def digest_queue_append_enabled() -> bool:
+    """Append to intent_digest_queue.jsonl unless INTENT_DIGEST_MODE disables it.
+
+    Truthy: unset, on, true, 1, yes. Falsy: off, false, 0, no.
+    """
+    raw = os.getenv("INTENT_DIGEST_MODE", "").strip().lower()
+    if not raw:
+        return True
+    return raw not in ("0", "false", "no", "off")
+
+
+def feedback_queue_enqueue_enabled() -> bool:
+    """Schedule Telegram feedback rows unless INTENT_FEEDBACK_MODE disables them."""
+    raw = os.getenv("INTENT_FEEDBACK_MODE", "").strip().lower()
+    if not raw:
+        return True
+    return raw not in ("0", "false", "no", "off")
+
+
 def _legacy_action_for_response(response: dict) -> str:
     """Map pre-action routing responses onto the new action vocabulary.
 
@@ -1341,6 +1362,8 @@ def route_delivery(
         or fmt == "draft"
         or consent_required
     )
+    if not digest_queue_append_enabled():
+        append_to_digest = False
     enqueue_future_action = action == "future_action_search_enqueue" and has_class_consent
 
     if push_via_pushover:
@@ -1484,7 +1507,7 @@ def route_delivery(
                 _log("action", f"ERROR: {exc}")
 
     # Feedback queue — schedule a Telegram check-in for today/soon/immediate urgency
-    if feedback_prompt and urgency != "low":
+    if feedback_queue_enqueue_enabled() and feedback_prompt and urgency != "low":
         if prior_sink_delivered_ok(ledger_entry, "feedback_queue"):
             results["results_per_sink"]["feedback_queue"] = {
                 "ok": True,
@@ -1505,6 +1528,7 @@ def route_delivery(
                     return results
                 fb_entry = {
                     "claude_idempotency_key": claude_idempotency_key,
+                    "intent_raw": envelope.get("intent_raw", ""),
                     "feedback_prompt": feedback_prompt,
                     "title": title,
                     "urgency": urgency,
