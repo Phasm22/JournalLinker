@@ -64,6 +64,19 @@ def load_env_files() -> None:
 FEEDBACK_QUEUE_FILENAME = "intent_feedback_queue.jsonl"
 
 
+def telegram_button_labels_preview(intent_class: str, category: str) -> tuple[str, str, str]:
+    """Must stay aligned with _button_labels() in scripts/feedback_sender.py."""
+    ic = (intent_class or "").strip()
+    cat = (category or "").strip().lower()
+    if ic == "purchase_intent":
+        return ("Got it", "Pass", "Later")
+    if ic == "latent_interest":
+        return ("Noted", "Dismiss", "Later")
+    if cat == "reminder":
+        return ("Done", "Dismiss", "Snooze")
+    return ("Done", "Skip", "Later")
+
+
 def main() -> int:
     load_env_files()
 
@@ -83,6 +96,19 @@ def main() -> int:
         "--intent-raw",
         default="manual live test",
         help="intent_raw field for learning / traces",
+    )
+    parser.add_argument(
+        "--intent-class",
+        default="task_intent",
+        metavar="CLASS",
+        help="Mirrors router envelope (default task_intent → Done/Skip/Later buttons). "
+        "purchase_intent → Got it/Pass/Later; latent_interest → Noted/Dismiss/Later.",
+    )
+    parser.add_argument(
+        "--category",
+        default="task",
+        metavar="CAT",
+        help="reminder → Done/Dismiss/Snooze; otherwise combines with --intent-class for label choice.",
     )
     parser.add_argument(
         "--state-dir",
@@ -118,8 +144,8 @@ def main() -> int:
         "urgency": "today",
         "format": "note",
         "action": "notification",
-        "category": "task",
-        "intent_class": "task_intent",
+        "category": args.category,
+        "intent_class": args.intent_class,
         "source_file": args.source_file or "",
         "captured_at": now.isoformat(timespec="seconds"),
         "send_after": send_after,
@@ -135,9 +161,14 @@ def main() -> int:
     with open(queue_path, "a", encoding="utf-8") as fh:
         fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
+    a, b, c = telegram_button_labels_preview(args.intent_class, args.category)
     print(f"Appended one pending row to {queue_path}")
     print(f"  claude_idempotency_key (prefix) = {key[:16]}…")
     print(f"  send_after = {send_after} (due immediately)")
+    print(
+        f"  Inline keyboard labels (confirm/reject/defer): {a!r} | {b!r} | {c!r} "
+        f"(intent_class={args.intent_class!r}, category={args.category!r})"
+    )
     print()
     if args.tick:
         sender = Path(__file__).resolve().parent / "feedback_sender.py"
