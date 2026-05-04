@@ -6,7 +6,9 @@
 #   ./scripts/telegram_live_trial.sh --minutes 90
 #
 # Optional:
-#   TRIAL_SPIKE=1 (default) sets INTENT_TELEGRAM_REACTION_SPIKE=1 for raw reaction logging.
+#   TRIAL_SPIKE=1 (default) sets INTENT_TELEGRAM_REACTION_SPIKE=1 for extra spike JSONL.
+#       Production emoji→ledger uses INTENT_REACTION_SIGNALS + the built-in/JSON map by default;
+#       use INTENT_REACTION_SIGNALS=off for callbacks/replies only.
 #   TRIAL_SKIP_CONFLICT_CHECK=1 — skip the exclusive bot check (you will get HTTP 409 if another
 #       getUpdates client is still running).
 #   Extra args pass through to feedback_sender.py (e.g. --verbose).

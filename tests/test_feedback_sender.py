@@ -60,7 +60,7 @@ class TestFeedbackSenderCallbacks(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             state_dir = Path(tmpdir)
             with mock.patch.object(fs, "answer_callback"):
-                entries, ledger = fs.process_callback_updates(
+                entries, ledger, _ = fs.process_callback_updates(
                     [self._update("confirm", key)], entries, ledger, "token", state_dir=state_dir
                 )
             learning = fs.load_feedback_learning(state_dir)
@@ -321,7 +321,7 @@ class TestFeedbackSenderMessages(unittest.TestCase):
             },
         }
         with mock.patch.object(fs, "_apply_clarification") as apply_mock:
-            fs.process_message_updates([update], [old, latest], "token", "chat")
+            fs.process_message_updates([update], [old, latest], "token", "chat")[0]
 
         apply_mock.assert_called_once_with(latest, "I meant beach shop", "token", "chat")
 
@@ -343,7 +343,7 @@ class TestFeedbackSenderMessages(unittest.TestCase):
             mock.patch.object(fs, "_apply_clarification") as apply_mock,
             mock.patch.object(fs, "_send_plain") as send_plain_mock,
         ):
-            fs.process_message_updates([update], [first, second], "token", "chat")
+            fs.process_message_updates([update], [first, second], "token", "chat")[0]
 
         apply_mock.assert_not_called()
         send_plain_mock.assert_called_once()
@@ -367,7 +367,7 @@ class TestFeedbackSenderMessages(unittest.TestCase):
                 entry["clarification_applied"] = True
 
             with mock.patch.object(fs, "_apply_clarification", side_effect=_fake_apply):
-                fs.process_message_updates([update], [latest], "token", "chat", state_dir=state_dir)
+                fs.process_message_updates([update], [latest], "token", "chat", state_dir=state_dir)[0]
 
             path = state_dir / fs.REPLY_TRACE_FILENAME
             self.assertTrue(path.exists())
@@ -390,7 +390,7 @@ class TestFeedbackSenderMessages(unittest.TestCase):
                 mock.patch.dict(os.environ, {"INTENT_TELEGRAM_REPLY_TRACE": "off"}),
                 mock.patch.object(fs, "_apply_clarification"),
             ):
-                fs.process_message_updates([update], [latest], "token", "chat", state_dir=state_dir)
+                fs.process_message_updates([update], [latest], "token", "chat", state_dir=state_dir)[0]
             self.assertFalse((state_dir / fs.REPLY_TRACE_FILENAME).exists())
 
 
@@ -516,9 +516,23 @@ class TestFeedbackSenderSendCaps(unittest.TestCase):
 
 
 class TestReactionSpike(unittest.TestCase):
-    def test_build_allowed_updates_default(self):
-        with mock.patch.dict(os.environ, {}, clear=True):
+    def test_build_allowed_updates_without_reactions_when_disabled(self):
+        with mock.patch.dict(os.environ, {"INTENT_REACTION_SIGNALS": "off"}, clear=False):
             self.assertEqual(fs.build_allowed_updates(), ["callback_query", "message"])
+
+    def test_build_allowed_updates_includes_message_reaction_uat_default(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "INTENT_REACTION_SIGNALS": "",
+                "INTENT_TELEGRAM_REACTION_SPIKE": "",
+            },
+        ):
+            allowed = fs.build_allowed_updates()
+        self.assertEqual(
+            allowed,
+            ["callback_query", "message", "message_reaction"],
+        )
 
     def test_build_allowed_updates_includes_reaction_when_spike_on(self):
         with mock.patch.dict(os.environ, {"INTENT_TELEGRAM_REACTION_SPIKE": "1"}):
@@ -540,6 +554,7 @@ class TestReactionSpike(unittest.TestCase):
             row = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
             self.assertEqual(row["update_id"], 42)
             self.assertEqual(row["message_reaction"]["message_id"], 7)
+            self.assertTrue(row["message_reaction"]["chat_id_set"])
 
     def test_process_reaction_spike_skipped_when_disabled(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -550,6 +565,141 @@ class TestReactionSpike(unittest.TestCase):
                     state_dir,
                 )
             self.assertFalse((state_dir / fs.REACTION_SPIKE_FILENAME).exists())
+
+
+class TestReactionProduction(unittest.TestCase):
+    def _entry_sent(self, key: str, msg_id: int = 55):
+        e = TestFeedbackSenderCallbacks()._entry(key)
+        e["telegram_message_id"] = msg_id
+        e["sent_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        return e
+
+    def test_thumb_up_confirms_matching_message(self):
+        key = "z" * 64
+        entries = [self._entry_sent(key)]
+        ledger = {key: {"claude_idempotency_key": key}}
+        learning = {"approved": {}, "suppressed": {}}
+        update = {
+            "update_id": 99,
+            "message_reaction": {
+                "chat": {"id": "chat"},
+                "message_id": 55,
+                "new_reaction": [{"type": "emoji", "emoji": "👍"}],
+                "old_reaction": [],
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_dir = Path(tmpdir)
+            with mock.patch.object(fs, "edit_message_reply_markup"):
+                fs.process_reaction_signal_updates(
+                    [update],
+                    entries,
+                    ledger,
+                    "token",
+                    "chat",
+                    state_dir=state_dir,
+                    learning=learning,
+                    persist_learning=False,
+                )
+        self.assertEqual(entries[0]["feedback_signal"], "confirmed")
+        self.assertEqual(ledger[key]["feedback_signal"], "confirmed")
+        self.assertEqual(learning["approved"]["task_intent"]["count"], 1)
+
+    def test_custom_json_map_overrides_builtin(self):
+        key = "y" * 64
+        entries = [self._entry_sent(key)]
+        ledger = {key: {"claude_idempotency_key": key}}
+        learning = {"approved": {}, "suppressed": {}}
+        update = {
+            "update_id": 100,
+            "message_reaction": {
+                "chat": {"id": "chat"},
+                "message_id": 55,
+                "new_reaction": [{"type": "emoji", "emoji": "🎈"}],
+                "old_reaction": [],
+            },
+        }
+        env = {"INTENT_REACTION_SIGNAL_MAP": '{"🎈":"reject"}'}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_dir = Path(tmpdir)
+            with mock.patch.dict(os.environ, env, clear=False):
+                with mock.patch.object(fs, "edit_message_reply_markup"):
+                    fs.process_reaction_signal_updates(
+                        [update],
+                        entries,
+                        ledger,
+                        "token",
+                        "chat",
+                        state_dir=state_dir,
+                        learning=learning,
+                        persist_learning=False,
+                    )
+        self.assertEqual(entries[0]["feedback_signal"], "rejected")
+
+    def test_audit_logs_unmapped_emoji(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_dir = Path(tmpdir)
+            update = {
+                "update_id": 101,
+                "message_reaction": {
+                    "chat": {"id": "chat"},
+                    "message_id": 55,
+                    "new_reaction": [{"type": "emoji", "emoji": "🛸"}],
+                    "old_reaction": [],
+                },
+            }
+            fs.process_reaction_signal_updates(
+                [update],
+                [self._entry_sent("y" * 64)],
+                {"y" * 64: {"claude_idempotency_key": "y" * 64}},
+                "token",
+                "chat",
+                state_dir=state_dir,
+                learning={"approved": {}, "suppressed": {}},
+                persist_learning=False,
+            )
+            path = state_dir / fs.REACTION_AUDIT_FILENAME
+            self.assertTrue(path.exists())
+            row = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
+            self.assertEqual(row["result"], "unmapped_emoji")
+
+
+class TestReplyLearning(unittest.TestCase):
+    def test_reply_learning_confirm_updates_ledger(self):
+        key = "m" * 64
+        latest = TestFeedbackSenderCallbacks()._entry(key)
+        latest["telegram_message_id"] = 200
+        latest["sent_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        update = {
+            "update_id": 11,
+            "message": {
+                "text": "done",
+                "chat": {"id": "chat"},
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_dir = Path(tmpdir)
+            ledger = {key: {"claude_idempotency_key": key}}
+            learning = fs.load_feedback_learning(state_dir)
+            with (
+                mock.patch.dict(os.environ, {"INTENT_REPLY_LEARNING_MODE": "confirm"}),
+                mock.patch.object(fs, "_apply_clarification"),
+                mock.patch.object(fs, "edit_message_reply_markup") as edit_mock,
+            ):
+                fs.process_message_updates(
+                    [update],
+                    [latest],
+                    "token",
+                    "chat",
+                    state_dir=state_dir,
+                    ledger=ledger,
+                    learning=learning,
+                    persist_learning=False,
+                )
+            self.assertEqual(latest["state"], "responded")
+            self.assertEqual(latest["feedback_signal"], "confirmed")
+            self.assertEqual(ledger[key]["feedback_signal"], "confirmed")
+            edit_mock.assert_called_once()
 
 
 if __name__ == "__main__":

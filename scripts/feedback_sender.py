@@ -26,10 +26,14 @@ Env vars:
     INTENT_FEEDBACK_SEND_INTERVAL   due-message scan interval seconds (default: 60)
     INTENT_FEEDBACK_QUIET_START     quiet-hours start, local hour 0-23 (default: 22)
     INTENT_FEEDBACK_QUIET_END       quiet-hours end, local hour 0-23 (default: 8)
-    INTENT_TELEGRAM_REACTION_SPIKE  1|true|on — subscribe to message_reaction updates and append
-                                    JSON lines to intent_feedback_reaction_spike.jsonl (debug only;
-                                    does not update ledger or learning). Default off.
-    INTENT_TELEGRAM_REPLY_TRACE     off|false — disable intent_feedback_reply_trace.jsonl for inbound
+    INTENT_TELEGRAM_REACTION_SPIKE  1|true|on — extra raw-ish reaction debug log (sanitized spike row).
+                                    Optional; production reactions use INTENT_REACTION_SIGNALS.
+    INTENT_REACTION_SIGNALS           off — disable emoji→confirm|reject|defer (default on when map non-empty).
+    INTENT_REACTION_BUILTIN_MAP       off — drop built-in emoji map; use INTENT_REACTION_SIGNAL_MAP JSON only.
+    INTENT_REACTION_SIGNAL_MAP        JSON object, e.g. {\"👍\":\"confirm\",\"👎\":\"reject\"} (overrides/extends defaults).
+    INTENT_REACTION_AUDIT_LOG         off — disable intent_feedback_reaction_audit.jsonl (default on).
+    INTENT_REPLY_LEARNING_MODE        off|confirm|reject|defer — treat routed text replies like a tap (default confirm).
+    INTENT_TELEGRAM_REPLY_TRACE       off|false — disable intent_feedback_reply_trace.jsonl for inbound
                                     text replies (default: on / trace enabled).
 """
 
@@ -53,6 +57,7 @@ OFFSET_FILENAME = "telegram_update_offset.txt"
 FEEDBACK_LEARNING_FILENAME = "intent_feedback_learning.json"
 FEEDBACK_TAP_TRACE_FILENAME = "intent_feedback_tap_trace.jsonl"
 REACTION_SPIKE_FILENAME = "intent_feedback_reaction_spike.jsonl"
+REACTION_AUDIT_FILENAME = "intent_feedback_reaction_audit.jsonl"
 REPLY_TRACE_FILENAME = "intent_feedback_reply_trace.jsonl"
 DEFER_DELAY_SECS = 86400  # 24h re-queue on defer
 DEFAULT_DEFER_LIMIT = 3
@@ -142,11 +147,246 @@ def reaction_spike_enabled() -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+def reaction_signals_env_enabled() -> bool:
+    """False when INTENT_REACTION_SIGNALS=off — disables production emoji→ledger (default on)."""
+    raw = os.getenv("INTENT_REACTION_SIGNALS", "").strip().lower()
+    if not raw:
+        return True
+    return raw not in ("0", "false", "no", "off")
+
+
+def builtin_reaction_map_enabled() -> bool:
+    raw = os.getenv("INTENT_REACTION_BUILTIN_MAP", "").strip().lower()
+    if not raw:
+        return True
+    return raw not in ("0", "false", "no", "off")
+
+
+def reaction_audit_log_enabled() -> bool:
+    raw = os.getenv("INTENT_REACTION_AUDIT_LOG", "").strip().lower()
+    if not raw:
+        return True
+    return raw not in ("0", "false", "no", "off")
+
+
+# Wide default map (skin tones + common symbols). Override or extend via INTENT_REACTION_SIGNAL_MAP.
+DEFAULT_REACTION_SIGNAL_MAP: dict[str, str] = {
+    # confirm
+    "👍": "confirm",
+    "👍🏻": "confirm",
+    "👍🏼": "confirm",
+    "👍🏽": "confirm",
+    "👍🏾": "confirm",
+    "👍🏿": "confirm",
+    "👌": "confirm",
+    "👌🏻": "confirm",
+    "👌🏼": "confirm",
+    "👌🏽": "confirm",
+    "👌🏾": "confirm",
+    "👌🏿": "confirm",
+    "🫶": "confirm",
+    "🫶🏻": "confirm",
+    "🫶🏼": "confirm",
+    "🫶🏽": "confirm",
+    "🫶🏾": "confirm",
+    "🫶🏿": "confirm",
+    "💯": "confirm",
+    "✅": "confirm",
+    "☑️": "confirm",
+    "✔️": "confirm",
+    "✔": "confirm",
+    "✓": "confirm",
+    "❤️": "confirm",
+    "❤": "confirm",
+    "🧡": "confirm",
+    "💛": "confirm",
+    "💚": "confirm",
+    "💙": "confirm",
+    "💜": "confirm",
+    "🩵": "confirm",
+    "🩷": "confirm",
+    "🤍": "confirm",
+    "🖤": "confirm",
+    "🤎": "confirm",
+    "🔥": "confirm",
+    "🎉": "confirm",
+    "🙌": "confirm",
+    "🙌🏻": "confirm",
+    "🙌🏼": "confirm",
+    "🙌🏽": "confirm",
+    "🙌🏾": "confirm",
+    "🙌🏿": "confirm",
+    "🙏": "confirm",
+    "🙏🏻": "confirm",
+    "🙏🏼": "confirm",
+    "🙏🏽": "confirm",
+    "🙏🏾": "confirm",
+    "🙏🏿": "confirm",
+    "👏": "confirm",
+    "👏🏻": "confirm",
+    "👏🏼": "confirm",
+    "👏🏽": "confirm",
+    "👏🏾": "confirm",
+    "👏🏿": "confirm",
+    "💖": "confirm",
+    "⭐": "confirm",
+    "🌟": "confirm",
+    "✨": "confirm",
+    "💪": "confirm",
+    "💪🏻": "confirm",
+    "💪🏼": "confirm",
+    "💪🏽": "confirm",
+    "💪🏾": "confirm",
+    "💪🏿": "confirm",
+    "☀️": "confirm",
+    "🌈": "confirm",
+    # reject
+    "👎": "reject",
+    "👎🏻": "reject",
+    "👎🏼": "reject",
+    "👎🏽": "reject",
+    "👎🏾": "reject",
+    "👎🏿": "reject",
+    "❌": "reject",
+    "✖️": "reject",
+    "✖": "reject",
+    "🚫": "reject",
+    "⛔": "reject",
+    "🛑": "reject",
+    "💔": "reject",
+    "😾": "reject",
+    "🙅": "reject",
+    "🙅🏻": "reject",
+    "🙅🏼": "reject",
+    "🙅🏽": "reject",
+    "🙅🏾": "reject",
+    "🙅🏿": "reject",
+    "🙅‍♂️": "reject",
+    "🙅‍♀️": "reject",
+    "🤐": "reject",
+    "😒": "reject",
+    "👎‍♂️": "reject",
+    "👎‍♀️": "reject",
+    # defer / snooze
+    "⏰": "defer",
+    "⏱️": "defer",
+    "⏳": "defer",
+    "⌛": "defer",
+    "😴": "defer",
+    "💤": "defer",
+    "🔜": "defer",
+    "🔁": "defer",
+    "🔂": "defer",
+    "🔃": "defer",
+    "🔄": "defer",
+    "🔅": "defer",
+    "⏸️": "defer",
+    "⏯️": "defer",
+    "🤷": "defer",
+    "🤷🏻": "defer",
+    "🤷🏼": "defer",
+    "🤷🏽": "defer",
+    "🤷🏾": "defer",
+    "🤷🏿": "defer",
+    "🤷‍♂️": "defer",
+    "🤷‍♀️": "defer",
+    "🕐": "defer",
+    "🕑": "defer",
+    "🕒": "defer",
+    "🕓": "defer",
+    "🕔": "defer",
+    "🕕": "defer",
+    "🕖": "defer",
+    "🕗": "defer",
+    "🕘": "defer",
+    "🕙": "defer",
+    "🕚": "defer",
+    "🕛": "defer",
+    "⏲️": "defer",
+    "☕": "defer",
+}
+
+
+def merged_reaction_signal_map() -> dict[str, str]:
+    """Merge built-in map (optional) with INTENT_REACTION_SIGNAL_MAP JSON; override wins."""
+    base: dict[str, str] = {}
+    if builtin_reaction_map_enabled():
+        base = dict(DEFAULT_REACTION_SIGNAL_MAP)
+    extra = os.getenv("INTENT_REACTION_SIGNAL_MAP", "").strip()
+    if extra:
+        try:
+            parsed = json.loads(extra)
+        except json.JSONDecodeError:
+            return base
+        if isinstance(parsed, dict):
+            for k, v in parsed.items():
+                if not isinstance(k, str) or not isinstance(v, str):
+                    continue
+                vv = v.strip().lower()
+                if vv in ("confirm", "reject", "defer"):
+                    base[k] = vv
+    return base
+
+
+def message_reaction_subscription_enabled() -> bool:
+    """Subscribe to message_reaction when spike logging or production emoji signals are active."""
+    if reaction_spike_enabled():
+        return True
+    if not reaction_signals_env_enabled():
+        return False
+    return bool(merged_reaction_signal_map())
+
+
 def build_allowed_updates() -> list[str]:
     allowed = ["callback_query", "message"]
-    if reaction_spike_enabled():
+    if message_reaction_subscription_enabled():
         allowed.append("message_reaction")
     return allowed
+
+
+def sanitize_log_text(text: str, max_len: int = 500) -> str:
+    """Single-line safe preview for JSONL traces (no control chars, bounded length)."""
+    s = str(text or "")
+    s = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", s)
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    s = re.sub(r"\s+", " ", s).strip()
+    if len(s) > max_len:
+        s = s[: max_len - 1] + "…"
+    return s
+
+
+def reply_learning_mode() -> str:
+    """INTENT_REPLY_LEARNING_MODE: off | confirm | reject | defer (default confirm)."""
+    raw = os.getenv("INTENT_REPLY_LEARNING_MODE", "confirm").strip().lower()
+    if raw in ("off", "confirm", "reject", "defer"):
+        return raw
+    return "confirm"
+
+
+def _sanitize_reaction_payload_for_spike(message_reaction: dict) -> dict:
+    """Structured reaction summary without chat payloads (IDs redacted to booleans where helpful)."""
+    chat = message_reaction.get("chat") or {}
+
+    def norm_reactions(reacts: object) -> list[dict]:
+        out: list[dict] = []
+        if not isinstance(reacts, list):
+            return out
+        for r in reacts:
+            if not isinstance(r, dict):
+                continue
+            if r.get("type") == "emoji":
+                out.append({"type": "emoji", "emoji": sanitize_log_text(str(r.get("emoji") or ""), 32)})
+            elif r.get("type") == "custom_emoji":
+                cid = str(r.get("custom_emoji_id") or "")
+                out.append({"type": "custom_emoji", "custom_emoji_id": cid[:24]})
+        return out
+
+    return {
+        "message_id": message_reaction.get("message_id"),
+        "chat_id_set": bool(chat.get("id")),
+        "new_reaction": norm_reactions(message_reaction.get("new_reaction")),
+        "old_reaction": norm_reactions(message_reaction.get("old_reaction")),
+    }
 
 
 def get_updates(token: str, offset: int, timeout: int = 0) -> list[dict]:
@@ -159,12 +399,13 @@ def get_updates(token: str, offset: int, timeout: int = 0) -> list[dict]:
 
 
 def append_reaction_spike_log(state_dir: Path, update: dict) -> None:
-    """Append one JSON line for a message_reaction update (spike / diagnostics only)."""
+    """Append one JSON line for a message_reaction update (spike / diagnostics; sanitized)."""
     path = state_dir / REACTION_SPIKE_FILENAME
+    mr = update.get("message_reaction") or {}
     record = {
         "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "update_id": update.get("update_id"),
-        "message_reaction": update.get("message_reaction"),
+        "message_reaction": _sanitize_reaction_payload_for_spike(mr) if mr else None,
     }
     with open(path, "a", encoding="utf-8") as fh:
         fh.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -579,6 +820,7 @@ def _record_tap(
     acknowledgement: str,
     tap_number: int,
     at: str,
+    interaction: str = "callback",
 ) -> None:
     if state_dir is None:
         return
@@ -598,6 +840,7 @@ def _record_tap(
         "telegram_message_id": message.get("message_id", entry.get("telegram_message_id", "") if entry else ""),
         "acknowledgement": acknowledgement,
         "tap_number": tap_number,
+        "interaction": interaction,
     }
     append_tap_trace(state_dir, record)
 
@@ -620,6 +863,270 @@ def build_feedback_message_text(entry: dict) -> str:
     return html.escape(prompt)
 
 
+def _synthetic_callback_query(message_id: int | str | None, chat_id: int | str | None) -> dict:
+    return {"id": "", "message": {"message_id": message_id, "chat": {"id": chat_id}}}
+
+
+def first_mapped_reaction_action(
+    new_reactions: list,
+    rmap: dict[str, str],
+) -> tuple[str | None, str | None]:
+    for r in new_reactions or []:
+        if not isinstance(r, dict):
+            continue
+        if r.get("type") != "emoji":
+            continue
+        em = str(r.get("emoji") or "")
+        if em in rmap:
+            return em, rmap[em]
+    return None, None
+
+
+def _apply_signal_transition(
+    matched: dict,
+    action: str,
+    defer_limit: int,
+    now_iso: str,
+    learning: dict | None,
+) -> tuple[str, bool]:
+    """Apply confirm|reject|defer to queue entry. Mutates matched. Returns (signal_label, learning_changed)."""
+    learning_changed = False
+    key16 = str(matched.get("claude_idempotency_key", ""))[:16]
+    if action == "defer":
+        defer_count = int(matched.get("defer_count") or 0) + 1
+        matched["defer_count"] = defer_count
+        if defer_count > defer_limit:
+            matched["state"] = "expired"
+            matched["feedback_signal"] = "expired_defer_limit"
+            matched["expires_at"] = now_iso
+            matched["telegram_message_id"] = None
+            _log("signal", f"expired key={key16} after defer_count={defer_count}")
+            signal_label = "expired_defer_limit"
+        else:
+            new_send_after = (
+                datetime.now(timezone.utc) + timedelta(seconds=DEFER_DELAY_SECS)
+            ).isoformat(timespec="seconds")
+            matched["state"] = "pending"
+            matched["send_after"] = new_send_after
+            matched["telegram_message_id"] = None
+            matched["feedback_signal"] = "deferred"
+            _log("signal", f"deferred key={key16} count={defer_count} new send_after={new_send_after}")
+            signal_label = "deferred"
+    else:
+        signal_label = "confirmed" if action == "confirm" else "rejected"
+        matched["state"] = "responded"
+        matched["feedback_signal"] = signal_label
+        _log("signal", f"{signal_label} key={key16}")
+        if learning is not None:
+            _record_feedback_learning(learning, matched, signal_label, now_iso)
+            learning_changed = True
+    return signal_label, learning_changed
+
+
+def _merge_signal_into_ledger(
+    ledger: dict,
+    ikey: str,
+    matched: dict,
+    signal_label: str,
+    now_iso: str,
+) -> None:
+    if ikey in ledger:
+        ledger[ikey]["feedback_signal"] = signal_label
+        ledger[ikey]["feedback_received_at"] = now_iso
+        ledger[ikey]["title"] = matched.get("title", ledger[ikey].get("title", ""))
+        ledger[ikey]["category"] = matched.get("category", ledger[ikey].get("category", ""))
+        ledger[ikey]["urgency"] = matched.get("urgency", ledger[ikey].get("urgency", ""))
+        ledger[ikey]["intent_class"] = matched.get("intent_class", ledger[ikey].get("intent_class", ""))
+        ledger[ikey]["action"] = matched.get("action", ledger[ikey].get("action", ""))
+        ledger[ikey]["defer_count"] = matched.get("defer_count", ledger[ikey].get("defer_count", 0))
+    else:
+        _vlog("ledger", f"ledger entry not found for {ikey[:16]} — signal recorded in queue only")
+
+
+def append_reaction_audit(state_dir: Path, row: dict) -> None:
+    if not reaction_audit_log_enabled():
+        return
+    path = state_dir / REACTION_AUDIT_FILENAME
+    safe = dict(row)
+    if "emoji" in safe:
+        safe["emoji"] = sanitize_log_text(str(safe["emoji"]), 64)
+    if "detail" in safe:
+        safe["detail"] = sanitize_log_text(str(safe["detail"]), 300)
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(safe, ensure_ascii=False) + "\n")
+
+
+def process_reaction_signal_updates(
+    updates: list[dict],
+    entries: list[dict],
+    ledger: dict,
+    token: str,
+    chat_id: str,
+    state_dir: Path | None = None,
+    learning: dict | None = None,
+    persist_learning: bool = True,
+) -> tuple[list[dict], dict, bool]:
+    """Map message_reaction emoji to confirm|reject|defer (same semantics as inline buttons)."""
+    if not reaction_signals_env_enabled():
+        return entries, ledger, False
+    rmap = merged_reaction_signal_map()
+    if not rmap:
+        return entries, ledger, False
+
+    learning_changed = False
+    defer_limit = _env_int("INTENT_FEEDBACK_DEFER_LIMIT", DEFAULT_DEFER_LIMIT)
+
+    for update in updates:
+        mr = update.get("message_reaction")
+        if not mr:
+            continue
+        chat = mr.get("chat") or {}
+        now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        msg_id = mr.get("message_id")
+        new_reactions = mr.get("new_reaction") or []
+
+        if chat_id and str(chat.get("id") or "") != str(chat_id):
+            if state_dir is not None:
+                append_reaction_audit(
+                    state_dir,
+                    {"at": now_iso, "update_id": update.get("update_id"), "message_id": msg_id, "result": "wrong_chat"},
+                )
+            continue
+
+        emoji, action = first_mapped_reaction_action(new_reactions, rmap)
+
+        if not new_reactions:
+            if state_dir is not None:
+                append_reaction_audit(
+                    state_dir,
+                    {"at": now_iso, "message_id": msg_id, "result": "reaction_cleared"},
+                )
+            continue
+
+        if not emoji or not action:
+            em_preview = sanitize_log_text(
+                json.dumps(
+                    [str((r or {}).get("emoji") or "") for r in new_reactions if isinstance(r, dict)],
+                    ensure_ascii=False,
+                ),
+                200,
+            )
+            if state_dir is not None:
+                append_reaction_audit(
+                    state_dir,
+                    {
+                        "at": now_iso,
+                        "message_id": msg_id,
+                        "result": "unmapped_emoji",
+                        "detail": em_preview,
+                    },
+                )
+            continue
+
+        matched = next(
+            (e for e in entries if str(e.get("telegram_message_id") or "") == str(msg_id)),
+            None,
+        )
+        if not matched:
+            if state_dir is not None:
+                append_reaction_audit(
+                    state_dir,
+                    {
+                        "at": now_iso,
+                        "message_id": msg_id,
+                        "emoji": emoji,
+                        "result": "no_queue_entry",
+                    },
+                )
+            continue
+
+        ikey = matched["claude_idempotency_key"]
+        key16 = ikey[:16]
+        synthetic = _synthetic_callback_query(msg_id, chat.get("id"))
+
+        prior_state = str(matched.get("state", "") or "")
+        prior_signal = str(matched.get("feedback_signal", "") or "")
+        previous_taps = count_tap_traces(state_dir, ikey) if state_dir is not None else int(matched.get("tap_count") or 0)
+        tap_number = previous_taps + 1
+        matched["tap_count"] = tap_number
+
+        if _is_duplicate_callback(matched, synthetic):
+            if state_dir is not None:
+                append_reaction_audit(
+                    state_dir,
+                    {
+                        "at": now_iso,
+                        "message_id": msg_id,
+                        "emoji": emoji,
+                        "key16": key16,
+                        "result": "duplicate",
+                    },
+                )
+            _record_tap(
+                state_dir,
+                matched,
+                synthetic,
+                key16,
+                str(action),
+                False,
+                prior_state,
+                prior_state,
+                prior_signal,
+                prior_signal,
+                "Already recorded.",
+                tap_number,
+                now_iso,
+                interaction="reaction",
+            )
+            continue
+
+        sig, lc = _apply_signal_transition(matched, str(action), defer_limit, now_iso, learning)
+        learning_changed = learning_changed or lc
+        _merge_signal_into_ledger(ledger, ikey, matched, sig, now_iso)
+
+        remove_callback_keyboard(token, synthetic, matched)
+        ack = {
+            "confirmed": "✓ Noted",
+            "rejected": "✗ Noted",
+            "deferred": "→ Snoozed 24h",
+            "expired_defer_limit": "Expired after too many defers",
+        }.get(sig, "OK")
+        _record_tap(
+            state_dir,
+            matched,
+            synthetic,
+            key16,
+            str(action),
+            True,
+            prior_state,
+            str(matched.get("state", "") or ""),
+            prior_signal,
+            sig,
+            ack,
+            tap_number,
+            now_iso,
+            interaction="reaction",
+        )
+        if state_dir is not None:
+            append_reaction_audit(
+                state_dir,
+                {
+                    "at": now_iso,
+                    "message_id": msg_id,
+                    "emoji": emoji,
+                    "key16": key16,
+                    "signal": sig,
+                    "result": "accepted",
+                },
+            )
+        _log("reaction", f"emoji={emoji!r} -> {sig} key={key16}")
+
+    if learning_changed and persist_learning and state_dir is not None and learning is not None:
+        save_feedback_learning(state_dir, learning)
+
+    return entries, ledger, learning_changed
+
+
 # ---------------------------------------------------------------------------
 # Core logic
 # ---------------------------------------------------------------------------
@@ -630,9 +1137,12 @@ def process_callback_updates(
     ledger: dict,
     token: str,
     state_dir: Path | None = None,
-) -> tuple[list[dict], dict]:
-    """Apply callback taps to queue entries and ledger. Returns updated (entries, ledger)."""
-    learning = load_feedback_learning(state_dir) if state_dir is not None else None
+    learning: dict | None = None,
+    persist_learning: bool = True,
+) -> tuple[list[dict], dict, bool]:
+    """Apply callback taps to queue entries and ledger. Returns (entries, ledger, learning_changed)."""
+    if learning is None and state_dir is not None:
+        learning = load_feedback_learning(state_dir)
     learning_changed = False
     defer_limit = _env_int("INTENT_FEEDBACK_DEFER_LIMIT", DEFAULT_DEFER_LIMIT)
 
@@ -683,47 +1193,9 @@ def process_callback_updates(
             _log("callback", f"duplicate tap key={key16} action={action} tap_number={tap_number}")
             continue
 
-        if action == "defer":
-            defer_count = int(matched.get("defer_count") or 0) + 1
-            matched["defer_count"] = defer_count
-            if defer_count > defer_limit:
-                matched["state"] = "expired"
-                matched["feedback_signal"] = "expired_defer_limit"
-                matched["expires_at"] = now_iso
-                matched["telegram_message_id"] = None
-                _log("callback", f"expired key={key16} after defer_count={defer_count}")
-                signal_label = "expired_defer_limit"
-            else:
-                new_send_after = (
-                    datetime.now(timezone.utc) + timedelta(seconds=DEFER_DELAY_SECS)
-                ).isoformat(timespec="seconds")
-                matched["state"] = "pending"
-                matched["send_after"] = new_send_after
-                matched["telegram_message_id"] = None
-                matched["feedback_signal"] = "deferred"
-                _log("callback", f"deferred key={key16} count={defer_count} new send_after={new_send_after}")
-                signal_label = "deferred"
-        else:
-            signal_label = "confirmed" if action == "confirm" else "rejected"
-            matched["state"] = "responded"
-            matched["feedback_signal"] = signal_label
-            _log("callback", f"{signal_label} key={key16}")
-            if learning is not None:
-                _record_feedback_learning(learning, matched, signal_label, now_iso)
-                learning_changed = True
-
-        # Write feedback_signal to ledger entry (record it even for defer)
-        if ikey in ledger:
-            ledger[ikey]["feedback_signal"] = signal_label
-            ledger[ikey]["feedback_received_at"] = now_iso
-            ledger[ikey]["title"] = matched.get("title", ledger[ikey].get("title", ""))
-            ledger[ikey]["category"] = matched.get("category", ledger[ikey].get("category", ""))
-            ledger[ikey]["urgency"] = matched.get("urgency", ledger[ikey].get("urgency", ""))
-            ledger[ikey]["intent_class"] = matched.get("intent_class", ledger[ikey].get("intent_class", ""))
-            ledger[ikey]["action"] = matched.get("action", ledger[ikey].get("action", ""))
-            ledger[ikey]["defer_count"] = matched.get("defer_count", ledger[ikey].get("defer_count", 0))
-        else:
-            _vlog("callback", f"ledger entry not found for {ikey[:16]} — signal recorded in queue only")
+        signal_label, lc = _apply_signal_transition(matched, action, defer_limit, now_iso, learning)
+        learning_changed = learning_changed or lc
+        _merge_signal_into_ledger(ledger, ikey, matched, signal_label, now_iso)
 
         ack = {
             "confirmed": "✓ Noted",
@@ -739,9 +1211,9 @@ def process_callback_updates(
             prior_signal, signal_label, ack, tap_number, now_iso,
         )
 
-    if learning_changed and state_dir is not None and learning is not None:
+    if learning_changed and persist_learning and state_dir is not None and learning is not None:
         save_feedback_learning(state_dir, learning)
-    return entries, ledger
+    return entries, ledger, learning_changed
 
 
 def send_due_messages(
@@ -979,7 +1451,17 @@ def process_message_updates(
     token: str,
     chat_id: str,
     state_dir: Path | None = None,
-) -> list[dict]:
+    ledger: dict | None = None,
+    learning: dict | None = None,
+    persist_learning: bool = True,
+) -> tuple[list[dict], dict | None, bool]:
+    """Route inbound text to clarification; optionally apply INTENT_REPLY_LEARNING_MODE signal."""
+    if learning is None and state_dir is not None:
+        learning = load_feedback_learning(state_dir)
+    learning_changed = False
+    defer_limit = _env_int("INTENT_FEEDBACK_DEFER_LIMIT", DEFAULT_DEFER_LIMIT)
+    mode = reply_learning_mode()
+
     for update in updates:
         msg = update.get("message")
         if not msg:
@@ -1018,7 +1500,11 @@ def process_message_updates(
                 continue
             matched = unanswered[0]
             _log("clarify", f"freeform routed to msg_id={matched.get('telegram_message_id')}: {text[:80]!r}")
+
+        prior_state = str(matched.get("state") or "")
+        prior_signal = str(matched.get("feedback_signal") or "")
         _apply_clarification(matched, text, token, chat_id)
+
         if state_dir is not None:
             append_reply_trace(
                 state_dir,
@@ -1027,13 +1513,66 @@ def process_message_updates(
                     "update_id": update.get("update_id"),
                     "claude_idempotency_key": matched.get("claude_idempotency_key", ""),
                     "telegram_message_id": matched.get("telegram_message_id"),
-                    "reply_text_preview": text[:500],
+                    "reply_text_preview": sanitize_log_text(text, 500),
                     "reply_threaded": reply_threaded,
                     "clarification_applied": bool(matched.get("clarification_applied")),
                     "intent_class": matched.get("intent_class", ""),
                 },
             )
-    return entries
+
+        if (
+            ledger is not None
+            and learning is not None
+            and mode in ("confirm", "reject", "defer")
+            and prior_state == "sent"
+            and not prior_signal
+        ):
+            action = mode
+            ikey = matched["claude_idempotency_key"]
+            key16 = ikey[:16]
+            msg_id = matched.get("telegram_message_id")
+            synthetic = _synthetic_callback_query(msg_id, chat_id)
+            previous_taps = count_tap_traces(state_dir, ikey) if state_dir is not None else int(matched.get("tap_count") or 0)
+            tap_number = previous_taps + 1
+            matched["tap_count"] = tap_number
+            now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            if _is_duplicate_callback(matched, synthetic):
+                continue
+            sig, lc = _apply_signal_transition(matched, action, defer_limit, now_iso, learning)
+            learning_changed = learning_changed or lc
+            _merge_signal_into_ledger(ledger, ikey, matched, sig, now_iso)
+            if msg_id and token and chat_id:
+                try:
+                    edit_message_reply_markup(token, chat_id, msg_id)
+                except Exception as exc:
+                    _vlog("reply-learn", f"editMessageReplyMarkup failed: {exc}")
+            ack = {
+                "confirmed": "✓ Noted",
+                "rejected": "✗ Noted",
+                "deferred": "→ Snoozed 24h",
+                "expired_defer_limit": "Expired after too many defers",
+            }.get(sig, "OK")
+            _record_tap(
+                state_dir,
+                matched,
+                synthetic,
+                key16,
+                action,
+                True,
+                prior_state,
+                str(matched.get("state") or ""),
+                prior_signal,
+                sig,
+                ack,
+                tap_number,
+                now_iso,
+                interaction="reply",
+            )
+
+    if learning_changed and persist_learning and state_dir is not None and learning is not None:
+        save_feedback_learning(state_dir, learning)
+
+    return entries, ledger, learning_changed
 
 
 def _process_updates_for_state(
@@ -1047,9 +1586,43 @@ def _process_updates_for_state(
     process_reaction_spike_updates(updates, state_dir)
     entries = load_feedback_queue(state_dir)
     ledger = load_ledger(state_dir)
-    entries, ledger = process_callback_updates(updates, entries, ledger, token, state_dir=state_dir)
+    learning = load_feedback_learning(state_dir)
+
+    entries, ledger, lc_r = process_reaction_signal_updates(
+        updates,
+        entries,
+        ledger,
+        token,
+        chat_id,
+        state_dir=state_dir,
+        learning=learning,
+        persist_learning=False,
+    )
+    entries, ledger, lc_c = process_callback_updates(
+        updates,
+        entries,
+        ledger,
+        token,
+        state_dir=state_dir,
+        learning=learning,
+        persist_learning=False,
+    )
+    lc_m = False
     if chat_id:
-        entries = process_message_updates(updates, entries, token, chat_id, state_dir=state_dir)
+        entries, ledger, lc_m = process_message_updates(
+            updates,
+            entries,
+            token,
+            chat_id,
+            state_dir=state_dir,
+            ledger=ledger,
+            learning=learning,
+            persist_learning=False,
+        )
+
+    if lc_r or lc_c or lc_m:
+        save_feedback_learning(state_dir, learning)
+
     save_ledger(state_dir, ledger)
     save_feedback_queue(state_dir, entries)
     new_offset = max(u["update_id"] for u in updates) + 1

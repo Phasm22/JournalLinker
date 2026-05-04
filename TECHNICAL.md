@@ -120,10 +120,13 @@ Unset behavior preserves legacy pipelines; set flags in `~/.config/journal-linke
 
 Other useful intent variables (see the script docstring in-repo): `INTENT_GATE_MODEL`, `INTENT_ROUTING_MODEL`, `INTENT_STATE_DIR`, `INTENT_FEEDBACK_DELAY_TODAY`, `INTENT_FEEDBACK_DELAY_SOON`, `INTENT_CORTEX_DIR`, `OPENAI_API_KEY`, and the same `SCRIBE_PUSHOVER_*` keys as daily reflection.
 
-### Telegram design contract + reaction spike
+### Telegram design contract + reactions + reply learning
 
-- Design notes and handler mapping (current vs target): [`docs/intent-telegram-design-contract.md`](docs/intent-telegram-design-contract.md).
-- `INTENT_TELEGRAM_REACTION_SPIKE` — set to `1`/`true`/`on` to subscribe to Bot API `message_reaction` updates and append raw events to `intent_feedback_reaction_spike.jsonl` under `INTENT_STATE_DIR` (debug only; no ledger/learning updates). Default off.
+- Design notes and handler mapping: [`docs/intent-telegram-design-contract.md`](docs/intent-telegram-design-contract.md).
+- **`message_reaction` (UAT default on)** — `getUpdates` subscribes when the merged emoji map is non-empty (built-in map plus optional `INTENT_REACTION_SIGNAL_MAP` JSON). Emoji map to the same three signals as inline buttons (`confirm` / `reject` / `defer`), update queue + ledger + learning, remove the keyboard, append tap trace with `interaction=reaction`, and append **`intent_feedback_reaction_audit.jsonl`** (one row per event; `INTENT_REACTION_AUDIT_LOG=off` disables). Set **`INTENT_REACTION_SIGNALS=off`** to turn off production reaction handling (and drop the extra subscription if spike is also off). Set **`INTENT_REACTION_BUILTIN_MAP=off`** to use only your JSON overrides.
+- **`INTENT_TELEGRAM_REACTION_SPIKE`** — `1`/`true`/`on` adds a second sanitized debug stream to `intent_feedback_reaction_spike.jsonl` (same `message_reaction` updates, structured summary only). Optional.
+- **`INTENT_REPLY_LEARNING_MODE`** — default **`confirm`**: after a routed clarifying reply, apply the same transition as tapping **Done** (ledger + learning + keyboard removal; tap trace `interaction=reply`). Use **`off`** to only run surgical edit + reply trace without closing the check-in. **`reject`** / **`defer`** map to those button semantics.
+- **`INTENT_TELEGRAM_REPLY_TRACE`** — `off` disables `intent_feedback_reply_trace.jsonl`. Previews are sanitized (length-limited, control chars stripped).
 - Time-boxed live trial (duration or `--until` datetime): [`scripts/telegram_live_trial.sh`](scripts/telegram_live_trial.sh) — wraps `timeout` around `feedback_sender.py --daemon`; see docstring in that script.
 - **409 Conflict on `getUpdates`:** only one long-poll client per bot. Stop `journal-linker-feedback-sender.service` before running a second daemon: `systemctl --user stop journal-linker-feedback-sender.service`.
 
@@ -135,7 +138,8 @@ Other useful intent variables (see the script docstring in-repo): `INTENT_GATE_M
 | 2. Inbound ping | `python3 scripts/telegram_smoke_test.py --send "journalLinker smoke"` | One outbound message; still no `getUpdates`. |
 | 3. Long-poll trial | `./scripts/telegram_live_trial.sh --minutes 30 --verbose` | Stop systemd feedback sender first; exercises callbacks/replies/reaction spike. |
 | 4. Unit tests | `.venv/bin/python -m pytest tests/test_feedback_sender.py -q` | Mocked HTTP — no real Telegram. |
-| 5. Reply trace | `INTENT_STATE_DIR/…/intent_feedback_reply_trace.jsonl` | One line per inbound text reply that was routed to a check-in (live daemon or trial). `INTENT_TELEGRAM_REPLY_TRACE=off` disables. |
+| 5. Reply trace | `…/intent_feedback_reply_trace.jsonl` | One line per routed clarifying reply (sanitized preview). |
+| 6. Reaction audit | `…/intent_feedback_reaction_audit.jsonl` | One line per `message_reaction` processing attempt (`accepted`, `duplicate`, `unmapped_emoji`, etc.). |
 
 ### Telegram feedback pressure controls
 
