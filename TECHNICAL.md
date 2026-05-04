@@ -127,6 +127,15 @@ Other useful intent variables (see the script docstring in-repo): `INTENT_GATE_M
 - Time-boxed live trial (duration or `--until` datetime): [`scripts/telegram_live_trial.sh`](scripts/telegram_live_trial.sh) — wraps `timeout` around `feedback_sender.py --daemon`; see docstring in that script.
 - **409 Conflict on `getUpdates`:** only one long-poll client per bot. Stop `journal-linker-feedback-sender.service` before running a second daemon: `systemctl --user stop journal-linker-feedback-sender.service`.
 
+**Testing Telegram (pick a lane):**
+
+| Step | Command | Notes |
+|------|---------|--------|
+| 1. Credentials | `python3 scripts/telegram_smoke_test.py` | `getMe` only — safe with daemon running. |
+| 2. Inbound ping | `python3 scripts/telegram_smoke_test.py --send "journalLinker smoke"` | One outbound message; still no `getUpdates`. |
+| 3. Long-poll trial | `./scripts/telegram_live_trial.sh --minutes 30 --verbose` | Stop systemd feedback sender first; exercises callbacks/replies/reaction spike. |
+| 4. Unit tests | `.venv/bin/python -m pytest tests/test_feedback_sender.py -q` | Mocked HTTP — no real Telegram. |
+
 ### Telegram feedback pressure controls
 
 - `INTENT_FEEDBACK_MAX_UNANSWERED` (default `3`): hard cap on unanswered sent check-ins before new due prompts are delayed.

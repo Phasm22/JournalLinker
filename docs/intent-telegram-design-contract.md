@@ -56,6 +56,12 @@ These are **design intents**; track implementation in PRs/issues.
 - Whether surgical edit remains **opt-in** (prefix/command) vs default on reply.
 - Supergroups vs private chat: reaction availability differs; document your chat id mode.
 
+## Testing Telegram (quick reference)
+
+1. **`scripts/telegram_smoke_test.py`** — `getMe` (+ optional `--send "text"`). Does **not** call `getUpdates`, so it will not conflict with `feedback_sender` long-poll.
+2. **`scripts/telegram_live_trial.sh`** — time-boxed `feedback_sender.py --daemon` for live buttons/replies/reactions. Stop `journal-linker-feedback-sender.service` first to avoid HTTP 409.
+3. **`pytest tests/test_feedback_sender.py`** — mocked Telegram API (offline CI).
+
 ## Live trial (time-boxed daemon)
 
 Use a **deadline or duration** instead of leaving the daemon running indefinitely while you experiment.
