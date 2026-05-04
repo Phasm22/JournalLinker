@@ -7,7 +7,13 @@
 #
 # Optional:
 #   TRIAL_SPIKE=1 (default) sets INTENT_TELEGRAM_REACTION_SPIKE=1 for raw reaction logging.
+#   TRIAL_SKIP_CONFLICT_CHECK=1 — skip the exclusive bot check (you will get HTTP 409 if another
+#       getUpdates client is still running).
 #   Extra args pass through to feedback_sender.py (e.g. --verbose).
+#
+# Telegram allows only ONE active getUpdates long-poll per bot token. Stop the systemd feedback
+# sender first if installed:
+#   systemctl --user stop journal-linker-feedback-sender.service
 #
 # Requires: GNU date (Ubuntu), coreutils timeout.
 set -euo pipefail
@@ -70,6 +76,31 @@ if [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_CHAT_ID:-}" ]]; then
   echo "  Example: set -a && source ~/.config/journal-linker/journal-linker.env && set +a" >&2
   exit 10
 fi
+
+# Only one client may call getUpdates per bot; otherwise Telegram returns HTTP 409 Conflict.
+trial_check_exclusive_feedback_sender() {
+  if [[ "${TRIAL_SKIP_CONFLICT_CHECK:-}" == "1" ]]; then
+    echo "[trial] skipping conflict check (TRIAL_SKIP_CONFLICT_CHECK=1)"
+    return 0
+  fi
+  local unit="journal-linker-feedback-sender.service"
+  if command -v systemctl >/dev/null 2>&1; then
+    if systemctl --user is-active --quiet "$unit" 2>/dev/null; then
+      echo "[trial] ERROR: ${unit} is active — it is already long-polling this bot (HTTP 409 if you run another)." >&2
+      echo "  Run:  systemctl --user stop ${unit}" >&2
+      echo "  Then re-run this trial. Override: TRIAL_SKIP_CONFLICT_CHECK=1 ./scripts/telegram_live_trial.sh ..." >&2
+      exit 11
+    fi
+  fi
+  if pgrep -f 'feedback_sender\.py' >/dev/null 2>&1; then
+    echo "[trial] ERROR: feedback_sender.py already running (PIDs: $(pgrep -f 'feedback_sender\.py' | tr '\n' ' '))." >&2
+    echo "  Stop those processes or: systemctl --user stop ${unit}" >&2
+    echo "  Override: TRIAL_SKIP_CONFLICT_CHECK=1 ..." >&2
+    exit 11
+  fi
+}
+
+trial_check_exclusive_feedback_sender
 
 STATE_DIR="${INTENT_STATE_DIR:-$HOME/.local/state/journal-linker/intents}"
 echo "[trial] INTENT_STATE_DIR=$STATE_DIR"

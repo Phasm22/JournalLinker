@@ -109,6 +109,7 @@ Other useful intent variables (see the script docstring in-repo): `INTENT_GATE_M
 - Design notes and handler mapping (current vs target): [`docs/intent-telegram-design-contract.md`](docs/intent-telegram-design-contract.md).
 - `INTENT_TELEGRAM_REACTION_SPIKE` — set to `1`/`true`/`on` to subscribe to Bot API `message_reaction` updates and append raw events to `intent_feedback_reaction_spike.jsonl` under `INTENT_STATE_DIR` (debug only; no ledger/learning updates). Default off.
 - Time-boxed live trial (duration or `--until` datetime): [`scripts/telegram_live_trial.sh`](scripts/telegram_live_trial.sh) — wraps `timeout` around `feedback_sender.py --daemon`; see docstring in that script.
+- **409 Conflict on `getUpdates`:** only one long-poll client per bot. Stop `journal-linker-feedback-sender.service` before running a second daemon: `systemctl --user stop journal-linker-feedback-sender.service`.
 
 ### Telegram feedback pressure controls
 

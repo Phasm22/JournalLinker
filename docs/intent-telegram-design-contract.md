@@ -69,6 +69,12 @@ Use a **deadline or duration** instead of leaving the daemon running indefinitel
 
 Default **`TRIAL_SPIKE=1`** turns on `INTENT_TELEGRAM_REACTION_SPIKE` so reactions append to `intent_feedback_reaction_spike.jsonl` for inspection.
 
+**HTTP 409 Conflict (`getUpdates`)** — Telegram allows **only one** active long-poll client per bot token. If `journal-linker-feedback-sender.service` (or another `feedback_sender.py --daemon`) is running, stop it before a trial:
+
+`systemctl --user stop journal-linker-feedback-sender.service`
+
+The trial script refuses to start if that unit is active or another `feedback_sender.py` is running (override with `TRIAL_SKIP_CONFLICT_CHECK=1` only if you know what you are doing).
+
 **Container?** Usually unnecessary for this solo bot: the trial script + env file give an isolated *time window* without Docker overhead. Use a container only if you want a throwaway token/chat pair.
 
 ## Related env vars
