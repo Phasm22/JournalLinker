@@ -104,6 +104,11 @@ Unset behavior preserves legacy pipelines; set flags in `~/.config/journal-linke
 
 Other useful intent variables (see the script docstring in-repo): `INTENT_GATE_MODEL`, `INTENT_ROUTING_MODEL`, `INTENT_STATE_DIR`, `INTENT_FEEDBACK_DELAY_TODAY`, `INTENT_FEEDBACK_DELAY_SOON`, `INTENT_CORTEX_DIR`, `OPENAI_API_KEY`, and the same `SCRIBE_PUSHOVER_*` keys as daily reflection.
 
+### Telegram design contract + reaction spike
+
+- Design notes and handler mapping (current vs target): [`docs/intent-telegram-design-contract.md`](docs/intent-telegram-design-contract.md).
+- `INTENT_TELEGRAM_REACTION_SPIKE` — set to `1`/`true`/`on` to subscribe to Bot API `message_reaction` updates and append raw events to `intent_feedback_reaction_spike.jsonl` under `INTENT_STATE_DIR` (debug only; no ledger/learning updates). Default off.
+
 ### Telegram feedback pressure controls
 
 - `INTENT_FEEDBACK_MAX_UNANSWERED` (default `3`): hard cap on unanswered sent check-ins before new due prompts are delayed.

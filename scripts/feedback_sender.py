@@ -26,6 +26,9 @@ Env vars:
     INTENT_FEEDBACK_SEND_INTERVAL   due-message scan interval seconds (default: 60)
     INTENT_FEEDBACK_QUIET_START     quiet-hours start, local hour 0-23 (default: 22)
     INTENT_FEEDBACK_QUIET_END       quiet-hours end, local hour 0-23 (default: 8)
+    INTENT_TELEGRAM_REACTION_SPIKE  1|true|on — subscribe to message_reaction updates and append
+                                    JSON lines to intent_feedback_reaction_spike.jsonl (debug only;
+                                    does not update ledger or learning). Default off.
 """
 
 import argparse
@@ -47,6 +50,7 @@ LEDGER_FILENAME = "intent_delivery_ledger.jsonl"
 OFFSET_FILENAME = "telegram_update_offset.txt"
 FEEDBACK_LEARNING_FILENAME = "intent_feedback_learning.json"
 FEEDBACK_TAP_TRACE_FILENAME = "intent_feedback_tap_trace.jsonl"
+REACTION_SPIKE_FILENAME = "intent_feedback_reaction_spike.jsonl"
 DEFER_DELAY_SECS = 86400  # 24h re-queue on defer
 DEFAULT_DEFER_LIMIT = 3
 DEFAULT_MAX_PER_SOURCE_PER_RUN = 1
@@ -129,13 +133,47 @@ def _tg_request(token: str, method: str, payload: dict, request_timeout: int = 1
         raise RuntimeError(f"Telegram {method} HTTP {exc.code}: {body[:300]}") from exc
 
 
+def reaction_spike_enabled() -> bool:
+    """True when INTENT_TELEGRAM_REACTION_SPIKE requests raw reaction logging (Bot API 7+)."""
+    raw = os.getenv("INTENT_TELEGRAM_REACTION_SPIKE", "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def build_allowed_updates() -> list[str]:
+    allowed = ["callback_query", "message"]
+    if reaction_spike_enabled():
+        allowed.append("message_reaction")
+    return allowed
+
+
 def get_updates(token: str, offset: int, timeout: int = 0) -> list[dict]:
     result = _tg_request(token, "getUpdates", {
         "offset": offset,
         "timeout": timeout,
-        "allowed_updates": ["callback_query", "message"],
+        "allowed_updates": build_allowed_updates(),
     }, request_timeout=max(15, timeout + 10))
     return result.get("result", [])
+
+
+def append_reaction_spike_log(state_dir: Path, update: dict) -> None:
+    """Append one JSON line for a message_reaction update (spike / diagnostics only)."""
+    path = state_dir / REACTION_SPIKE_FILENAME
+    record = {
+        "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "update_id": update.get("update_id"),
+        "message_reaction": update.get("message_reaction"),
+    }
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    _log("reaction-spike", f"logged update_id={update.get('update_id')}")
+
+
+def process_reaction_spike_updates(updates: list[dict], state_dir: Path | None) -> None:
+    if state_dir is None or not reaction_spike_enabled():
+        return
+    for update in updates:
+        if update.get("message_reaction"):
+            append_reaction_spike_log(state_dir, update)
 
 
 def send_message(token: str, chat_id: str, text: str, reply_markup: dict) -> dict:
@@ -970,6 +1008,7 @@ def _process_updates_for_state(
 ) -> None:
     if not updates:
         return
+    process_reaction_spike_updates(updates, state_dir)
     entries = load_feedback_queue(state_dir)
     ledger = load_ledger(state_dir)
     entries, ledger = process_callback_updates(updates, entries, ledger, token, state_dir=state_dir)

@@ -471,5 +471,42 @@ class TestFeedbackSenderSendCaps(unittest.TestCase):
         self.assertEqual(text, "Did you pay Jill &amp; Marcus?")
 
 
+class TestReactionSpike(unittest.TestCase):
+    def test_build_allowed_updates_default(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(fs.build_allowed_updates(), ["callback_query", "message"])
+
+    def test_build_allowed_updates_includes_reaction_when_spike_on(self):
+        with mock.patch.dict(os.environ, {"INTENT_TELEGRAM_REACTION_SPIKE": "1"}):
+            self.assertEqual(
+                fs.build_allowed_updates(),
+                ["callback_query", "message", "message_reaction"],
+            )
+
+    def test_append_reaction_spike_log_writes_jsonl(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_dir = Path(tmpdir)
+            update = {
+                "update_id": 42,
+                "message_reaction": {"chat": {"id": 1}, "message_id": 7},
+            }
+            fs.append_reaction_spike_log(state_dir, update)
+            path = state_dir / fs.REACTION_SPIKE_FILENAME
+            self.assertTrue(path.exists())
+            row = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
+            self.assertEqual(row["update_id"], 42)
+            self.assertEqual(row["message_reaction"]["message_id"], 7)
+
+    def test_process_reaction_spike_skipped_when_disabled(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_dir = Path(tmpdir)
+            with mock.patch.dict(os.environ, {}, clear=True):
+                fs.process_reaction_spike_updates(
+                    [{"update_id": 1, "message_reaction": {"x": 1}}],
+                    state_dir,
+                )
+            self.assertFalse((state_dir / fs.REACTION_SPIKE_FILENAME).exists())
+
+
 if __name__ == "__main__":
     unittest.main()
