@@ -12,5 +12,8 @@ __pycache__/
 scribe_learning.json
 daily_reflection_state.json
 
+# Local backups (never commit — large and machine-specific)
+*.bak
+
 # OS / editor
 .DS_Store

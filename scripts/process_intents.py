@@ -793,6 +793,13 @@ ROUTING_SYSTEM_PROMPT = (
     "unless that is how the user naturally writes. Short, casual, first-person phrasing is preferred over "
     "analytical. Good examples: 'you get those SPDs sorted?', 'ended up renaming that file?', "
     "'commit to the shoe thing?'. Never start with What, How, Why, Which, or Who.\n"
+    "Variety (Telegram check-ins): when style_examples exist under feedback_context for this intent_class, "
+    "write feedback_prompt so it does not reuse the same opening phrase or sentence skeleton as those examples "
+    "(change opener, length, and shape — fragment vs full question vs trailing tag). "
+    "Across different intents in one journal batch, avoid converging on one template (for example only "
+    "'you get … sorted?' or only 'did you …'). Rotate registers: blunt fragment ('laundry before work tho?'), "
+    "soft check-in ('still aiming for that long run?'), playful hypotheticals. "
+    "One crisp line is enough; depth accumulates from calibration over time, not from repeating one interrogative mold.\n"
     "Feedback calibration: if feedback_context is present in the envelope, it contains confirmed/rejected "
     "tap counts and style_examples (recent confirmed feedback_prompt phrases) from the user's Telegram "
     "responses, keyed by intent_class. Use this to calibrate routing:\n"
@@ -983,7 +990,7 @@ def call_routing_model(envelope: dict, model: str, dry_run: bool = False) -> dic
     completion = client.chat.completions.create(
         model=model,
         max_tokens=512,
-        temperature=0.4,
+        temperature=0.45,
         messages=[
             {"role": "system", "content": ROUTING_SYSTEM_PROMPT},
             {"role": "user", "content": user_content},
