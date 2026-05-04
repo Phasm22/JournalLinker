@@ -34,6 +34,7 @@ Single-user capture: **every interaction is signal**. This document locks **curr
 | Reply **threaded** to a check-in message | Text routed to **surgical journal edit** (OpenAI) against source daily note — **not** written to `intent_feedback_learning` as confirm/reject. |
 | Free text, **one** unanswered check-in | Same surgical path for that check-in. |
 | Free text, **zero or multiple** unanswered | Short helper reply; no patch. |
+| **Reply trace** (Sprint 3) | After each clarifying path, one JSON line in `intent_feedback_reply_trace.jsonl` (key, reply preview, `clarification_applied`, `reply_threaded`). Set `INTENT_TELEGRAM_REPLY_TRACE=off` to disable. Does not yet increment button-style learning. |
 
 ### Spike only (optional)
 

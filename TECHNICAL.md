@@ -135,6 +135,7 @@ Other useful intent variables (see the script docstring in-repo): `INTENT_GATE_M
 | 2. Inbound ping | `python3 scripts/telegram_smoke_test.py --send "journalLinker smoke"` | One outbound message; still no `getUpdates`. |
 | 3. Long-poll trial | `./scripts/telegram_live_trial.sh --minutes 30 --verbose` | Stop systemd feedback sender first; exercises callbacks/replies/reaction spike. |
 | 4. Unit tests | `.venv/bin/python -m pytest tests/test_feedback_sender.py -q` | Mocked HTTP — no real Telegram. |
+| 5. Reply trace | `INTENT_STATE_DIR/…/intent_feedback_reply_trace.jsonl` | One line per inbound text reply that was routed to a check-in (live daemon or trial). `INTENT_TELEGRAM_REPLY_TRACE=off` disables. |
 
 ### Telegram feedback pressure controls
 

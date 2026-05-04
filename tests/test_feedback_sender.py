@@ -349,6 +349,50 @@ class TestFeedbackSenderMessages(unittest.TestCase):
         send_plain_mock.assert_called_once()
         self.assertIn("multiple active check-ins", send_plain_mock.call_args.args[2])
 
+    def test_reply_trace_appended_when_state_dir_set(self):
+        latest = TestFeedbackSenderCallbacks()._entry("m" * 64)
+        latest["telegram_message_id"] = 200
+        latest["sent_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        update = {
+            "update_id": 11,
+            "message": {
+                "text": "clarification text",
+                "chat": {"id": "chat"},
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_dir = Path(tmpdir)
+
+            def _fake_apply(entry: dict, text: str, token: str, cid: str) -> None:
+                entry["clarification_applied"] = True
+
+            with mock.patch.object(fs, "_apply_clarification", side_effect=_fake_apply):
+                fs.process_message_updates([update], [latest], "token", "chat", state_dir=state_dir)
+
+            path = state_dir / fs.REPLY_TRACE_FILENAME
+            self.assertTrue(path.exists())
+            row = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
+            self.assertEqual(row["reply_text_preview"], "clarification text")
+            self.assertTrue(row["clarification_applied"])
+            self.assertEqual(row["intent_class"], "task_intent")
+
+    def test_reply_trace_skipped_when_disabled(self):
+        latest = TestFeedbackSenderCallbacks()._entry("m" * 64)
+        latest["telegram_message_id"] = 200
+        latest["sent_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        update = {
+            "update_id": 12,
+            "message": {"text": "x", "chat": {"id": "chat"}},
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_dir = Path(tmpdir)
+            with (
+                mock.patch.dict(os.environ, {"INTENT_TELEGRAM_REPLY_TRACE": "off"}),
+                mock.patch.object(fs, "_apply_clarification"),
+            ):
+                fs.process_message_updates([update], [latest], "token", "chat", state_dir=state_dir)
+            self.assertFalse((state_dir / fs.REPLY_TRACE_FILENAME).exists())
+
 
 class TestFeedbackSenderSendCaps(unittest.TestCase):
     def _pending(self, key, source_file):

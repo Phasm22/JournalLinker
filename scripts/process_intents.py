@@ -2129,6 +2129,8 @@ def cmd_reset_ledger(state_dir: Path) -> int:
         FEEDBACK_QUEUE_FILENAME,
         ACTION_QUEUE_FILENAME,
         CONSENT_FILENAME,
+        "intent_feedback_reply_trace.jsonl",
+        "intent_feedback_reaction_spike.jsonl",
     ):
         p = state_dir / fname
         if p.exists():

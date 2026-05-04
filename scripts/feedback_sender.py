@@ -29,6 +29,8 @@ Env vars:
     INTENT_TELEGRAM_REACTION_SPIKE  1|true|on — subscribe to message_reaction updates and append
                                     JSON lines to intent_feedback_reaction_spike.jsonl (debug only;
                                     does not update ledger or learning). Default off.
+    INTENT_TELEGRAM_REPLY_TRACE     off|false — disable intent_feedback_reply_trace.jsonl for inbound
+                                    text replies (default: on / trace enabled).
 """
 
 import argparse
@@ -51,6 +53,7 @@ OFFSET_FILENAME = "telegram_update_offset.txt"
 FEEDBACK_LEARNING_FILENAME = "intent_feedback_learning.json"
 FEEDBACK_TAP_TRACE_FILENAME = "intent_feedback_tap_trace.jsonl"
 REACTION_SPIKE_FILENAME = "intent_feedback_reaction_spike.jsonl"
+REPLY_TRACE_FILENAME = "intent_feedback_reply_trace.jsonl"
 DEFER_DELAY_SECS = 86400  # 24h re-queue on defer
 DEFAULT_DEFER_LIMIT = 3
 DEFAULT_MAX_PER_SOURCE_PER_RUN = 1
@@ -174,6 +177,23 @@ def process_reaction_spike_updates(updates: list[dict], state_dir: Path | None) 
     for update in updates:
         if update.get("message_reaction"):
             append_reaction_spike_log(state_dir, update)
+
+
+def reply_trace_enabled() -> bool:
+    """Append inbound reply events to JSONL unless INTENT_TELEGRAM_REPLY_TRACE disables."""
+    raw = os.getenv("INTENT_TELEGRAM_REPLY_TRACE", "").strip().lower()
+    if not raw:
+        return True
+    return raw not in ("0", "false", "no", "off")
+
+
+def append_reply_trace(state_dir: Path, record: dict) -> None:
+    if not reply_trace_enabled():
+        return
+    path = state_dir / REPLY_TRACE_FILENAME
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    _vlog("reply-trace", f"logged key={str(record.get('claude_idempotency_key', ''))[:16]}…")
 
 
 def send_message(token: str, chat_id: str, text: str, reply_markup: dict) -> dict:
@@ -958,6 +978,7 @@ def process_message_updates(
     entries: list[dict],
     token: str,
     chat_id: str,
+    state_dir: Path | None = None,
 ) -> list[dict]:
     for update in updates:
         msg = update.get("message")
@@ -970,6 +991,7 @@ def process_message_updates(
         text = (msg.get("text") or "").strip()
         if not text:
             continue
+        reply_threaded = bool(reply_to)
         if reply_to:
             reply_to_id = reply_to.get("message_id")
             matched = next(
@@ -997,6 +1019,20 @@ def process_message_updates(
             matched = unanswered[0]
             _log("clarify", f"freeform routed to msg_id={matched.get('telegram_message_id')}: {text[:80]!r}")
         _apply_clarification(matched, text, token, chat_id)
+        if state_dir is not None:
+            append_reply_trace(
+                state_dir,
+                {
+                    "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "update_id": update.get("update_id"),
+                    "claude_idempotency_key": matched.get("claude_idempotency_key", ""),
+                    "telegram_message_id": matched.get("telegram_message_id"),
+                    "reply_text_preview": text[:500],
+                    "reply_threaded": reply_threaded,
+                    "clarification_applied": bool(matched.get("clarification_applied")),
+                    "intent_class": matched.get("intent_class", ""),
+                },
+            )
     return entries
 
 
@@ -1013,7 +1049,7 @@ def _process_updates_for_state(
     ledger = load_ledger(state_dir)
     entries, ledger = process_callback_updates(updates, entries, ledger, token, state_dir=state_dir)
     if chat_id:
-        entries = process_message_updates(updates, entries, token, chat_id)
+        entries = process_message_updates(updates, entries, token, chat_id, state_dir=state_dir)
     save_ledger(state_dir, ledger)
     save_feedback_queue(state_dir, entries)
     new_offset = max(u["update_id"] for u in updates) + 1
