@@ -1,4 +1,4 @@
-# Same role as launchd VoiceRetry — transient voice failures every 15 minutes.
+# Transient voice failures — same role as launchd VoiceRetry.
 [Unit]
 Description=Journal Linker — voice retry (transient failures)
 After=network-online.target

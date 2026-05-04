@@ -2,8 +2,9 @@
 Description=Journal Linker — poll for daily ntfy reflection window
 
 [Timer]
-OnBootSec=10min
-OnUnitActiveSec=15min
+# Wall-clock every 15m at :02, :17, :32, :47 (offset from quarter-hour).
+# Use OnCalendar, not OnBootSec+OnUnitActiveSec — the latter can yield no next elapse under user systemd.
+OnCalendar=*-*-* *:02/15
 AccuracySec=1min
 Persistent=true
 

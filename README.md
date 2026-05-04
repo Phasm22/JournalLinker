@@ -157,7 +157,7 @@ iOS setup: **[docs/ios-setup.md](./docs/ios-setup.md)**
 
 ## On Linux (systemd)
 
-User units and env templates live under [`systemd/`](./systemd/). Typical flow:
+User units and env templates live under [`systemd/`](./systemd/) (see [`systemd/README.md`](./systemd/README.md) for install, stagger, and why timers use `OnCalendar`). Typical flow:
 
 - Copy or symlink unit files into `~/.config/systemd/user/`, set `JOURNAL_LINKER_REPO` to this repo’s path in `~/.config/journal-linker/journal-linker.env`, then `systemctl --user daemon-reload`.
 - Enable `.path` / `.timer` units for watcher or scheduled jobs. Enable `journal-linker-feedback-sender.service` directly; it is a persistent Telegram long-polling daemon, not a timer.
