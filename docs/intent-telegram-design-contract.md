@@ -56,6 +56,21 @@ These are **design intents**; track implementation in PRs/issues.
 - Whether surgical edit remains **opt-in** (prefix/command) vs default on reply.
 - Supergroups vs private chat: reaction availability differs; document your chat id mode.
 
+## Live trial (time-boxed daemon)
+
+Use a **deadline or duration** instead of leaving the daemon running indefinitely while you experiment.
+
+- Script: [`scripts/telegram_live_trial.sh`](../scripts/telegram_live_trial.sh) wraps `timeout` + `feedback_sender.py --daemon`.
+- Prereq: load Telegram vars first, e.g. `set -a && source ~/.config/journal-linker/journal-linker.env && set +a`.
+- Examples:
+  - `./scripts/telegram_live_trial.sh --minutes 45`
+  - `./scripts/telegram_live_trial.sh --until "2026-05-04 22:00:00"`
+  - `TRIAL_SPIKE=0 ./scripts/telegram_live_trial.sh --minutes 30` — daemon only, no `message_reaction` subscription.
+
+Default **`TRIAL_SPIKE=1`** turns on `INTENT_TELEGRAM_REACTION_SPIKE` so reactions append to `intent_feedback_reaction_spike.jsonl` for inspection.
+
+**Container?** Usually unnecessary for this solo bot: the trial script + env file give an isolated *time window* without Docker overhead. Use a container only if you want a throwaway token/chat pair.
+
 ## Related env vars
 
 See [`TECHNICAL.md`](../TECHNICAL.md): `INTENT_FEEDBACK_MODE`, `INTENT_DIGEST_MODE`, Telegram pressure knobs, and `INTENT_TELEGRAM_REACTION_SPIKE`.
