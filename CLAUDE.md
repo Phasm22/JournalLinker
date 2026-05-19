@@ -74,3 +74,29 @@ SCRIBE_CTX="8192"             # optional
 **`archivist.py`** — separate utility that also uses Ollama and clipboard. Shares the same `SCRIBE_MODEL`/`SCRIBE_CTX` env vars pattern.
 
 **`tests/`** — unittest-based. Fixtures live in `tests/fixtures/`. Tests use `tempfile.TemporaryDirectory` for isolation; no external services are called (Ollama calls are mocked).
+
+## Intent pipeline (`scripts/process_intents.py`)
+
+Separate from Scribe: reads a daily note, decides whether it contains actionable intents, routes each intent with a cloud LLM, then delivers to notification sinks, Obsidian cortex, and optional digests. Tunables and secrets are documented in the **module docstring** at the top of that file.
+
+**Exit codes** (stable for shell wrappers and automation):
+
+| Code | Meaning |
+|------|---------|
+| 0 | Success, or clean skip (no intents, or nothing left to do) |
+| 10 | Permanent failure (unreadable note, bad credentials, schema errors that will not fix themselves) |
+| 20 | Transient gate failure (local model unavailable or timed out) |
+| 30 | Transient routing failure (API rate limit, network) |
+| 40 | Transient delivery failure (e.g. push API error) |
+| 50 | Partial success (some delivery sinks succeeded, others failed — retry delivery only) |
+
+**Pipeline (order of operations):**
+
+1. **State** — Load the delivery ledger; reconcile stale in-flight rows so retries stay safe.
+2. **Read note** — Load journal file text; derive journal time from `YYYY-MM-DD` filename when possible, else file modification time.
+3. **Gate** — Local Ollama runs over short paragraph chunks of the note and emits candidate intents (categories and raw phrases).
+4. **Per intent** — Build an envelope (surrounding context, metadata). Apply suppression when prior feedback says to skip similar wording. Optionally enrich with local cortex search plus best-effort retrieval.
+5. **Route** — OpenAI returns structured JSON (urgency, format, action, title, body, defer date, feedback prompt). Values are validated against fixed enums in code.
+6. **Deliver** — Push to configured sinks (e.g. Pushover, cortex files, digest queue). Record outcomes in the ledger and run history. Optional paths can schedule Telegram feedback check-ins or append digest lines when those features are enabled.
+
+Design tradeoffs and weak spots (gate vs enrichment, recurrence heuristics, time): see [docs/intent-pipeline-risks.md](docs/intent-pipeline-risks.md).
