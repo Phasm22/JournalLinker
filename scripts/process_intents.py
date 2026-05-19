@@ -62,6 +62,7 @@ import json
 import os
 import re
 import sys
+from dataclasses import asdict, dataclass
 import tempfile
 import time as _time
 import traceback
@@ -82,6 +83,30 @@ EXIT_GATE_TRANSIENT = 20
 EXIT_CLAUDE_TRANSIENT = 30
 EXIT_DELIVERY_TRANSIENT = 40
 EXIT_PARTIAL = 50
+
+
+@dataclass
+class RunSummary:
+    source_file: str = ""
+    intents_gated: int = 0
+    intents_delivered: int = 0
+    intents_suppressed: int = 0
+    intents_failed: int = 0
+    retry_queue_in: int = 0
+    retry_queue_out: int = 0
+
+    def to_payload(self) -> dict:
+        return {k: v for k, v in asdict(self).items()}
+
+
+def _finalize_run(exit_code: int, summary: RunSummary) -> int:
+    from journal_linker_telemetry import maybe_write_job_payload
+
+    payload = summary.to_payload()
+    payload["worst_exit_code"] = int(exit_code)
+    maybe_write_job_payload(**payload)
+    return exit_code
+
 
 DEFAULT_GATE_MODEL = "phi4:14b"
 DEFAULT_GATE_STYLE = "auto"
@@ -1738,8 +1763,10 @@ def run_intent_pipeline(
     dry_run: bool,
     verbose: bool,
     existing_idempotency_key: str | None = None,
+    emit_payload: bool = True,
 ) -> int:
     """Run the full intent pipeline for one note. Returns an exit code."""
+    summary = RunSummary(source_file=source_path.name)
     run_id = str(uuid.uuid4())
     created_at = _now_iso()
     _log("intent", f"run_id={run_id} file={source_path.name}")
@@ -1760,7 +1787,8 @@ def run_intent_pipeline(
             "source_path": str(source_path), "status": "failed_permanent",
             "failure": {"stage": "read", "kind": "permanent", "detail": str(exc)},
         })
-        return EXIT_PERMANENT
+        summary.intents_failed = 1
+        return _finalize_run(EXIT_PERMANENT, summary)
 
     # Stat for idempotency
     try:
@@ -1768,7 +1796,8 @@ def run_intent_pipeline(
         source_stat_str = f"{st.st_mtime_ns}:{st.st_size}"
     except Exception as exc:
         _log("intent", f"cannot stat note: {exc}")
-        return EXIT_PERMANENT
+        summary.intents_failed = 1
+        return _finalize_run(EXIT_PERMANENT, summary)
 
     journal_timestamp = infer_journal_timestamp(source_path)
     source_date = journal_timestamp[:10]  # YYYY-MM-DD
@@ -1793,8 +1822,10 @@ def run_intent_pipeline(
         gate_run_record["status"] = "failed_transient"
         gate_run_record["failure"] = {"stage": "gate", "kind": "transient", "detail": str(exc)}
         append_run_record(state_dir, gate_run_record)
-        return EXIT_GATE_TRANSIENT
+        summary.intents_failed = 1
+        return _finalize_run(EXIT_GATE_TRANSIENT, summary)
 
+    summary.intents_gated = len(intents)
     _log("gate", f"found {len(intents)} intent(s)")
     if verbose:
         for item in intents:
@@ -1806,7 +1837,7 @@ def run_intent_pipeline(
         _log("intent", "no intents detected — clean skip")
         gate_run_record["status"] = "skipped_no_intent"
         append_run_record(state_dir, gate_run_record)
-        return EXIT_SUCCESS
+        return _finalize_run(EXIT_SUCCESS, summary)
 
     gate_run_record["status"] = "gate_complete"
     append_run_record(state_dir, gate_run_record)
@@ -1881,6 +1912,7 @@ def run_intent_pipeline(
                 "status": "skipped_suppressed",
                 "suppression": suppression,
             })
+            summary.intents_suppressed += 1
             continue
 
         envelope = build_envelope(
@@ -1981,6 +2013,7 @@ def run_intent_pipeline(
                     "kind": "transient", "enqueued_at": _now_iso(),
                 })
                 worst_exit = max(worst_exit, EXIT_CLAUDE_TRANSIENT)
+                summary.intents_failed += 1
                 continue
 
             run_record["claude"] = {
@@ -2000,6 +2033,7 @@ def run_intent_pipeline(
         if claude_response is None:
             _log("intent", f"no Claude response for intent {intent_index + 1} — skipping")
             worst_exit = max(worst_exit, EXIT_PERMANENT)
+            summary.intents_failed += 1
             continue
 
         clean_response = {k: v for k, v in claude_response.items() if not k.startswith("_")}
@@ -2059,9 +2093,15 @@ def run_intent_pipeline(
                 "kind": "transient", "enqueued_at": _now_iso(),
             })
 
+        if intent_exit == EXIT_SUCCESS:
+            summary.intents_delivered += 1
+        else:
+            summary.intents_failed += 1
         worst_exit = max(worst_exit, intent_exit)
 
     _log("intent", f"done exit_code={worst_exit}")
+    if emit_payload:
+        return _finalize_run(worst_exit, summary)
     return worst_exit
 
 
@@ -2083,9 +2123,10 @@ def run_retry(
 ) -> int:
     """Replay pending transient failures from the retry queue."""
     entries = load_retry_queue(state_dir)
+    summary = RunSummary(retry_queue_in=len(entries))
     if not entries:
         _log("retry", "no entries in retry queue")
-        return EXIT_SUCCESS
+        return _finalize_run(EXIT_SUCCESS, summary)
 
     _log("retry", f"{len(entries)} entr{'y' if len(entries)==1 else 'ies'} in retry queue")
     # Deduplicate: only latest entry per idempotency key
@@ -2116,11 +2157,14 @@ def run_retry(
             dry_run=dry_run,
             verbose=verbose,
             existing_idempotency_key=key,
+            emit_payload=False,
         )
-        if exit_code != EXIT_SUCCESS:
+        if exit_code == EXIT_SUCCESS:
+            summary.retry_queue_out += 1
+        else:
             worst_exit = exit_code
 
-    return worst_exit
+    return _finalize_run(worst_exit, summary)
 
 
 # ---------------------------------------------------------------------------

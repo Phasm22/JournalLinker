@@ -16,49 +16,25 @@
 
 set -euo pipefail
 
-if [[ -z "${HOME:-}" ]]; then
-  export HOME
-  HOME="$(cd ~ && pwd)"
-fi
-
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=job_log_lib.sh
+source "$HERE/job_log_lib.sh"
+
 ROOT="$(cd "$HERE/.." && pwd)"
+JOURNAL_LINKER_ROOT="$ROOT"
 PYTHON="${PYTHON:-$ROOT/ScribeVenv/bin/python3}"
 PROCESS_INTENTS_PY="${PROCESS_INTENTS_PY:-$ROOT/scripts/process_intents.py}"
 
-LOG_DIR="${SCRIBE_JOB_LOG_DIR:-$HOME/.local/state/journal-linker/logs}"
-if ! mkdir -p "$LOG_DIR" 2>/dev/null; then
-  LOG_DIR="/tmp/journal-linker-logs"
-  mkdir -p "$LOG_DIR"
-fi
+job_log_init intent-watcher .intent-job.lock intent
 
-LOCK_DIR="$LOG_DIR/.intent-job.lock"
-if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-  echo "intent_watcher: skipped — another job is running (lock: $LOCK_DIR). If stuck: rmdir \"$LOCK_DIR\"" >&2
-  exit 0
-fi
-trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT INT TERM HUP
-
-RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"
-LOG_FILE="$LOG_DIR/intent-$RUN_ID.log"
-LATEST_LINK="$LOG_DIR/intent-latest.log"
-
-ts() { date "+%Y-%m-%dT%H:%M:%S%z"; }
-
-{
-  echo "=== Intent watcher job $RUN_ID ==="
-  echo "log_file: $LOG_FILE"
-  echo "start: $(ts)"
-  echo "python: $PYTHON"
+job_log_header "Intent watcher job" \
+  echo "python: $PYTHON" \
   echo "script: $PROCESS_INTENTS_PY"
-} | tee "$LOG_FILE"
 
 set +e
 START_EPOCH=$(date +%s)
+SKIP_REASON=""
 
-# Resolve which note to process.
-# Priority: explicit INTENT_NOTE_FILE > most recently modified dated note (last 10 min).
-# If no fresh note found, exit clean — retries are the timer's job, not the path watcher's.
 NOTE_FILE="${INTENT_NOTE_FILE:-}"
 if [[ -z "$NOTE_FILE" && -n "${SCRIBE_JOURNAL_DIR:-}" && -d "${SCRIBE_JOURNAL_DIR}" ]]; then
   NOTE_FILE=$(find "${SCRIBE_JOURNAL_DIR}" -maxdepth 1 -name "????-??-??.md" -mmin -10 \
@@ -72,19 +48,11 @@ if [[ -n "$NOTE_FILE" ]]; then
 else
   echo "no recently modified note found — exiting (retries handled by timer)" | tee -a "$LOG_FILE"
   EXIT=0
+  SKIP_REASON=no_recent_note
 fi
 END_EPOCH=$(date +%s)
 DURATION=$((END_EPOCH - START_EPOCH))
 set -e
 
-{
-  echo "end: $(ts)"
-  echo "duration_sec: $DURATION"
-  echo "exit_code: $EXIT"
-  echo "log_file: $LOG_FILE"
-  echo "latest_symlink: $LATEST_LINK -> $(basename "$LOG_FILE")"
-  echo "=== done ==="
-} | tee -a "$LOG_FILE"
-
-ln -sf "$LOG_FILE" "$LATEST_LINK"
+job_log_footer "$EXIT" "$DURATION" "$SKIP_REASON"
 exit "$EXIT"

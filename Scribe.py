@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from journal_linker_env import bootstrap_journal_linker_env
+from journal_linker_telemetry import maybe_write_job_payload
 from local_embeddings import LocalEmbeddingCache, cosine_similarity as embedding_cosine_similarity, normalize_embedding_text
 
 
@@ -1545,6 +1546,12 @@ def main() -> int:
             error_message,
             file=sys.stderr,
         )
+        maybe_write_job_payload(
+            active_file=str(resolved_note_path) if resolved_note_path else None,
+            write_back=False,
+            links_added=0,
+            error=error_message,
+        )
         return 2
 
     prompt = build_prompt(input_text)
@@ -1706,6 +1713,19 @@ def main() -> int:
             except Exception as wb_err:
                 print(f"[Scribe] write_back failed: {wb_err}", file=sys.stderr)
 
+        input_wikilinks = count_wikilink_markers(input_text)
+        output_wikilinks = count_wikilink_markers(out)
+        write_back_ok = bool(
+            WRITE_BACK
+            and resolved_note_path is not None
+            and "journal_file" in input_body_source
+        )
+        maybe_write_job_payload(
+            active_file=str(resolved_note_path) if resolved_note_path else None,
+            write_back=write_back_ok,
+            links_added=max(0, output_wikilinks - input_wikilinks),
+            ollama_sec=round(t1 - t0, 3) if t0 is not None and t1 is not None else None,
+        )
         print(out)
         return 0
     except Exception as e:
@@ -1745,6 +1765,12 @@ def main() -> int:
         if report_path is not None:
             print(f"[Scribe] report={report_path}", file=sys.stderr)
         print(f"Error: {e}", file=sys.stderr)
+        maybe_write_job_payload(
+            active_file=str(resolved_note_path) if resolved_note_path else None,
+            write_back=False,
+            links_added=0,
+            error=str(e),
+        )
         return 1
 
 

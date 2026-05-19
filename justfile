@@ -251,8 +251,17 @@ doctor:
     @bash -c '[[ -x "{{py}}" ]] && echo "  Venv: OK" || echo "  Venv: missing (see README)"'
     @bash -c 'xdg="${XDG_CONFIG_HOME:-$HOME/.config}"; f="$xdg/journal-linker/journal-linker.env"; [[ -f "$f" ]] && echo "  user env: $f (present)" || echo "  user env: $f (missing)"'
     @bash -c '[[ -f "{{root}}/.env" ]] && echo "  repo .env: present (legacy; set JOURNAL_LINKER_DOTENV=1 to load)" || echo "  repo .env: missing"'
-    @printf '%s\n' \
-      "" \
-      "  Scheduled job logs:  ~/Library/Logs/JournalLinker/ (scribe-*-PID.log, scribe-latest.log)" \
-      "  launchd job name:    com.journal-linker.scribe" \
-      "  More: README.md -> On your Mac"
+    @bash -c 'set -a; \
+      [[ -f "$HOME/.config/journal-linker/journal-linker.env" ]] && . "$HOME/.config/journal-linker/journal-linker.env"; \
+      set +a; \
+      if [[ "$(uname -s)" == "Darwin" ]]; then \
+        logdir="${SCRIBE_JOB_LOG_DIR:-$HOME/Library/Logs/JournalLinker}"; \
+        echo "  Scheduled job logs:  $logdir"; \
+        echo "  Scheduler:           launchd (com.journal-linker.*)"; \
+      else \
+        logdir="${SCRIBE_JOB_LOG_DIR:-$HOME/.local/state/journal-linker}"; \
+        echo "  Scheduled job logs:  $logdir  (not .../logs/ — stale)"; \
+        echo "  Scheduler:           systemd --user (journal-linker-*)"; \
+        echo "  Audit:               journalctl --user -u '\''journal-linker-*'\''"; \
+      fi'
+    @printf '%s\n' "  More: README.md, SERVICE_INTAKE.md"

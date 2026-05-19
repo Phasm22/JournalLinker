@@ -11,41 +11,20 @@
 
 set -euo pipefail
 
-if [[ -z "${HOME:-}" ]]; then
-  export HOME
-  HOME="$(cd ~ && pwd)"
-fi
-
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=job_log_lib.sh
+source "$HERE/job_log_lib.sh"
+
 ROOT="$(cd "$HERE/.." && pwd)"
+JOURNAL_LINKER_ROOT="$ROOT"
 PYTHON="${PYTHON:-$ROOT/ScribeVenv/bin/python3}"
 PROCESS_INTENTS_PY="${PROCESS_INTENTS_PY:-$ROOT/scripts/process_intents.py}"
 
-LOG_DIR="${SCRIBE_JOB_LOG_DIR:-$HOME/.local/state/journal-linker/logs}"
-if ! mkdir -p "$LOG_DIR" 2>/dev/null; then
-  LOG_DIR="/tmp/journal-linker-logs"
-  mkdir -p "$LOG_DIR"
-fi
+job_log_init intent-retry .intent-job.lock intent-retry
 
-# Share lock with intent_watcher so jobs don't overlap.
-LOCK_DIR="$LOG_DIR/.intent-job.lock"
-if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-  echo "intent_retry: skipped — intent job is already running (lock: $LOCK_DIR)" >&2
-  exit 0
-fi
-trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT INT TERM HUP
-
-RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"
-LOG_FILE="$LOG_DIR/intent-retry-$RUN_ID.log"
-LATEST_LINK="$LOG_DIR/intent-retry-latest.log"
-
-ts() { date "+%Y-%m-%dT%H:%M:%S%z"; }
-
-{
-  echo "=== Intent retry job $RUN_ID ==="
-  echo "log_file: $LOG_FILE"
-  echo "start: $(ts)"
-} | tee "$LOG_FILE"
+job_log_header "Intent retry job" \
+  echo "python: $PYTHON" \
+  echo "script: $PROCESS_INTENTS_PY"
 
 set +e
 START_EPOCH=$(date +%s)
@@ -55,12 +34,5 @@ END_EPOCH=$(date +%s)
 DURATION=$((END_EPOCH - START_EPOCH))
 set -e
 
-{
-  echo "end: $(ts)"
-  echo "duration_sec: $DURATION"
-  echo "exit_code: $EXIT"
-  echo "=== done ==="
-} | tee -a "$LOG_FILE"
-
-ln -sf "$LOG_FILE" "$LATEST_LINK"
+job_log_footer "$EXIT" "$DURATION"
 exit "$EXIT"

@@ -208,6 +208,29 @@ python3 vault_mapper.py --min-cooccurrence 3
 - `--min-cooccurrence` controls the minimum link co-occurrence threshold for edges.
 - Suggested cadence: run with weekly insight generation (`python3 weekly_insights.py --update-vault-map`) so `vault_map.md` and weekly summaries stay synchronized.
 
+## Supervised job telemetry
+
+Wrappers (`scripts/scheduled_run.sh`, `daily_reflection.sh`, `voice_*.sh`, `intent_*.sh`, `feedback_sender.sh`) source `scripts/job_log_lib.sh` and finalize via `python -m journal_linker_telemetry finalize`. Entrypoints write service-specific fields with `journal_linker_telemetry.maybe_write_job_payload()` when `JOURNAL_LINKER_JOB_PAYLOAD_FILE` is set. See [`SERVICE_INTAKE.md`](SERVICE_INTAKE.md) for the `JOURNAL_LINKER_EVENT=` schema.
+
+**Linux log root:** `SCRIBE_JOB_LOG_DIR` (typical: `~/.local/state/journal-linker/`). Not `~/Library/Logs/JournalLinker/` (macOS) and not `~/.local/state/journal-linker/logs/` (legacy).
+
+## SQLite schema deploys
+
+When a deploy changes SQLite schema (monitoring app or future journalLinker stores):
+
+```bash
+# 1. Stop or quiesce writers (example)
+systemctl --user stop journal-linker-feedback-sender.service
+
+# 2. Migrate the file on disk
+/path/to/migrate script or CLI
+
+# 3. Restart consumers so they open the DB with new code
+systemctl --user restart journal-linker-feedback-sender.service
+```
+
+Restart is required: a process that opened the DB before migrate keeps the old schema in memory until it exits. Lazy table creation on first connect does not upgrade a already-running daemon.
+
 ## Behavior
 
 - Scribe reads input from argv, stdin, or clipboard.

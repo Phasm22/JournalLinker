@@ -9,7 +9,7 @@ This repository is a local-first journal pipeline for an Obsidian vault. Core sc
 - `daily_reflection.py` - day-behind reflection and push delivery
 - `archivist.py` - standalone clipboard/Ollama helper
 
-Supporting code lives in `scripts/`, with launchd and systemd examples in `launchd/` and `systemd/`. Documentation lives in `docs/`, and tests are under `tests/` with fixtures in `tests/fixtures/`.
+Supporting code lives in `scripts/` (including `scripts/process_intents.py` — intent gate, routing, and delivery pipeline), with launchd and systemd examples in `launchd/` and `systemd/`. Documentation lives in `docs/`, and tests are under `tests/` with fixtures in `tests/fixtures/`.
 
 ## Build, Test, and Development Commands
 
@@ -27,6 +27,21 @@ Direct test execution also works with `python3 -m pytest tests/`. If `just test`
 ## Coding Style & Naming Conventions
 
 This codebase is Python-first. Use 4-space indentation, `snake_case` for functions and files, and `Test...` classes with `test_...` methods. Keep scripts small and explicit; prefer clear control flow over abstraction. Daily note files should follow `YYYY-MM-DD.md`. Follow the existing ASCII-only style unless a file already contains Unicode.
+
+## Supervised job telemetry
+
+Scheduled wrappers under `scripts/` set `JOURNAL_LINKER_JOB_PAYLOAD_FILE` and emit a single `JOURNAL_LINKER_EVENT=` JSON line before `=== done ===` (see [`journal_linker_telemetry.py`](journal_linker_telemetry.py) and [`SERVICE_INTAKE.md`](SERVICE_INTAKE.md)).
+
+On Linux, live logs are under `~/.local/state/journal-linker/` when `SCRIBE_JOB_LOG_DIR` is set (no `/logs` subdir). Use that path or `journalctl --user`, not `~/Library/Logs/JournalLinker/`.
+
+## Deploying schema changes (SQLite)
+
+This repo’s intent pipeline state is **JSONL**, not SQLite. If you add SQLite (e.g. a monitoring registry) or deploy code that changes an existing SQLite schema:
+
+1. **Migrate** — run the migration tool/script against the on-disk DB while consumers are stopped or quiesced.
+2. **Restart** — restart every long-lived process that holds a connection (`systemctl --user restart …` for feedback-sender and any daemon).
+
+Code on disk does not update the live schema. Lazy `CREATE TABLE IF NOT EXISTS` only runs when a **new** process opens the DB; already-running processes keep the old connection and old expectations until restart.
 
 ## Testing Guidelines
 

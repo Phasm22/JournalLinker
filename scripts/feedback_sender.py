@@ -24,6 +24,7 @@ Env vars:
     INTENT_STATE_DIR     state dir (default: ~/.local/state/journal-linker/intents)
     INTENT_FEEDBACK_POLL_TIMEOUT    long-poll timeout seconds (default: 25)
     INTENT_FEEDBACK_SEND_INTERVAL   due-message scan interval seconds (default: 60)
+    INTENT_FEEDBACK_HEARTBEAT_SEC   health.probe interval in --daemon mode (default: 300, min 30)
     INTENT_FEEDBACK_QUIET_START     quiet-hours start, local hour 0-23 (default: 22)
     INTENT_FEEDBACK_QUIET_END       quiet-hours end, local hour 0-23 (default: 8)
     INTENT_TELEGRAM_REACTION_SPIKE  1|true|on — extra raw-ish reaction debug log (sanitized spike row).
@@ -50,6 +51,12 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from journal_linker_telemetry import emit_health_probe, maybe_write_job_payload
 
 FEEDBACK_QUEUE_FILENAME = "intent_feedback_queue.jsonl"
 LEDGER_FILENAME = "intent_delivery_ledger.jsonl"
@@ -671,6 +678,14 @@ def _normalize_suppression_phrase(text: str) -> str:
     lowered = re.sub(r"[^\w\s]+", " ", lowered)
     lowered = re.sub(r"\s+", " ", lowered).strip()
     return lowered
+
+
+def _feedback_queue_pending(entries: list[dict]) -> int:
+    return sum(1 for entry in entries if str(entry.get("state", "")).strip().lower() == "pending")
+
+
+def _heartbeat_interval_sec() -> int:
+    return _env_int("INTENT_FEEDBACK_HEARTBEAT_SEC", 300)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -1648,6 +1663,12 @@ def run(state_dir: Path, token: str, chat_id: str, poll_timeout: int = 0) -> int
     _process_updates_for_state(state_dir, token, updates, chat_id=chat_id)
     _send_due_for_state(state_dir, token, chat_id)
 
+    entries = load_feedback_queue(state_dir)
+    maybe_write_job_payload(
+        updates_received=len(updates),
+        feedback_queue_pending=_feedback_queue_pending(entries),
+        poll_offset=offset,
+    )
     return 0
 
 
@@ -1663,13 +1684,36 @@ def run_daemon(
         "daemon",
         f"starting long polling poll_timeout={poll_timeout}s send_interval={send_interval}s state_dir={state_dir}",
     )
+    started_at = time.monotonic()
     next_send_at = 0.0
+    next_heartbeat_at = 0.0
+    heartbeat_interval = max(30, _heartbeat_interval_sec())
+    last_updates_count = 0
+    poll_offset = load_offset(state_dir)
+
+    def _emit_probe() -> None:
+        nonlocal poll_offset, last_updates_count
+        entries = load_feedback_queue(state_dir)
+        emit_health_probe(
+            "feedback-sender",
+            uptime_sec=round(time.monotonic() - started_at, 1),
+            poll_offset=poll_offset,
+            updates_last_cycle=last_updates_count,
+            feedback_queue_pending=_feedback_queue_pending(entries),
+        )
+        last_updates_count = 0
+
+    _emit_probe()
+    next_heartbeat_at = time.monotonic() + heartbeat_interval
+
     while True:
         try:
             offset = load_offset(state_dir)
+            poll_offset = offset
             _vlog("updates", f"long polling getUpdates offset={offset} timeout={poll_timeout}")
             updates = get_updates(token, offset, timeout=poll_timeout)
             if updates:
+                last_updates_count = len(updates)
                 _log("updates", f"received {len(updates)} update(s)")
                 _process_updates_for_state(state_dir, token, updates, chat_id=chat_id)
 
@@ -1677,6 +1721,9 @@ def run_daemon(
             if now >= next_send_at:
                 _send_due_for_state(state_dir, token, chat_id)
                 next_send_at = now + send_interval
+            if now >= next_heartbeat_at:
+                _emit_probe()
+                next_heartbeat_at = now + heartbeat_interval
         except KeyboardInterrupt:
             _log("daemon", "stopping on keyboard interrupt")
             return 0

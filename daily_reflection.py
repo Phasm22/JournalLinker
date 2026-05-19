@@ -12,6 +12,7 @@ from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
 from journal_linker_env import bootstrap_journal_linker_env
+from journal_linker_telemetry import maybe_write_job_payload
 from weekly_insights import (
     DEFAULT_MEMORY_STORE_FILE,
     MIN_SUBSTANTIVE_ENTRY_WORDS,
@@ -525,6 +526,25 @@ def run_daily_reflection(
     return result
 
 
+def _reflection_outcome(status: str) -> str:
+    if status == "dry-run":
+        return "dry_run"
+    if status in ("sent", "skipped", "failed"):
+        return status
+    return status
+
+
+def _write_reflection_payload(result: dict) -> None:
+    maybe_write_job_payload(
+        outcome=_reflection_outcome(str(result.get("status", "skipped"))),
+        reason=str(result.get("reason", "")),
+        reflection_date=str(result.get("reflection_date", "")),
+        target_send_at=str(result.get("target_send_at", "")),
+        sent=bool(result.get("sent")),
+        source=str(result.get("source", "")),
+    )
+
+
 def main() -> int:
     args = parse_args()
     if not args.journal_dir:
@@ -542,7 +562,10 @@ def main() -> int:
         )
     except Exception as exc:
         print(f"Error: {exc}")
+        maybe_write_job_payload(outcome="failed", reason=str(exc))
         return 1
+
+    _write_reflection_payload(result)
 
     if result["payload"]:
         payload = result["payload"]
@@ -563,6 +586,8 @@ def main() -> int:
             f"target={result['target_send_at']} "
             f"reason={result['reason']}"
         )
+    if result["status"] == "failed":
+        return 1
     return 0
 
 

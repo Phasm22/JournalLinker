@@ -36,6 +36,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from journal_linker_env import bootstrap_journal_linker_env
+from journal_linker_telemetry import maybe_write_job_payload
 
 RECENCY_LAMBDA = 0.08  # same as Scribe.py
 WHISPER_PROMPT_MAX_CHARS = 800  # ~200 tokens; Whisper decoder prefix limit is 223
@@ -483,6 +484,10 @@ def parse_cli() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _write_voice_payload(**fields) -> None:
+    maybe_write_job_payload(**fields)
+
+
 def main() -> int:
     args = parse_cli()
 
@@ -539,6 +544,13 @@ def main() -> int:
             dry_run=args.dry_run,
             verbose=args.verbose,
         )
+        _write_voice_payload(
+            items_processed=1 if success else 0,
+            items_failed=0 if success else 1,
+            items_skipped_placeholder=0,
+            items_skipped_already=0,
+            items_pending_at_start=1,
+        )
         return 0 if success else 1
 
     # Scan-dir mode
@@ -588,14 +600,25 @@ def main() -> int:
         print(f"[voice] skipping {len(waiting)} file(s) still downloading from iCloud: "
               + ", ".join(f.name for f in waiting), file=sys.stderr)
     pending = synced
-    skipped = len(candidates) - len(pending) - len(waiting)
+    items_skipped_already = max(0, len(candidates) - len(pending) - len(waiting))
+    items_skipped_placeholder = len(waiting)
+    items_pending_at_start = len(pending)
+    skipped = items_skipped_already
     print(f"[voice] found {len(pending)} to process of {len(candidates)} recordings in {drop_dir}"
           + (f" ({skipped} already processed — use --force to re-run)" if skipped else ""), file=sys.stderr)
 
     if not pending:
+        _write_voice_payload(
+            items_processed=0,
+            items_failed=0,
+            items_skipped_placeholder=items_skipped_placeholder,
+            items_skipped_already=items_skipped_already,
+            items_pending_at_start=0,
+        )
         return 0
 
     errors = 0
+    processed = 0
     for audio_path in pending:
         ok = process_file(
             audio_path,
@@ -608,9 +631,18 @@ def main() -> int:
             dry_run=args.dry_run,
             verbose=args.verbose,
         )
-        if not ok:
+        if ok:
+            processed += 1
+        else:
             errors += 1
 
+    _write_voice_payload(
+        items_processed=processed,
+        items_failed=errors,
+        items_skipped_placeholder=items_skipped_placeholder,
+        items_skipped_already=items_skipped_already,
+        items_pending_at_start=items_pending_at_start,
+    )
     return 0 if errors == 0 else 1
 
 

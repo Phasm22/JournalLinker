@@ -328,6 +328,25 @@ class TestDailyReflection(unittest.TestCase):
             self.assertEqual(second["reason"], "no new context since last run")
             reflection_mock.assert_not_called()
 
+    def test_reflection_job_payload_records_outcome_and_reason(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, self.make_env(), clear=False):
+            payload_file = Path(d) / "payload.json"
+            with mock.patch.dict(os.environ, {"JOURNAL_LINKER_JOB_PAYLOAD_FILE": str(payload_file)}, clear=False):
+                daily_reflection._write_reflection_payload(
+                    {
+                        "status": "skipped",
+                        "reason": "before target send time",
+                        "reflection_date": "2026-04-08",
+                        "target_send_at": "2026-04-09T20:00:00",
+                        "sent": False,
+                        "source": "yesterday",
+                    }
+                )
+            data = json.loads(payload_file.read_text(encoding="utf-8"))
+            self.assertEqual(data["outcome"], "skipped")
+            self.assertEqual(data["reason"], "before target send time")
+            self.assertFalse(data["sent"])
+
     def test_before_target_send_time_skips_without_model_call(self):
         with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, self.make_env(), clear=False):
             journal_dir = Path(d) / "journal"
@@ -390,6 +409,63 @@ class TestDailyReflection(unittest.TestCase):
 
             self.assertEqual(exit_code, 0)
             self.assertIn("[daily_reflection] status=dry-run", stdout.getvalue())
+
+    def test_main_returns_one_when_send_fails(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, self.make_env(), clear=False):
+            journal_dir = Path(d) / "journal"
+            journal_dir.mkdir()
+            (journal_dir / "2026-04-08.md").write_text(SUBSTANTIVE_DAY, encoding="utf-8")
+            learning_file = Path(d) / "scribe_learning.json"
+            self.write_learning(learning_file)
+            state_file = Path(d) / "daily_reflection_state.json"
+            payload_file = Path(d) / "payload.json"
+
+            reflection = {
+                "title": "A calmer read on yesterday",
+                "body": "Distance made the day feel more legible.",
+                "confidence": 0.71,
+                "should_send": True,
+                "reason": "",
+            }
+
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"JOURNAL_LINKER_JOB_PAYLOAD_FILE": str(payload_file)},
+                    clear=False,
+                ),
+                mock.patch.object(daily_reflection, "request_daily_reflection", return_value=reflection),
+                mock.patch.object(
+                    daily_reflection,
+                    "publish_pushover",
+                    side_effect=RuntimeError("temporary error"),
+                ),
+                mock.patch.object(
+                    daily_reflection,
+                    "compute_target_send_time",
+                    return_value=datetime(2026, 4, 9, 17, 0, 0),
+                ),
+                mock.patch(
+                    "sys.argv",
+                    [
+                        "daily_reflection.py",
+                        "--journal-dir",
+                        str(journal_dir),
+                        "--learning-file",
+                        str(learning_file),
+                        "--state-file",
+                        str(state_file),
+                        "--date",
+                        "2026-04-08",
+                    ],
+                ),
+            ):
+                exit_code = daily_reflection.main()
+
+            self.assertEqual(exit_code, 1)
+            payload = json.loads(payload_file.read_text(encoding="utf-8"))
+            self.assertEqual(payload["outcome"], "failed")
+            self.assertIn("temporary error", payload["reason"])
 
     @unittest.skipUnless(LIVE_OLLAMA_SMOKE, "set JOURNAL_LINKER_LIVE_SMOKE=1 to run live Ollama smoke tests")
     def test_live_ollama_smoke_for_daily_reflection(self):

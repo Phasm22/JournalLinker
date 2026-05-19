@@ -303,6 +303,35 @@ class TestFeedbackSenderLongPolling(unittest.TestCase):
         self.assertEqual(ledger[key]["feedback_signal"], "confirmed")
         self.assertEqual(offset, 8)
 
+    def test_run_daemon_emits_health_probe(self):
+        clock = {"t": 0.0}
+
+        def monotonic():
+            clock["t"] += 40.0
+            return clock["t"]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_dir = Path(tmpdir)
+            with (
+                mock.patch.object(fs.time, "monotonic", side_effect=monotonic),
+                mock.patch.object(fs, "_heartbeat_interval_sec", return_value=30),
+                mock.patch.object(fs, "get_updates", side_effect=[[], KeyboardInterrupt]),
+                mock.patch.object(fs, "emit_health_probe") as probe_mock,
+                mock.patch.object(fs, "_send_due_for_state"),
+            ):
+                fs.run_daemon(
+                    state_dir,
+                    "token",
+                    "chat",
+                    poll_timeout=1,
+                    send_interval=999,
+                )
+
+        self.assertGreaterEqual(probe_mock.call_count, 2)
+        self.assertEqual(probe_mock.call_args_list[0][0][0], "feedback-sender")
+        self.assertIn("uptime_sec", probe_mock.call_args_list[0][1])
+        self.assertIn("feedback_queue_pending", probe_mock.call_args_list[0][1])
+
 
 class TestFeedbackSenderMessages(unittest.TestCase):
     def test_freeform_text_routes_to_latest_unanswered_checkin(self):
