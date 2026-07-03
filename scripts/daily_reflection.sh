@@ -22,6 +22,9 @@ job_log_header "Daily reflection job" \
   echo "python: $PYTHON" \
   echo "script: $DAILY_REFLECTION_PY"
 
+# shellcheck source=ensure_ollama.sh
+source "$HERE/ensure_ollama.sh" || true
+
 set +e
 START_EPOCH=$(date +%s)
 "$PYTHON" "$DAILY_REFLECTION_PY" 2>&1 | tee -a "$LOG_FILE"

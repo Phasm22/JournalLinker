@@ -3,7 +3,7 @@ Description=Journal Linker — intent retry every 15 minutes
 
 [Timer]
 OnBootSec=5min
-OnUnitActiveSec=15min
+OnUnitActiveSec=30min
 Unit=journal-linker-intent-retry.service
 
 [Install]

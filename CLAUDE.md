@@ -37,6 +37,10 @@ python3 weekly_insights.py
 
 Tests use `importlib` to load `Scribe.py` directly as a module (not a package), so test files import from `SCRIPT_PATH = Path(__file__).resolve().parents[1] / "Scribe.py"`.
 
+## Host runtime (`pc-stacks`)
+
+On TJ's Linux desktop: path units/timers stay enabled; Telegram feedback sender is cold until `pc-stacks up journal`. Job scripts use `scripts/ensure_ollama.sh`. See [README.md](README.md#local-runtime-on-demand--pc-stacks) and [`/home/tj/bin/README.md`](/home/tj/bin/README.md).
+
 ## Environment
 
 Configure secrets outside the repo (recommended):

@@ -68,7 +68,16 @@ job_log_header() {
     echo "=== $title $RUN_ID ==="
     echo "log_file: $LOG_FILE"
     echo "start: $(job_log_ts)"
-    "$@"
+    while [[ $# -gt 0 ]]; do
+      if [[ "$1" == "echo" ]]; then
+        shift
+        echo "$1"
+        shift
+      else
+        "$@"
+        break
+      fi
+    done
   } | tee "$LOG_FILE"
 }
 

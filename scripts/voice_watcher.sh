@@ -32,6 +32,9 @@ job_log_header "Voice watcher job" \
   echo "python: $PYTHON" \
   echo "script: $PROCESS_VOICE_PY"
 
+# shellcheck source=ensure_ollama.sh
+source "$HERE/ensure_ollama.sh" || true
+
 set +e
 START_EPOCH=$(date +%s)
 "$PYTHON" "$PROCESS_VOICE_PY" --retry 2>&1 | tee -a "$LOG_FILE"

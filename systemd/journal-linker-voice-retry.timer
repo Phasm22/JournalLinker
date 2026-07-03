@@ -3,7 +3,7 @@ Description=Journal Linker — voice retry (staggered, every 15m)
 
 [Timer]
 # :09, :24, :39, :54 — staggered from daily-reflection (:02, :17, :32, :47) to spread Whisper/IO.
-OnCalendar=*-*-* *:09/15
+OnCalendar=*-*-* *:09/30
 AccuracySec=1min
 Persistent=true
 

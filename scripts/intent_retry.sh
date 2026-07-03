@@ -26,6 +26,9 @@ job_log_header "Intent retry job" \
   echo "python: $PYTHON" \
   echo "script: $PROCESS_INTENTS_PY"
 
+# shellcheck source=ensure_ollama.sh
+source "$HERE/ensure_ollama.sh" || true
+
 set +e
 START_EPOCH=$(date +%s)
 "$PYTHON" "$PROCESS_INTENTS_PY" --retry 2>&1 | tee -a "$LOG_FILE"

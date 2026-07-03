@@ -33,6 +33,23 @@ Voice entries are first-class. A recording made at 11 PM is attributed to that d
 - **Python 3** with a venv at `ScribeVenv/` (`just` recipes use it automatically)
 - **faster-whisper** for voice: `just voice-install`
 
+### Local runtime (on-demand / `pc-stacks`)
+
+On TJ's Linux desktop:
+
+| Component | Boot behavior | Start when needed |
+|-----------|---------------|-------------------|
+| Path units (voice/intent watchers) | **Enabled** — event-driven, near-zero idle cost | automatic on file drop |
+| Timers (scribe, reflection, retries) | **Enabled** — every 30 min | automatic; call `scripts/ensure_ollama.sh` before Ollama jobs |
+| Feedback sender (Telegram long-poll) | **Disabled** at boot | `pc-stacks up journal` |
+
+```bash
+pc-stacks up journal
+pc-stacks status
+```
+
+Orchestrator: [`/home/tj/bin/pc-stacks`](/home/tj/bin/pc-stacks) — [`/home/tj/bin/README.md`](/home/tj/bin/README.md). Traceability: PC Idle Quietdown plan (Cursor plans, Jul 2025).
+
 ---
 
 ## Quick start

@@ -27,6 +27,9 @@ job_log_header "Scribe job" \
   echo "python: $PYTHON" \
   echo "script: $SCRIBE_PY"
 
+# shellcheck source=ensure_ollama.sh
+source "$HERE/ensure_ollama.sh" || true
+
 set +e
 START_EPOCH=$(date +%s)
 echo "" | "$PYTHON" "$SCRIBE_PY" --write-back 2>&1 | tee -a "$LOG_FILE"

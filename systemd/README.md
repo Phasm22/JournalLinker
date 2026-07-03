@@ -2,17 +2,28 @@
 
 Canonical timer + service definitions for journalLinker when **not** using macOS launchd.
 
+## On-demand runtime (`pc-stacks`)
+
+On TJ's Linux desktop, the **Telegram feedback sender** is cold at boot. Path units and timers stay enabled (low idle cost).
+
+```bash
+pc-stacks up journal       # journal-linker-feedback-sender.service
+pc-stacks status
+```
+
+Job scripts source `scripts/ensure_ollama.sh` before Ollama/Whisper work. Index: [`/home/tj/bin/README.md`](/home/tj/bin/README.md). Traceability: PC Idle Quietdown plan (Cursor plans, Jul 2025).
+
 ## Why these timers look like this
 
-- **`OnCalendar=*-*-* *:MM/15`** — wall-clock every 15 minutes.  
-  Do **not** use `OnBootSec=` + `OnUnitActiveSec=` for this poller pattern: on some systemd/user-session setups the timer ends up with **`NextElapseUSecMonotonic=infinity`** and never schedules real **`NEXT`** times.
+- **`OnCalendar=*-*-* *:MM/30`** — wall-clock every 30 minutes (was 15 min pre–Idle Quietdown).
 
 ## Stagger
 
 | Unit | Schedule | Purpose |
 |------|----------|---------|
-| `journal-linker-daily-reflection.timer` | minutes **:02, :17, :32, :47** | `daily_reflection.sh` — script decides whether to send |
-| `journal-linker-voice-retry.timer` | minutes **:09, :24, :39, :54** | `voice_retry.sh` — retries transient voice failures |
+| `journal-linker-daily-reflection.timer` | minutes **:02, :32** (every 30m) | `daily_reflection.sh` — script decides whether to send |
+| `journal-linker-voice-retry.timer` | minutes **:09, :39** (every 30m) | `voice_retry.sh` — retries transient voice failures |
+| `journal-linker-intent-retry.timer` | every **30 min** after boot | `intent_retry.sh` |
 
 Seven minutes after each daily-reflection tick starts a voice-retry cycle, so Whisper / disk are less likely to pile onto the same moment as reflection.
 
