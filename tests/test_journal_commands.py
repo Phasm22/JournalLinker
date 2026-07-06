@@ -5,7 +5,9 @@ with high precision and that normal journaling never triggers a route.
 """
 
 import importlib.util
+import json
 import os
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -360,6 +362,103 @@ class TestFindCommandsWithDiagnostics(unittest.TestCase):
         commands, _anomalies = jc.find_commands_with_diagnostics(text)
         routes = sorted((c["route"], c["company"]) for c in commands)
         self.assertEqual(routes, [("hot_seat_fetch", "ford"), ("watchlist_add", "apple")])
+
+
+def _load_jc_with_config(config_path: str):
+    """Load a fresh journal_commands module instance with a specific route
+    config, without disturbing the module-level `jc` used by other tests."""
+    with mock.patch.dict(os.environ, {"INTENT_VOICE_ROUTES_CONFIG": str(config_path)}):
+        fresh_spec = importlib.util.spec_from_file_location("journal_commands_alt", SCRIPT_PATH)
+        module = importlib.util.module_from_spec(fresh_spec)
+        assert fresh_spec and fresh_spec.loader
+        fresh_spec.loader.exec_module(module)
+    return module
+
+
+class TestDeclarativeConfig(unittest.TestCase):
+    """Route definitions live in scripts/voice_command_routes.json and drive
+    recognition at import time. These tests lock the flatten ordering + filler
+    derivation, and prove a new route can be added by config edit alone."""
+
+    # Snapshot of the config-driven verb tuples (longest-first). Locks both the
+    # config contents and _flatten_verb_forms()'s ordering against regressions.
+    _EXPECTED_FETCH_VERBS = (
+        'pulling down', 'pulled down', 'downloading', 'bringing up', 'pulling up',
+        'downloaded', 'brought up', 'looking up', 'pull down', 'pulled up', 'looked up',
+        'fetching', 'grabbing', 'download', 'bring up', 'bringing', 'pull up', 'pulling',
+        'fetched', 'grabbed', 'loading', 'getting', 'brought', 'look up', 'pulled',
+        'loaded', 'get me', 'got me', 'adding', 'fetch', 'bring', 'added', 'pull',
+        'pole', 'poll', 'grab', 'load', 'get', 'got', 'add',
+    )
+    _EXPECTED_WATCH_VERBS = (
+        'following', 'watching', 'tracking', 'followed', 'watched', 'tracked',
+        'follow', 'watch', 'track',
+    )
+
+    def test_config_driven_verbs_match_snapshot(self):
+        self.assertEqual(jc._FETCH_VERBS, self._EXPECTED_FETCH_VERBS)
+        self.assertEqual(jc._WATCH_VERBS, self._EXPECTED_WATCH_VERBS)
+
+    def test_every_verb_form_is_also_a_filler_word(self):
+        # The verb/filler desync is the exact bug this feature exists to
+        # prevent: every token of every verb surface form must be filler.
+        for form in jc._FETCH_VERBS + jc._WATCH_VERBS:
+            for tok in form.split():
+                self.assertIn(tok, jc._FILLER, f"{tok!r} (from {form!r}) missing from _FILLER")
+
+    def test_new_route_added_via_config_edit_alone(self):
+        # Acceptance criterion: a brand-new route works with zero code changes —
+        # only a config edit. Add an `alert_add` route (no filing type) with a
+        # disjoint verb vocabulary and confirm it parses + its verb tokens are
+        # derived as filler, using the same generic recognition path.
+        config = {
+            "routes": [
+                {
+                    "name": "hot_seat_fetch",
+                    "requires_form": True,
+                    "form_canonical": "10-K",
+                    "form_patterns": [r"\b10[\s\-]?k\b"],
+                    "verb_forms": {"pull": {"canonical": ["pull"], "artifact": ["pulled"]}},
+                },
+                {
+                    "name": "watchlist_add",
+                    "requires_form": False,
+                    "verb_forms": {"watch": {"canonical": ["watch"], "artifact": ["watched"]}},
+                },
+                # The one and only edit needed to add a whole new route: append
+                # this entry. No Python change anywhere.
+                {
+                    "name": "alert_add",
+                    "requires_form": False,
+                    "verb_forms": {
+                        "alert": {"canonical": ["alert"], "artifact": ["alerted", "alerting"]},
+                        "flag": {"canonical": ["flag"], "artifact": ["flagged", "flagging"]},
+                    },
+                },
+            ]
+        }
+        with tempfile.TemporaryDirectory() as td:
+            cfg = Path(td) / "routes.json"
+            cfg.write_text(json.dumps(config), encoding="utf-8")
+            alt = _load_jc_with_config(cfg)
+
+            # The new route is loaded and its verbs recognized generically.
+            self.assertIn("alert_add", alt._ROUTES)
+            result, diag = alt.parse_route_diagnostic("alert Ford", "alert_add")
+            self.assertIsNotNone(result)
+            self.assertEqual(result["route"], "alert_add")
+            self.assertEqual(result["company"], "ford")
+            self.assertEqual(diag["reason"], "ok")
+
+            # Verb/filler invariant holds for the new route with no code change.
+            for tok in ("alert", "alerted", "alerting", "flag", "flagged", "flagging"):
+                self.assertIn(tok, alt._FILLER)
+
+            # find_commands iterates configured routes generically, so the new
+            # route fires end-to-end from a wake-word note.
+            cmds = alt.find_commands("Palindrome, flag Apple.")
+            self.assertEqual([(c["route"], c["company"]) for c in cmds],
+                             [("alert_add", "apple")])
 
 
 class TestStripSpans(unittest.TestCase):

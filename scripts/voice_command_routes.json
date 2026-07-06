@@ -1,0 +1,76 @@
+{
+  "routes": [
+    {
+      "name": "hot_seat_fetch",
+      "requires_form": true,
+      "form_canonical": "10-K",
+      "form_patterns": [
+        "\\b10[\\s\\-]?k\\b",
+        "\\bten[\\s\\-]?k\\b",
+        "\\bannual\\s+report\\b",
+        "\\bannual\\s+filing\\b"
+      ],
+      "verb_forms": {
+        "pull": {
+          "canonical": ["pull up", "pull down", "pull"],
+          "artifact": [
+            "pulled up", "pulled down", "pulling up", "pulling down",
+            "pulled", "pulling", "pole", "poll"
+          ]
+        },
+        "fetch": {
+          "canonical": ["fetch"],
+          "artifact": ["fetched", "fetching"]
+        },
+        "grab": {
+          "canonical": ["grab"],
+          "artifact": ["grabbed", "grabbing"]
+        },
+        "download": {
+          "canonical": ["download"],
+          "artifact": ["downloaded", "downloading"]
+        },
+        "load": {
+          "canonical": ["load"],
+          "artifact": ["loaded", "loading"]
+        },
+        "get": {
+          "canonical": ["get me", "get"],
+          "artifact": ["got me", "got", "getting"]
+        },
+        "bring": {
+          "canonical": ["bring up", "bring"],
+          "artifact": ["brought up", "brought", "bringing up", "bringing"]
+        },
+        "add": {
+          "canonical": ["add"],
+          "artifact": ["added", "adding"]
+        },
+        "look up": {
+          "canonical": ["look up"],
+          "artifact": ["looked up", "looking up"]
+        }
+      }
+    },
+    {
+      "name": "watchlist_add",
+      "requires_form": false,
+      "form_canonical": null,
+      "form_patterns": [],
+      "verb_forms": {
+        "watch": {
+          "canonical": ["watch"],
+          "artifact": ["watched", "watching"]
+        },
+        "track": {
+          "canonical": ["track"],
+          "artifact": ["tracked", "tracking"]
+        },
+        "follow": {
+          "canonical": ["follow"],
+          "artifact": ["followed", "following"]
+        }
+      }
+    }
+  ]
+}

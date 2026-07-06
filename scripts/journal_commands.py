@@ -25,6 +25,7 @@ Design notes:
   sentence returns None and falls through to normal intent handling.
 """
 
+import json
 import os
 import re
 import sys
@@ -37,75 +38,24 @@ from text_normalize import has_spelled_letters, normalize_command_text
 
 DEFAULT_WAKE_WORDS = ["palindrome"]
 
-# Verbs that indicate "acquire this document", grouped by lemma. "canonical"
-# forms are phrasings someone would actually choose; "artifact" forms are
-# tense mismatches or homophones a user would never intentionally say as the
-# activation verb but that speech-to-text produces (confirmed real cases:
-# "pulled"/"pulling" — tense drift, and "pole"/"poll" — a Whisper mishearing
-# of "pull"). Both recognize the verb so a real command isn't silently
-# dropped; downstream code can still tell the two apart for anomaly tagging.
-_FETCH_VERB_FORMS = {
-    "pull": {
-        "canonical": ["pull up", "pull down", "pull"],
-        "artifact": [
-            "pulled up", "pulled down", "pulling up", "pulling down",
-            "pulled", "pulling", "pole", "poll",
-        ],
-    },
-    "fetch": {
-        "canonical": ["fetch"],
-        "artifact": ["fetched", "fetching"],
-    },
-    "grab": {
-        "canonical": ["grab"],
-        "artifact": ["grabbed", "grabbing"],
-    },
-    "download": {
-        "canonical": ["download"],
-        "artifact": ["downloaded", "downloading"],
-    },
-    "load": {
-        "canonical": ["load"],
-        "artifact": ["loaded", "loading"],
-    },
-    "get": {
-        "canonical": ["get me", "get"],
-        "artifact": ["got me", "got", "getting"],
-    },
-    "bring": {
-        "canonical": ["bring up", "bring"],
-        "artifact": ["brought up", "brought", "bringing up", "bringing"],
-    },
-    "add": {
-        "canonical": ["add"],
-        "artifact": ["added", "adding"],
-    },
-    "look up": {
-        "canonical": ["look up"],
-        "artifact": ["looked up", "looking up"],
-    },
-}
+# Route names for the two built-in routes. `journal_commands` exposes a couple
+# of route-specific helper wrappers (parse_command / parse_watchlist_command)
+# bound to these names for callers, but recognition itself is fully
+# config-driven and generic (see _ROUTES) — a brand-new route can be added by
+# editing voice_command_routes.json alone, with no code change here.
+_HOT_SEAT_ROUTE = "hot_seat_fetch"
+_WATCHLIST_ROUTE = "watchlist_add"
 
-
-# Verbs that indicate "start tracking this ticker, no filing needed" —
-# distinct vocabulary from _FETCH_VERB_FORMS by design, so the two routes
-# never collide on the same word. Tense variants are "artifact" for the same
-# reason as the fetch verbs: an activation command phrased in past tense
-# ("Palindrome, watched Ford") isn't something you'd intentionally say.
-_WATCH_VERB_FORMS = {
-    "watch": {
-        "canonical": ["watch"],
-        "artifact": ["watched", "watching"],
-    },
-    "track": {
-        "canonical": ["track"],
-        "artifact": ["tracked", "tracking"],
-    },
-    "follow": {
-        "canonical": ["follow"],
-        "artifact": ["followed", "following"],
-    },
-}
+# Declarative route definitions. Each route's verb forms are grouped by lemma:
+# "canonical" forms are phrasings someone would actually choose; "artifact"
+# forms are tense mismatches or homophones a user would never intentionally say
+# as the activation verb but that speech-to-text produces (confirmed real
+# cases: "pulled"/"pulling" — tense drift, and "pole"/"poll" — a Whisper
+# mishearing of "pull"). Both recognize the verb so a real command isn't
+# silently dropped; downstream code can still tell the two apart for anomaly
+# tagging. Routes use disjoint verb vocabularies by design, so they never
+# compete for the same utterance.
+_ROUTES_CONFIG_FILENAME = "voice_command_routes.json"
 
 
 def _flatten_verb_forms(
@@ -122,21 +72,80 @@ def _flatten_verb_forms(
     return forms, info
 
 
-# All recognized surface forms, longest-first (so "pull up" is preferred over
-# a bare "pull" substring match), and a lookup from surface form -> (lemma,
-# is_artifact).
-_FETCH_VERBS, _VERB_FORM_INFO = _flatten_verb_forms(_FETCH_VERB_FORMS)
-_WATCH_VERBS, _WATCH_VERB_FORM_INFO = _flatten_verb_forms(_WATCH_VERB_FORMS)
+def _routes_config_path() -> Path:
+    """Resolve the route-config JSON path (env override, else next to module)."""
+    raw = os.getenv("INTENT_VOICE_ROUTES_CONFIG", "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    return Path(__file__).resolve().parent / _ROUTES_CONFIG_FILENAME
 
-# Every individual token that appears across all verb surface forms (e.g.
-# "pull", "up", "pulled", "pole", "watch", "tracking") is also a filler word
-# when isolating the company reference. Deriving this from the same dicts the
-# verb matchers use keeps them permanently in sync — a verb tense/synonym
-# added to either forms dict is automatically stripped as filler too.
-_FETCH_VERB_TOKENS = {tok for form in _VERB_FORM_INFO for tok in form.split()}
-_WATCH_VERB_TOKENS = {tok for form in _WATCH_VERB_FORM_INFO for tok in form.split()}
 
-# Words dropped when isolating the company reference.
+def _build_route(entry: dict) -> dict:
+    """Compile one config route entry into its runtime recognition structure."""
+    verb_forms = entry.get("verb_forms", {})
+    # Longest-first surface forms (so "pull up" beats a bare "pull") + a lookup
+    # from surface form -> (lemma, is_artifact).
+    verbs, info = _flatten_verb_forms(verb_forms)
+    # Every individual token across all verb surface forms (e.g. "pull", "up",
+    # "pulled", "pole", "watch", "tracking") becomes a filler word when
+    # isolating the company reference. Deriving this from the same forms the
+    # verb matchers use keeps them permanently in sync — a verb tense/synonym
+    # added to the config is automatically stripped as filler too.
+    tokens = {tok for form in info for tok in form.split()}
+    canonical = entry.get("form_canonical")
+    form_patterns = [
+        (re.compile(p, re.IGNORECASE), canonical)
+        for p in entry.get("form_patterns", [])
+    ]
+    return {
+        "name": entry["name"],
+        "requires_form": bool(entry.get("requires_form", False)),
+        "form_canonical": canonical,
+        "verb_forms": verb_forms,
+        "verbs": verbs,
+        "verb_form_info": info,
+        "verb_tokens": tokens,
+        "form_patterns": form_patterns,
+    }
+
+
+def _load_route_config(path: Path | None = None) -> dict[str, dict]:
+    """Load route definitions from the JSON config into a name -> route dict,
+    preserving config order (form-requiring routes are listed first, which
+    fixes their recognition precedence)."""
+    cfg_path = path or _routes_config_path()
+    with open(cfg_path, encoding="utf-8") as fh:
+        data = json.load(fh)
+    routes: dict[str, dict] = {}
+    for entry in data.get("routes", []):
+        routes[entry["name"]] = _build_route(entry)
+    return routes
+
+
+_ROUTES = _load_route_config()
+
+# Public bindings over the config-driven structures, kept so existing callers
+# and tests import the same names. These derive from _ROUTES rather than being
+# hand-maintained — the config is the single source of truth.
+_FETCH_VERB_FORMS = _ROUTES[_HOT_SEAT_ROUTE]["verb_forms"]
+_WATCH_VERB_FORMS = _ROUTES[_WATCHLIST_ROUTE]["verb_forms"]
+_FETCH_VERBS = _ROUTES[_HOT_SEAT_ROUTE]["verbs"]
+_VERB_FORM_INFO = _ROUTES[_HOT_SEAT_ROUTE]["verb_form_info"]
+_WATCH_VERBS = _ROUTES[_WATCHLIST_ROUTE]["verbs"]
+_WATCH_VERB_FORM_INFO = _ROUTES[_WATCHLIST_ROUTE]["verb_form_info"]
+_FETCH_VERB_TOKENS = _ROUTES[_HOT_SEAT_ROUTE]["verb_tokens"]
+_WATCH_VERB_TOKENS = _ROUTES[_WATCHLIST_ROUTE]["verb_tokens"]
+
+# Form detection -> canonical form for the hot_seat route (kept as a public
+# binding; per-route detection uses each route's own compiled patterns).
+_FORM_PATTERNS = _ROUTES[_HOT_SEAT_ROUTE]["form_patterns"]
+
+# Words dropped when isolating the company reference. The verb tokens come from
+# *every* configured route's forms (union), so adding a route via config alone
+# keeps the verb/filler invariant that this whole feature exists to protect.
+_ALL_VERB_TOKENS: set[str] = set().union(
+    *(route["verb_tokens"] for route in _ROUTES.values())
+) if _ROUTES else set()
 _FILLER = {
     "can", "you", "could", "would", "will", "please", "the", "a", "an",
     "latest", "most", "recent", "newest", "current", "me", "my", "for", "of",
@@ -145,15 +154,7 @@ _FILLER = {
     "document", "documents", "into", "hot", "seat", "s", "that", "this",
     "their", "its", "it", "from", "down", "some", "go", "ahead",
     "ticker", "symbol",
-} | _FETCH_VERB_TOKENS | _WATCH_VERB_TOKENS
-
-# Form detection -> canonical form. Only 10-K is acted on right now.
-_FORM_PATTERNS = [
-    (re.compile(r"\b10[\s\-]?k\b", re.IGNORECASE), "10-K"),
-    (re.compile(r"\bten[\s\-]?k\b", re.IGNORECASE), "10-K"),
-    (re.compile(r"\bannual\s+report\b", re.IGNORECASE), "10-K"),
-    (re.compile(r"\bannual\s+filing\b", re.IGNORECASE), "10-K"),
-]
+} | _ALL_VERB_TOKENS
 
 _SENTENCE_TERMINATORS = ".?!\n"
 
@@ -203,43 +204,64 @@ def extract_command_spans(note_text: str, wake_words: list[str] | None = None) -
     return spans
 
 
-def detect_form(text: str) -> tuple[str | None, tuple[int, int] | None]:
-    """Return (canonical_form, (span_start, span_end)) or (None, None)."""
-    for rx, form in _FORM_PATTERNS:
+def _detect_form_for_route(
+    text: str, route: dict
+) -> tuple[str | None, tuple[int, int] | None]:
+    """Return (canonical_form, (span_start, span_end)) for a route's own form
+    patterns, or (None, None)."""
+    for rx, form in route["form_patterns"]:
         m = rx.search(text)
         if m:
             return form, (m.start(), m.end())
     return None, None
 
 
-def _find_fetch_verb(low: str) -> tuple[str, str, bool, int, int] | None:
-    """Return (matched_form, lemma, is_artifact, start, end) for the first
-    matching fetch verb (by lemma-list priority, longest phrase first), or None.
+def detect_form(text: str) -> tuple[str | None, tuple[int, int] | None]:
+    """Return (canonical_form, (span_start, span_end)) or (None, None).
+
+    Uses the hot_seat route's filing-type patterns (the only form-requiring
+    route today); route-generic code calls _detect_form_for_route().
     """
-    for form in _FETCH_VERBS:
+    return _detect_form_for_route(text, _ROUTES[_HOT_SEAT_ROUTE])
+
+
+def _find_verb_for_route(
+    low: str, route_name: str
+) -> tuple[str, str, bool, int, int] | None:
+    """Return (matched_form, lemma, is_artifact, start, end) for the first
+    matching verb of `route_name` (by lemma-list priority, longest phrase
+    first), or None.
+    """
+    route = _ROUTES[route_name]
+    info = route["verb_form_info"]
+    for form in route["verbs"]:
         idx = low.find(form)
         if idx >= 0:
-            lemma, is_artifact = _VERB_FORM_INFO[form]
+            lemma, is_artifact = info[form]
             return form, lemma, is_artifact, idx, idx + len(form)
     return None
+
+
+def _find_fetch_verb(low: str) -> tuple[str, str, bool, int, int] | None:
+    """First matching hot_seat fetch verb, or None."""
+    return _find_verb_for_route(low, _HOT_SEAT_ROUTE)
 
 
 def _find_watch_verb(low: str) -> tuple[str, str, bool, int, int] | None:
     """Same as _find_fetch_verb(), over the watch/track/follow vocabulary."""
-    for form in _WATCH_VERBS:
-        idx = low.find(form)
-        if idx >= 0:
-            lemma, is_artifact = _WATCH_VERB_FORM_INFO[form]
-            return form, lemma, is_artifact, idx, idx + len(form)
-    return None
+    return _find_verb_for_route(low, _WATCHLIST_ROUTE)
 
 
 def _find_any_verb(low: str) -> tuple[str, str, bool, int, int] | None:
-    """Fetch or watch verb match, whichever is found — used only by
-    _extract_company()'s before/after split heuristic, which doesn't care
-    which route the verb belongs to.
+    """First verb match across all configured routes, whichever is found —
+    used only by _extract_company()'s before/after split heuristic, which
+    doesn't care which route the verb belongs to.
     """
-    return _find_fetch_verb(low) or _find_watch_verb(low)
+    for route_name in _ROUTES:
+        match = _find_verb_for_route(low, route_name)
+        if match:
+            return match
+    return None
 
 
 def _clean_company(text: str) -> str:
@@ -281,19 +303,23 @@ def _extract_company(command_text: str, form_span: tuple[int, int] | None) -> st
     return _clean_company(text)
 
 
-def parse_command_diagnostic(command_text: str) -> tuple[dict | None, dict]:
-    """Parse a single command sentence, returning (result, diagnostics).
+def parse_route_diagnostic(command_text: str, route_name: str) -> tuple[dict | None, dict]:
+    """Parse a single command sentence against one configured route, returning
+    (result, diagnostics).
 
-    `result` is the same dict `parse_command()` returns, or None. `diagnostics`
-    explains *why* a None result happened (or flags a match worth a caveat),
-    for the anomaly-reporting layer — {reason: "no_form"|"no_verb"|
+    `result` is a route dict ({route, [form,] company, command_text}) or None.
+    `diagnostics` explains *why* a None result happened (or flags a match worth
+    a caveat), for the anomaly-reporting layer — {reason: "no_form"|"no_verb"|
     "no_company"|"ok", verb_form, verb_lemma, is_artifact_verb,
-    had_spelled_letters}. A wake-word span with reason != "ok" produced no
+    had_spelled_letters}. A route that doesn't require a filing type ("form")
+    never yields "no_form". A wake-word span with reason != "ok" produced no
     command at all (nothing downstream ever sees it); is_artifact_verb /
     had_spelled_letters can be true even when reason == "ok".
     """
+    route = _ROUTES[route_name]
+    requires_form = route["requires_form"]
     diag = {
-        "reason": "no_form",
+        "reason": "no_form" if requires_form else "no_verb",
         "verb_form": None,
         "verb_lemma": None,
         "is_artifact_verb": False,
@@ -312,8 +338,10 @@ def parse_command_diagnostic(command_text: str) -> tuple[dict | None, dict]:
     # mentioned) still records that "pole" (an artifact of "pull") was said,
     # which the anomaly-reporting layer wants regardless of why parsing
     # ultimately failed.
-    form, form_span = detect_form(normalized)
-    verb_match = _find_fetch_verb(low)
+    form, form_span = (None, None)
+    if requires_form:
+        form, form_span = _detect_form_for_route(normalized, route)
+    verb_match = _find_verb_for_route(low, route_name)
     if verb_match:
         verb_form, verb_lemma, is_artifact, _v_start, _v_end = verb_match
         diag.update({
@@ -322,7 +350,7 @@ def parse_command_diagnostic(command_text: str) -> tuple[dict | None, dict]:
             "is_artifact_verb": is_artifact,
         })
 
-    if not form:
+    if requires_form and not form:
         diag["reason"] = "no_form"
         return None, diag
     if not verb_match:
@@ -335,13 +363,21 @@ def parse_command_diagnostic(command_text: str) -> tuple[dict | None, dict]:
         return None, diag
 
     diag["reason"] = "ok"
-    result = {
-        "route": "hot_seat_fetch",
-        "form": form,
-        "company": company,
-        "command_text": normalized.strip(),
-    }
+    result: dict = {"route": route_name}
+    if requires_form:
+        result["form"] = form
+    result["company"] = company
+    result["command_text"] = normalized.strip()
     return result, diag
+
+
+def parse_command_diagnostic(command_text: str) -> tuple[dict | None, dict]:
+    """Parse a single command sentence for the hot_seat 10-K fetch route.
+
+    Thin wrapper over parse_route_diagnostic() bound to hot_seat_fetch; see
+    there for the (result, diagnostics) shape.
+    """
+    return parse_route_diagnostic(command_text, _HOT_SEAT_ROUTE)
 
 
 def parse_command(command_text: str) -> dict | None:
@@ -356,48 +392,11 @@ def parse_command(command_text: str) -> dict | None:
 
 def parse_watchlist_command_diagnostic(command_text: str) -> tuple[dict | None, dict]:
     """Parse "Palindrome, watch/track/follow <company>" into a watchlist_add
-    route, or None. Same (result, diagnostics) shape as
-    parse_command_diagnostic(), minus the "no_form" reason — this route
-    doesn't consult filing type at all, by design: it's for tracking a
-    ticker independent of whether a 10-K exists or was ever fetched.
+    route, or None. Thin wrapper over parse_route_diagnostic() — this route
+    doesn't consult filing type at all, by design: it's for tracking a ticker
+    independent of whether a 10-K exists or was ever fetched.
     """
-    diag = {
-        "reason": "no_verb",
-        "verb_form": None,
-        "verb_lemma": None,
-        "is_artifact_verb": False,
-        "had_spelled_letters": False,
-    }
-    if not command_text:
-        return None, diag
-
-    diag["had_spelled_letters"] = has_spelled_letters(command_text)
-    normalized = normalize_command_text(command_text)
-    low = normalized.lower()
-
-    verb_match = _find_watch_verb(low)
-    if not verb_match:
-        diag["reason"] = "no_verb"
-        return None, diag
-    verb_form, verb_lemma, is_artifact, _v_start, _v_end = verb_match
-    diag.update({
-        "verb_form": verb_form,
-        "verb_lemma": verb_lemma,
-        "is_artifact_verb": is_artifact,
-    })
-
-    company = _extract_company(normalized, None)
-    if not company:
-        diag["reason"] = "no_company"
-        return None, diag
-
-    diag["reason"] = "ok"
-    result = {
-        "route": "watchlist_add",
-        "company": company,
-        "command_text": normalized.strip(),
-    }
-    return result, diag
+    return parse_route_diagnostic(command_text, _WATCHLIST_ROUTE)
 
 
 def parse_watchlist_command(command_text: str) -> dict | None:
@@ -443,17 +442,20 @@ def find_commands_with_diagnostics(
     anomalies: list[dict] = []
     seen: set[str] = set()
     for span in extract_command_spans(note_text, wake_words):
-        parsed, diag = parse_command_diagnostic(span["command_text"])
-        if not parsed:
-            watch_parsed, watch_diag = parse_watchlist_command_diagnostic(span["command_text"])
-            if watch_parsed:
-                parsed, diag = watch_parsed, watch_diag
-            elif watch_diag["verb_form"] is not None:
-                # Neither route completed, but the watch parser at least
-                # recognized a verb (e.g. "watch" with no company at all) —
-                # prefer that diagnostic so the anomaly reflects what was
-                # actually said.
-                diag = watch_diag
+        # Try each configured route in config order (form-requiring routes
+        # first). The first route that produces a command wins. If none does,
+        # keep the most informative diagnostic — one that at least recognized a
+        # verb (e.g. "watch" with no company) — so the anomaly reflects what
+        # was actually said rather than an earlier route's empty miss.
+        parsed: dict | None = None
+        diag: dict | None = None
+        for route_name in _ROUTES:
+            p, d = parse_route_diagnostic(span["command_text"], route_name)
+            if p:
+                parsed, diag = p, d
+                break
+            if diag is None or (diag["verb_form"] is None and d["verb_form"] is not None):
+                diag = d
 
         raw = note_text[span["start"]:span["end"]].strip()
         if diag["reason"] == "ok":
