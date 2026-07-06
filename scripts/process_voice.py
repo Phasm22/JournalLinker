@@ -34,14 +34,23 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
+_SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
 
 from journal_linker_env import bootstrap_journal_linker_env
 from journal_linker_telemetry import maybe_write_job_payload
+import journal_commands as jc
 
 RECENCY_LAMBDA = 0.08  # same as Scribe.py
 WHISPER_PROMPT_MAX_CHARS = 800  # ~200 tokens; Whisper decoder prefix limit is 223
 DEFAULT_WHISPER_MODEL = "base.en"
 DEFAULT_NIGHT_CUTOFF = 4
+
+# Mirrors process_intents.py's VOICE_ANOMALY_LOG_FILENAME — kept as a literal
+# here rather than importing process_intents.py (heavier module) just for
+# one constant.
+VOICE_ANOMALY_LOG_FILENAME = "voice_anomalies.jsonl"
 PROCESSED_SUFFIX = ".processed"
 FAILED_SUFFIX = ".failed"
 
@@ -93,57 +102,133 @@ def _parse_iso_date(date_str: str | None) -> datetime | None:
         return None
 
 
-def extract_whisper_prompt(learning_file: Path, reference_date: str | None = None) -> str:
+def _default_state_dir() -> Path:
+    """Mirrors process_intents.py's get_state_dir() default."""
+    raw = os.getenv("INTENT_STATE_DIR", "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    return Path.home() / ".local" / "state" / "journal-linker" / "intents"
+
+
+def _load_anomaly_corrected_terms(state_dir: Path) -> list[str]:
+    """Distinct `corrected_term` values from voice_anomalies.jsonl, in the
+    order first seen. These are terms Whisper has already gotten wrong once
+    (e.g. "OCM" corrected to "OMC") — feeding them back as vocabulary bias is
+    the point of logging them in the first place.
+    """
+    path = state_dir / VOICE_ANOMALY_LOG_FILENAME
+    if not path.exists():
+        return []
+    terms: list[str] = []
+    seen: set[str] = set()
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except Exception:
+            continue
+        term = str(record.get("corrected_term") or "").strip()
+        key = term.lower()
+        if term and key not in seen:
+            seen.add(key)
+            terms.append(term)
+    return terms
+
+
+def _guaranteed_vocab_terms(state_dir: Path | None = None) -> list[str]:
+    """Terms always included in the Whisper prompt, regardless of
+    scribe_learning.json success counts: the configured wake word(s), and
+    corrected terms from previously-logged voice-command anomalies.
+    """
+    terms: list[str] = []
+    try:
+        terms.extend(w.capitalize() for w in jc.get_wake_words())
+    except Exception:
+        pass
+    try:
+        terms.extend(_load_anomaly_corrected_terms(state_dir or _default_state_dir()))
+    except Exception:
+        pass
+    return terms
+
+
+def extract_whisper_prompt(
+    learning_file: Path,
+    reference_date: str | None = None,
+    guaranteed_terms: list[str] | None = None,
+) -> str:
     """Read scribe_learning.json, rank terms by success*recency, return prompt str.
 
     Uses the same RECENCY_LAMBDA and scoring approach as Scribe.py's
     rank_link_candidates so the Whisper vocabulary bias reflects the same
     weights the feedback loop has already learned.
+
+    `guaranteed_terms` (default: wake word(s) + logged anomaly corrections,
+    via _guaranteed_vocab_terms()) are included first, ahead of the ranked
+    terms, since they shouldn't depend on scribe_learning.json's success
+    counts — a term that's never been successfully linked yet (like a
+    ticker mentioned for the first time) still needs Whisper's bias.
     """
-    if not learning_file.exists():
-        return ""
-    try:
-        data = json.loads(learning_file.read_text(encoding="utf-8"))
-    except Exception:
-        return ""
-
-    term_memory = data.get("term_memory")
-    if not isinstance(term_memory, dict):
-        return ""
-
-    ref_dt = _parse_iso_date(reference_date) or datetime.now()
-    ref_str = ref_dt.strftime("%Y-%m-%d")
-
-    DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+    if guaranteed_terms is None:
+        guaranteed_terms = _guaranteed_vocab_terms()
 
     scored: list[tuple[float, str]] = []
-    for _key, record in term_memory.items():
-        if not isinstance(record, dict):
-            continue
-        canonical = record.get("term", "").strip()
-        if not canonical or DATE_RE.fullmatch(canonical):
-            continue
-        successes = record.get("success_count", 0) or 0
-        if successes <= 0:
-            continue
-        last_date = record.get("last_success_date") or record.get("last_seen_date")
-        last_dt = _parse_iso_date(last_date)
-        days = max(0, (ref_dt - last_dt).days) if last_dt else 9999
-        recency = math.exp(-RECENCY_LAMBDA * days)
-        score = successes * recency
-        if score > 0:
-            scored.append((score, canonical))
+    try:
+        data = json.loads(learning_file.read_text(encoding="utf-8")) if learning_file.exists() else {}
+        term_memory = data.get("term_memory")
+        if isinstance(term_memory, dict):
+            ref_dt = _parse_iso_date(reference_date) or datetime.now()
+            DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+            for _key, record in term_memory.items():
+                if not isinstance(record, dict):
+                    continue
+                canonical = record.get("term", "").strip()
+                if not canonical or DATE_RE.fullmatch(canonical):
+                    continue
+                successes = record.get("success_count", 0) or 0
+                if successes <= 0:
+                    continue
+                last_date = record.get("last_success_date") or record.get("last_seen_date")
+                last_dt = _parse_iso_date(last_date)
+                days = max(0, (ref_dt - last_dt).days) if last_dt else 9999
+                recency = math.exp(-RECENCY_LAMBDA * days)
+                score = successes * recency
+                if score > 0:
+                    scored.append((score, canonical))
+    except Exception:
+        scored = []
 
     scored.sort(reverse=True)
 
     parts: list[str] = []
+    seen_lower: set[str] = set()
     total_chars = len("Topics: ") + 1  # "Topics: " prefix + trailing "."
-    for _, term in scored:
+
+    def _try_add(term: str) -> None:
+        nonlocal total_chars
+        term = term.strip()
+        if not term:
+            return
+        key = term.lower()
+        if key in seen_lower:
+            return
         cost = len(term) + 2  # ", " separator
         if total_chars + cost > WHISPER_PROMPT_MAX_CHARS:
-            break
+            return
         parts.append(term)
+        seen_lower.add(key)
         total_chars += cost
+
+    for term in guaranteed_terms:
+        _try_add(term)
+    for _, term in scored:
+        _try_add(term)
 
     if not parts:
         return ""

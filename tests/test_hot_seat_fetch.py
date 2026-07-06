@@ -4,6 +4,7 @@ Network (SEC EDGAR) and OpenAI are mocked. Filesystem uses tempdirs.
 """
 
 import importlib.util
+import json
 import os
 import tempfile
 import unittest
@@ -80,6 +81,95 @@ class TestResolveTicker(unittest.TestCase):
             res = hsf.resolve_ticker("apple", tickers=TICKERS, mode="local")
             m.assert_not_called()
         self.assertEqual(res["ticker"], "AAPL")
+
+    def test_strips_wikilinks_before_resolving(self):
+        res = hsf.resolve_ticker("[[apple]]", tickers=TICKERS, mode="local")
+        self.assertEqual(res["ticker"], "AAPL")
+
+    def test_collapses_spelled_out_letters_before_resolving(self):
+        res = hsf.resolve_ticker("A-A-P-L", tickers=TICKERS, mode="local")
+        self.assertEqual(res["ticker"], "AAPL")
+
+    def test_alias_wins_over_openai_and_local(self):
+        tickers = TICKERS + [{"ticker": "OMC", "title": "OMNICOM GROUP INC", "cik_str": 30371}]
+        with mock.patch.object(hsf, "load_ticker_aliases", return_value={"OCM": "OMC"}), \
+                mock.patch.object(hsf, "openai_resolve_ticker", return_value="AAPL"):
+            res = hsf.resolve_ticker("OCM", tickers=tickers, mode="auto")
+        self.assertEqual(res["ticker"], "OMC")
+        self.assertEqual(res["source"], "alias")
+
+    def test_alias_miss_falls_through_to_local(self):
+        with mock.patch.object(hsf, "load_ticker_aliases", return_value={"OCM": "OMC"}):
+            res = hsf.resolve_ticker("apple", tickers=TICKERS, mode="local")
+        self.assertEqual(res["ticker"], "AAPL")
+        self.assertEqual(res["source"], "edgar_local")
+
+
+class TestFuzzyResolveTicker(unittest.TestCase):
+    def setUp(self):
+        self.tickers_with_omc = TICKERS + [
+            {"ticker": "OMC", "title": "OMNICOM GROUP INC", "cik_str": 30371},
+        ]
+
+    def test_catches_ticker_transposition(self):
+        # Real case: "OCM" heard/spoken for the real ticker "OMC" (Omnicom).
+        # Exact/token/prefix scoring in local_resolve_ticker can't catch a
+        # single-letter transposition in a 3-char ticker.
+        res = hsf.fuzzy_resolve_ticker("OCM", self.tickers_with_omc)
+        self.assertIsNotNone(res)
+        self.assertEqual(res["ticker"], "OMC")
+        self.assertEqual(res["source"], "fuzzy")
+        self.assertTrue(res["low_confidence"])
+
+    def test_below_threshold_returns_none(self):
+        self.assertIsNone(hsf.fuzzy_resolve_ticker("zzznotarealticker", TICKERS))
+
+    def test_empty_query_returns_none(self):
+        self.assertIsNone(hsf.fuzzy_resolve_ticker("", TICKERS))
+
+    def test_wired_as_last_resort_in_resolve_ticker(self):
+        # local_resolve_ticker finds nothing for "OCM" against these tickers
+        # (no exact/token/prefix match), so resolve_ticker should fall
+        # through to the fuzzy tier automatically. Alias tier disabled here
+        # so this test isolates the fuzzy fallthrough specifically (the
+        # alias seed table already has its own OCM->OMC entry, tested
+        # separately in TestResolveTicker).
+        with mock.patch.object(hsf, "load_ticker_aliases", return_value={}):
+            res = hsf.resolve_ticker("OCM", tickers=self.tickers_with_omc, mode="local")
+        self.assertEqual(res["ticker"], "OMC")
+        self.assertEqual(res["source"], "fuzzy")
+
+    def test_alias_and_local_take_priority_over_fuzzy(self):
+        # A real local match should win outright, never falling to fuzzy.
+        res = hsf.resolve_ticker("apple", tickers=TICKERS, mode="local")
+        self.assertEqual(res["source"], "edgar_local")
+
+
+class TestLoadTickerAliases(unittest.TestCase):
+    def test_loads_default_seed_file(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("HOT_SEAT_ALIAS_FILE", None)
+            aliases = hsf.load_ticker_aliases()
+        self.assertEqual(aliases.get("OCM"), "OMC")
+
+    def test_env_override_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            custom = Path(td) / "my_aliases.json"
+            custom.write_text(json.dumps({"XYZ": {"ticker": "abc"}}), encoding="utf-8")
+            with mock.patch.dict(os.environ, {"HOT_SEAT_ALIAS_FILE": str(custom)}):
+                aliases = hsf.load_ticker_aliases()
+            self.assertEqual(aliases, {"XYZ": "ABC"})
+
+    def test_missing_override_file_returns_empty(self):
+        with mock.patch.dict(os.environ, {"HOT_SEAT_ALIAS_FILE": "/tmp/does-not-exist-xyz.json"}):
+            self.assertEqual(hsf.load_ticker_aliases(), {})
+
+    def test_malformed_json_returns_empty(self):
+        with tempfile.TemporaryDirectory() as td:
+            bad = Path(td) / "bad.json"
+            bad.write_text("{not valid json", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"HOT_SEAT_ALIAS_FILE": str(bad)}):
+                self.assertEqual(hsf.load_ticker_aliases(), {})
 
 
 class TestResolveLatestFiling(unittest.TestCase):

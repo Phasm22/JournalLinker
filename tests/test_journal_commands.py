@@ -81,11 +81,127 @@ class TestParseCommand(unittest.TestCase):
         # Mentions a 10-K but issues no fetch verb -> not a command.
         self.assertIsNone(jc.parse_command("I read Ford's 10-K yesterday"))
 
+    def test_company_before_verb(self):
+        # Company can precede the verb entirely, not just follow it as a
+        # prepositional object.
+        cmd = jc.parse_command("Ford's 10-K, can you pull it")
+        self.assertEqual(cmd["company"], "ford")
+
+    def test_company_before_verb_via_preposition(self):
+        cmd = jc.parse_command("for Ford, pull the 10-K")
+        self.assertEqual(cmd["company"], "ford")
+
+    def test_after_still_wins_when_both_sides_present(self):
+        # Company mentioned on both sides: prepositional-object handling
+        # (highest confidence) still wins over the before/after fallback.
+        cmd = jc.parse_command("Ford's 10-K, pull the 10-K for Apple")
+        self.assertEqual(cmd["company"], "apple")
+
     def test_requires_form(self):
         self.assertIsNone(jc.parse_command("pull the thing for ford"))
 
     def test_empty(self):
         self.assertIsNone(jc.parse_command(""))
+
+    def test_strips_wikilinks_from_company(self):
+        cmd = jc.parse_command("pull the 10-K for [[Ford]]")
+        self.assertEqual(cmd["company"], "ford")
+
+    def test_wikilinked_wake_and_ticker(self):
+        cmd = jc.parse_command("pull the 10K for ticker [[ocm]]")
+        self.assertEqual(cmd["company"], "ocm")
+
+    def test_collapses_spelled_out_letters(self):
+        cmd = jc.parse_command("pull the 10-K for ticker O-C-M")
+        self.assertEqual(cmd["company"], "ocm")
+
+    def test_collapses_spelled_out_letters_space_separated(self):
+        cmd = jc.parse_command("pull the 10-K for ticker O C M")
+        self.assertEqual(cmd["company"], "ocm")
+
+    def test_past_tense_verb_with_no_company_is_not_a_command(self):
+        # Regression: "pulled the 10K" (no company at all) used to leak
+        # "pulled" through as a bogus company because the filler list only
+        # had the bare "pull", not "pulled". Real reported bug.
+        self.assertIsNone(jc.parse_command("pulled the 10K"))
+        # Same scenario via the full wake-word pipeline (parse_command()
+        # only ever sees command_text *after* the wake word is stripped by
+        # extract_command_spans(), so the wake word must not leak in here).
+        self.assertEqual(jc.find_commands("[[Palindrome]] pulled the 10K"), [])
+
+    def test_past_tense_verb_variants_still_recognized_with_company(self):
+        for phrase in [
+            "pulled the 10-K for Ford",
+            "pulling up the 10-K for Ford",
+            "fetched the 10-K for Ford",
+            "grabbed the 10-K for Ford",
+            "downloaded the 10-K for Ford",
+            "got me the 10-K for Ford",
+        ]:
+            cmd = jc.parse_command(phrase)
+            self.assertIsNotNone(cmd, phrase)
+            self.assertEqual(cmd["company"], "ford", phrase)
+
+    def test_pole_homophone_recognized_as_pull_with_company(self):
+        # Real evidence (2026-07-04 journal): Whisper misheard "pull" as
+        # "pole". With a company present it should still resolve.
+        cmd = jc.parse_command("pole the 10-K for APH")
+        self.assertIsNotNone(cmd)
+        self.assertEqual(cmd["company"], "aph")
+
+    def test_pole_with_no_form_still_fails(self):
+        # Matches the real utterance exactly: no form mentioned at all, so
+        # this is out of scope regardless of verb recognition.
+        self.assertIsNone(jc.parse_command("pole ticker APH and add it to the hot seat"))
+
+
+class TestParseCommandDiagnostic(unittest.TestCase):
+    def test_ok_result_matches_parse_command(self):
+        result, diag = jc.parse_command_diagnostic("pull the 10-K for Ford")
+        self.assertEqual(result, jc.parse_command("pull the 10-K for Ford"))
+        self.assertEqual(diag["reason"], "ok")
+        self.assertFalse(diag["is_artifact_verb"])
+        self.assertFalse(diag["had_spelled_letters"])
+
+    def test_no_form_reason(self):
+        result, diag = jc.parse_command_diagnostic("pole ticker APH and add it to the hot seat")
+        self.assertIsNone(result)
+        self.assertEqual(diag["reason"], "no_form")
+        # Verb detection still runs even though form detection is what
+        # ultimately rejects it — this is what lets the anomaly-reporting
+        # layer flag "pole" as a mis-transcription even in a no-form miss.
+        self.assertTrue(diag["is_artifact_verb"])
+        self.assertEqual(diag["verb_lemma"], "pull")
+
+    def test_no_verb_reason(self):
+        result, diag = jc.parse_command_diagnostic("I read Ford's 10-K yesterday")
+        self.assertIsNone(result)
+        self.assertEqual(diag["reason"], "no_verb")
+
+    def test_no_company_reason_flags_the_real_bug(self):
+        result, diag = jc.parse_command_diagnostic("pulled the 10K")
+        self.assertIsNone(result)
+        self.assertEqual(diag["reason"], "no_company")
+        self.assertTrue(diag["is_artifact_verb"])
+        self.assertEqual(diag["verb_lemma"], "pull")
+
+    def test_artifact_verb_flagged_even_when_it_parses(self):
+        result, diag = jc.parse_command_diagnostic("pole the 10-K for APH")
+        self.assertIsNotNone(result)
+        self.assertEqual(diag["reason"], "ok")
+        self.assertTrue(diag["is_artifact_verb"])
+        self.assertEqual(diag["verb_form"], "pole")
+        self.assertEqual(diag["verb_lemma"], "pull")
+
+    def test_spelled_letters_flagged(self):
+        result, diag = jc.parse_command_diagnostic("pull the 10-K for ticker O-C-M")
+        self.assertIsNotNone(result)
+        self.assertTrue(diag["had_spelled_letters"])
+
+    def test_empty_text(self):
+        result, diag = jc.parse_command_diagnostic("")
+        self.assertIsNone(result)
+        self.assertEqual(diag["reason"], "no_form")
 
 
 class TestFindCommands(unittest.TestCase):
@@ -113,6 +229,56 @@ class TestFindCommands(unittest.TestCase):
         companies = sorted(c["company"] for c in cmds)
         self.assertEqual(companies, ["apple", "ford"])
 
+
+class TestFindCommandsWithDiagnostics(unittest.TestCase):
+    def test_clean_command_produces_no_anomaly(self):
+        text = "Palindrome, pull the 10-K for Ford."
+        commands, anomalies = jc.find_commands_with_diagnostics(text)
+        self.assertEqual(len(commands), 1)
+        self.assertEqual(anomalies, [])
+
+    def test_real_bug_produces_zero_commands_and_one_anomaly(self):
+        text = "Palindrome pulled the 10K"
+        commands, anomalies = jc.find_commands_with_diagnostics(text)
+        self.assertEqual(commands, [])
+        self.assertEqual(len(anomalies), 1)
+        self.assertEqual(anomalies[0]["reason"], "no_company")
+        self.assertTrue(anomalies[0]["is_artifact_verb"])
+
+    def test_pole_no_form_produces_zero_commands_and_one_anomaly(self):
+        text = "Palindrome, pole ticker APH and add it to the hot seat."
+        commands, anomalies = jc.find_commands_with_diagnostics(text)
+        self.assertEqual(commands, [])
+        self.assertEqual(len(anomalies), 1)
+        self.assertEqual(anomalies[0]["reason"], "no_form")
+        self.assertTrue(anomalies[0]["is_artifact_verb"])
+        self.assertEqual(anomalies[0]["verb_lemma"], "pull")
+
+    def test_pole_with_form_produces_command_and_anomaly(self):
+        # Auto-fetch AND flag: it still executes, but is tagged for review.
+        text = "Palindrome, pole the 10-K for APH."
+        commands, anomalies = jc.find_commands_with_diagnostics(text)
+        self.assertEqual(len(commands), 1)
+        self.assertEqual(commands[0]["company"], "aph")
+        self.assertEqual(len(anomalies), 1)
+        self.assertEqual(anomalies[0]["reason"], "ok")
+        self.assertEqual(anomalies[0]["company"], "aph")
+
+    def test_spelled_letters_produces_command_and_anomaly(self):
+        text = "Palindrome, pull the 10-K for ticker O-C-M."
+        commands, anomalies = jc.find_commands_with_diagnostics(text)
+        self.assertEqual(len(commands), 1)
+        self.assertEqual(commands[0]["company"], "ocm")
+        self.assertEqual(len(anomalies), 1)
+        self.assertTrue(anomalies[0]["had_spelled_letters"])
+
+    def test_non_command_wake_sentence_no_anomaly(self):
+        # A wake-word hit with no fetch-shaped phrasing at all shouldn't be
+        # reported as an anomaly — it's just normal journaling.
+        text = "Palindrome, remind me to call the dentist."
+        commands, anomalies = jc.find_commands_with_diagnostics(text)
+        self.assertEqual(commands, [])
+        self.assertEqual(anomalies, [])
 
 class TestStripSpans(unittest.TestCase):
     def test_strips_recognized_span(self):

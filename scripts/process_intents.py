@@ -151,6 +151,7 @@ DIGEST_QUEUE_FILENAME = "intent_digest_queue.jsonl"
 FEEDBACK_QUEUE_FILENAME = "intent_feedback_queue.jsonl"
 ACTION_QUEUE_FILENAME = "intent_action_queue.jsonl"
 COMMAND_LEDGER_FILENAME = "intent_command_ledger.jsonl"
+VOICE_ANOMALY_LOG_FILENAME = "voice_anomalies.jsonl"
 CONSENT_FILENAME = "intent_consent.json"
 
 
@@ -1423,6 +1424,76 @@ def append_command_ledger(state_dir: Path, record: dict) -> None:
         fh.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+def _voice_anomaly_log_path(state_dir: Path) -> Path:
+    return state_dir / VOICE_ANOMALY_LOG_FILENAME
+
+
+def append_voice_anomaly_log(state_dir: Path, record: dict) -> None:
+    """Append one line to voice_anomalies.jsonl (kept separate from
+    scribe_learning.json, which is Scribe's own link-ranking store and
+    shouldn't be polluted with unrelated voice-transcription-artifact data).
+    """
+    path = _voice_anomaly_log_path(state_dir)
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def classify_voice_anomaly(diag: dict) -> tuple[str, str]:
+    """Return (tag, corrected_term) for a diagnostics dict from
+    journal_commands.parse_command_diagnostic()/find_commands_with_diagnostics().
+    """
+    if diag.get("had_spelled_letters"):
+        corrected = str(diag.get("company") or "")
+        return "spelled_out_letters", corrected.upper()
+    if diag.get("is_artifact_verb"):
+        return "artifact_verb", str(diag.get("verb_lemma") or "")
+    if diag.get("verb_form"):
+        return "incomplete_command", ""
+    return "unrecognized", ""
+
+
+def _voice_anomaly_notification_body(diag: dict, tag: str, corrected_term: str) -> str:
+    raw = str(diag.get("raw") or "")[:200]
+    if tag == "spelled_out_letters":
+        return f"Spelled-out ticker auto-corrected to {corrected_term}: {raw!r}"
+    if tag == "artifact_verb":
+        verb_form = diag.get("verb_form", "")
+        return f"Whisper may have misheard '{corrected_term}' as '{verb_form}': {raw!r}"
+    if tag == "incomplete_command":
+        return f"Command didn't complete ({diag.get('reason', '')}): {raw!r}"
+    return f"Unrecognized voice-command attempt: {raw!r}"
+
+
+def report_voice_anomalies(state_dir: Path, anomalies: list[dict]) -> None:
+    """Log + Pushover-notify voice-command anomalies (not real commands, or
+    real commands flagged as likely transcription artifacts). Best-effort:
+    logging/notification failures never affect command execution.
+    """
+    for diag in anomalies:
+        tag, corrected_term = classify_voice_anomaly(diag)
+        record = {
+            "timestamp": _now_iso(),
+            "raw_text": diag.get("raw", ""),
+            "wake_word": diag.get("wake", ""),
+            "reason": diag.get("reason", ""),
+            "tag": tag,
+            "verb_form": diag.get("verb_form"),
+            "corrected_term": corrected_term,
+        }
+        try:
+            append_voice_anomaly_log(state_dir, record)
+        except Exception as exc:
+            _log("command", f"voice anomaly log error (ignored): {exc}")
+        try:
+            _push_command_notification(
+                "Voice command anomaly",
+                _voice_anomaly_notification_body(diag, tag, corrected_term),
+                urgency="today",
+            )
+        except Exception as exc:
+            _log("command", f"voice anomaly notify error (ignored): {exc}")
+
+
 def compute_command_idempotency_key(source_path: Path, source_date: str, cmd_key: str) -> str:
     fingerprint = "\n".join([
         "command_idempotency_version=1",
@@ -1638,7 +1709,10 @@ def run_command_stage(
         _log("command", f"hot_seat_fetch unavailable, skipping command stage: {exc}")
         return EXIT_SUCCESS, note_text
 
-    commands = jc.find_commands(note_text)
+    commands, anomalies = jc.find_commands_with_diagnostics(note_text)
+    if anomalies:
+        _log("command", f"found {len(anomalies)} voice anomaly(ies)")
+        report_voice_anomalies(state_dir, anomalies)
     if not commands:
         return EXIT_SUCCESS, note_text
 

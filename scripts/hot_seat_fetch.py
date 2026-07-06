@@ -21,6 +21,8 @@ Env vars:
     HOT_SEAT_DIR           Download target (default: ~/Documents/hot_seat).
     HOT_SEAT_TICKER_RESOLVER  openai|local|auto (default: auto — OpenAI first,
                            local EDGAR name-match fallback).
+    HOT_SEAT_ALIAS_FILE    Path to a personal ticker-alias JSON override
+                           (default: scripts/ticker_aliases.json in-repo).
     INTENT_ROUTING_MODEL   OpenAI model for name->ticker (default: gpt-4o-mini).
     OPENAI_API_KEY         Enables the OpenAI resolver.
 
@@ -32,6 +34,7 @@ Exit codes:
 """
 
 import argparse
+import difflib
 import json
 import os
 import re
@@ -40,6 +43,11 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from text_normalize import normalize_command_text
 
 DEFAULT_USER_AGENT = "TJResearch/1.0 tj@example.com"
 COMPANY_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
@@ -193,6 +201,57 @@ def local_resolve_ticker(query: str, tickers: list[dict]) -> dict | None:
     return best
 
 
+# Fuzzy-match thresholds are length-aware: a single-letter transposition in a
+# short ticker already swings difflib's ratio a lot (measured: "OCM" vs the
+# real "OMC" = 0.667), so ticker-vs-ticker comparisons use a low bar. Longer
+# title comparisons keep a high bar since more characters make coincidental
+# similarity far less likely.
+_FUZZY_TICKER_THRESHOLD = 0.6
+_FUZZY_TITLE_THRESHOLD = 0.8
+
+
+def fuzzy_resolve_ticker(query: str, tickers: list[dict]) -> dict | None:
+    """Last-resort similarity match for near-misses exact/token/prefix
+    scoring in local_resolve_ticker can't catch — e.g. a short ticker heard
+    as a letter transposition ("OCM" spoken/heard for the real "OMC").
+
+    Compares against both raw ticker symbols (what actually catches short
+    transpositions — token-subset scoring in local_resolve_ticker doesn't
+    help for single short tokens) and normalized titles (for longer company
+    names). Returns a low_confidence result so callers can flag it.
+    """
+    q_raw = str(query or "").strip()
+    ql = _norm(q_raw)
+    if not ql:
+        return None
+
+    best: dict | None = None
+    best_ratio = 0.0
+    for row in tickers:
+        ticker = row["ticker"]
+        title = row["title"]
+        tnorm = _norm(title)
+
+        ticker_ratio = difflib.SequenceMatcher(None, q_raw.upper(), ticker).ratio()
+        if ticker_ratio >= _FUZZY_TICKER_THRESHOLD and ticker_ratio > best_ratio:
+            best, best_ratio = row, ticker_ratio
+
+        title_ratio = difflib.SequenceMatcher(None, ql, tnorm).ratio()
+        if title_ratio >= _FUZZY_TITLE_THRESHOLD and title_ratio > best_ratio:
+            best, best_ratio = row, title_ratio
+
+    if best is None:
+        return None
+    return {
+        "ticker": best["ticker"],
+        "cik_str": best["cik_str"],
+        "title": best["title"],
+        "source": "fuzzy",
+        "score": round(best_ratio, 3),
+        "low_confidence": True,
+    }
+
+
 def openai_resolve_ticker(query: str) -> str | None:
     """Ask OpenAI for the most likely ticker. Returns a ticker or None."""
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
@@ -228,12 +287,51 @@ def openai_resolve_ticker(query: str) -> str | None:
         return None
 
 
+_DEFAULT_ALIAS_FILE = Path(__file__).resolve().parent / "ticker_aliases.json"
+
+
+def load_ticker_aliases() -> dict[str, str]:
+    """Load the ticker-alias override table: uppercase query -> canonical ticker.
+
+    A manually curated correction list for known misheard-transcription
+    cases (e.g. "OCM" -> "OMC" for Omnicom), not a general alias/nickname
+    dictionary — that's what fuzzy matching and OpenAI resolution are for.
+    Re-read on every call (the file is tiny; no TTL/caching needed).
+    """
+    raw_path = os.getenv("HOT_SEAT_ALIAS_FILE", "").strip()
+    path = Path(raw_path).expanduser() if raw_path else _DEFAULT_ALIAS_FILE
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    aliases: dict[str, str] = {}
+    for key, value in data.items():
+        ticker = value.get("ticker") if isinstance(value, dict) else value
+        if ticker:
+            aliases[str(key).strip().upper()] = str(ticker).strip().upper()
+    return aliases
+
+
 def resolve_ticker(query: str, *, tickers: list[dict] | None = None,
                    mode: str = "auto") -> dict | None:
     """Resolve a company reference to {ticker, cik_str, title, source}."""
+    query = normalize_command_text(str(query or ""))
     if tickers is None:
         tickers = load_company_tickers()
     by_ticker = {row["ticker"]: row for row in tickers}
+
+    aliases = load_ticker_aliases()
+    alias_ticker = aliases.get(query.strip().upper())
+    if alias_ticker and alias_ticker in by_ticker:
+        row = by_ticker[alias_ticker]
+        return {
+            "ticker": row["ticker"],
+            "cik_str": row["cik_str"],
+            "title": row["title"],
+            "source": "alias",
+        }
 
     if mode in ("auto", "openai"):
         oai = openai_resolve_ticker(query)
@@ -248,7 +346,7 @@ def resolve_ticker(query: str, *, tickers: list[dict] | None = None,
         if mode == "openai":
             return None
 
-    return local_resolve_ticker(query, tickers)
+    return local_resolve_ticker(query, tickers) or fuzzy_resolve_ticker(query, tickers)
 
 
 # ---------------------------------------------------------------------------
