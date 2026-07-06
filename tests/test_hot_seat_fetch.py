@@ -145,6 +145,17 @@ class TestFuzzyResolveTicker(unittest.TestCase):
         self.assertEqual(res["source"], "edgar_local")
 
 
+class TestResolverConfidence(unittest.TestCase):
+    def test_fuzzy_is_low(self):
+        # The OCM->OMC transposition scores difflib ratio 0.667 (over the fuzzy
+        # bar) but should still map to the shaky 0.5 tier so it gets confirmed.
+        self.assertEqual(hsf.resolver_confidence("fuzzy"), 0.5)
+
+    def test_confident_sources(self):
+        for source in ("edgar_local", "alias", "openai", "exact", None):
+            self.assertEqual(hsf.resolver_confidence(source), 1.0)
+
+
 class TestLoadTickerAliases(unittest.TestCase):
     def test_loads_default_seed_file(self):
         with mock.patch.dict(os.environ, {}, clear=False):

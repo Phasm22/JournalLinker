@@ -461,6 +461,31 @@ class TestDeclarativeConfig(unittest.TestCase):
                              [("alert_add", "apple")])
 
 
+class TestConfidence(unittest.TestCase):
+    def test_parse_confidence_tiers(self):
+        self.assertEqual(jc.parse_confidence(False, False), 1.0)
+        self.assertEqual(jc.parse_confidence(True, False), 0.7)   # artifact verb
+        self.assertEqual(jc.parse_confidence(False, True), 0.7)   # spelled letters
+        self.assertEqual(jc.parse_confidence(True, True), 0.7)
+
+    def test_canonical_command_is_full_confidence(self):
+        result = jc.parse_command("pull the 10-K for Ford")
+        self.assertEqual(result["confidence"], 1.0)
+
+    def test_artifact_verb_lowers_confidence(self):
+        # "pulled" is a tense-drift artifact of "pull".
+        result = jc.parse_command("pulled the 10-K for Ford")
+        self.assertEqual(result["confidence"], 0.7)
+
+    def test_spelled_out_letters_lower_confidence(self):
+        result = jc.parse_command("pull the 10-K for O-C-M")
+        self.assertEqual(result["confidence"], 0.7)
+
+    def test_watchlist_command_carries_confidence(self):
+        result = jc.parse_watchlist_command("watch Ford")
+        self.assertEqual(result["confidence"], 1.0)
+
+
 class TestStripSpans(unittest.TestCase):
     def test_strips_recognized_span(self):
         text = "Before. Palindrome, pull the 10-K for Ford. After."

@@ -303,6 +303,28 @@ def _extract_company(command_text: str, form_span: tuple[int, int] | None) -> st
     return _clean_company(text)
 
 
+# Parse-level confidence tiers. A clean canonical verb with no spelled-out
+# letters is a full-confidence match; an artifact verb (tense drift/homophone
+# Whisper produced) or spelled-out letters ("O-C-M") is a recognized-but-shaky
+# signal worth a lower score. Ticker-resolution confidence (e.g. a fuzzy
+# difflib match) is a separate tier composed in later (see hot_seat_fetch
+# .resolver_confidence and run_command_stage).
+_CONFIDENCE_CANONICAL = 1.0
+_CONFIDENCE_ARTIFACT = 0.7
+
+
+def parse_confidence(is_artifact_verb: bool, had_spelled_letters: bool) -> float:
+    """Parse-level confidence for a recognized command (0.0-1.0).
+
+    Canonical verb + no spelled-out letters (+ an exact form match, which a
+    successful form-requiring parse already implies) -> 1.0; an artifact verb
+    or spelled-out letters -> 0.7. Kept in one place so the tiers can't drift.
+    """
+    if is_artifact_verb or had_spelled_letters:
+        return _CONFIDENCE_ARTIFACT
+    return _CONFIDENCE_CANONICAL
+
+
 def parse_route_diagnostic(command_text: str, route_name: str) -> tuple[dict | None, dict]:
     """Parse a single command sentence against one configured route, returning
     (result, diagnostics).
@@ -363,11 +385,14 @@ def parse_route_diagnostic(command_text: str, route_name: str) -> tuple[dict | N
         return None, diag
 
     diag["reason"] = "ok"
+    confidence = parse_confidence(diag["is_artifact_verb"], diag["had_spelled_letters"])
+    diag["confidence"] = confidence
     result: dict = {"route": route_name}
     if requires_form:
         result["form"] = form
     result["company"] = company
     result["command_text"] = normalized.strip()
+    result["confidence"] = confidence
     return result, diag
 
 

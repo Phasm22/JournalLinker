@@ -209,6 +209,21 @@ def local_resolve_ticker(query: str, tickers: list[dict]) -> dict | None:
 _FUZZY_TICKER_THRESHOLD = 0.6
 _FUZZY_TITLE_THRESHOLD = 0.8
 
+# Resolver-confidence tier for a ticker resolution, keyed on its `source`. A
+# fuzzy difflib match is the shaky tier (the OCM->OMC transposition scored
+# ratio 0.667, over the 0.6 fuzzy bar but well short of certainty), so it maps
+# to 0.5 — below the default low-confidence threshold — so a fuzzy resolution
+# asks for confirmation rather than auto-executing. Every other source (an
+# exact/local hit, a curated alias, an OpenAI answer) is treated as confident.
+_RESOLVER_CONFIDENCE_FUZZY = 0.5
+_RESOLVER_CONFIDENCE_CONFIDENT = 1.0
+
+
+def resolver_confidence(source: str | None) -> float:
+    """Confidence (0.0-1.0) implied by a resolution's `source`. `fuzzy` -> 0.5;
+    everything else (`alias`/`openai`/`edgar_local`/exact) -> 1.0."""
+    return _RESOLVER_CONFIDENCE_FUZZY if source == "fuzzy" else _RESOLVER_CONFIDENCE_CONFIDENT
+
 
 def fuzzy_resolve_ticker(query: str, tickers: list[dict]) -> dict | None:
     """Last-resort similarity match for near-misses exact/token/prefix

@@ -113,6 +113,7 @@ class RunSummary:
     retry_queue_out: int = 0
     commands_executed: int = 0
     commands_failed: int = 0
+    commands_needs_confirmation: int = 0
 
     def to_payload(self) -> dict:
         return {k: v for k, v in asdict(self).items()}
@@ -1394,6 +1395,23 @@ def command_mode_enabled() -> bool:
     return raw not in ("0", "false", "no", "off")
 
 
+DEFAULT_LOW_CONFIDENCE_THRESHOLD = 0.6
+
+
+def low_confidence_threshold() -> float:
+    """Overall-confidence floor below which a recognized command is not
+    auto-executed but flagged for confirmation. Env-overridable via
+    LOW_CONFIDENCE_THRESHOLD (default 0.6). A bad value falls back to default.
+    """
+    raw = os.getenv("LOW_CONFIDENCE_THRESHOLD", "").strip()
+    if not raw:
+        return DEFAULT_LOW_CONFIDENCE_THRESHOLD
+    try:
+        return float(raw)
+    except ValueError:
+        return DEFAULT_LOW_CONFIDENCE_THRESHOLD
+
+
 def _command_ledger_path(state_dir: Path) -> Path:
     return state_dir / COMMAND_LEDGER_FILENAME
 
@@ -1441,7 +1459,12 @@ def append_voice_anomaly_log(state_dir: Path, record: dict) -> None:
 def classify_voice_anomaly(diag: dict) -> tuple[str, str]:
     """Return (tag, corrected_term) for a diagnostics dict from
     journal_commands.parse_command_diagnostic()/find_commands_with_diagnostics().
+
+    A caller may pre-set diag["tag"] (e.g. "low_confidence" for a command the
+    confidence gate declined to auto-execute); that wins over inference.
     """
+    if diag.get("tag") == "low_confidence":
+        return "low_confidence", str(diag.get("corrected_term") or "")
     if diag.get("had_spelled_letters"):
         corrected = str(diag.get("company") or "")
         return "spelled_out_letters", corrected.upper()
@@ -1461,6 +1484,11 @@ def _voice_anomaly_notification_body(diag: dict, tag: str, corrected_term: str) 
         return f"Whisper may have misheard '{corrected_term}' as '{verb_form}': {raw!r}"
     if tag == "incomplete_command":
         return f"Command didn't complete ({diag.get('reason', '')}): {raw!r}"
+    if tag == "low_confidence":
+        conf = diag.get("confidence")
+        conf_txt = f" (confidence {conf})" if conf is not None else ""
+        target = f" for {corrected_term}" if corrected_term else ""
+        return f"Low-confidence command{target}{conf_txt} — confirm before acting: {raw!r}"
     return f"Unrecognized voice-command attempt: {raw!r}"
 
 
@@ -1479,6 +1507,8 @@ def report_voice_anomalies(state_dir: Path, anomalies: list[dict]) -> None:
             "tag": tag,
             "verb_form": diag.get("verb_form"),
             "corrected_term": corrected_term,
+            "route": diag.get("route"),
+            "confidence": diag.get("confidence"),
         }
         try:
             append_voice_anomaly_log(state_dir, record)
@@ -1492,6 +1522,29 @@ def report_voice_anomalies(state_dir: Path, anomalies: list[dict]) -> None:
             )
         except Exception as exc:
             _log("command", f"voice anomaly notify error (ignored): {exc}")
+
+
+def report_low_confidence_command(
+    state_dir: Path, cmd: dict, confidence: float, corrected_term: str, raw: str,
+) -> None:
+    """Flag a recognized command the confidence gate declined to auto-execute.
+
+    Reuses the voice-anomaly plumbing (voice_anomalies.jsonl + Pushover) with a
+    pre-set tag="low_confidence" rather than inventing a new sink — the record
+    also carries the composed confidence, route, and the fuzzy-resolved term.
+    """
+    diag = {
+        "tag": "low_confidence",
+        "reason": "low_confidence",
+        "raw": raw,
+        "wake": cmd.get("wake", ""),
+        "verb_form": cmd.get("verb_form"),
+        "route": cmd.get("route"),
+        "company": cmd.get("company", ""),
+        "corrected_term": corrected_term,
+        "confidence": round(float(confidence), 3),
+    }
+    report_voice_anomalies(state_dir, [diag])
 
 
 def compute_command_idempotency_key(source_path: Path, source_date: str, cmd_key: str) -> str:
@@ -1859,6 +1912,7 @@ def run_command_stage(
     _log("command", f"found {len(commands)} command(s)")
     ledger = load_command_ledger(state_dir)
     worst_exit = EXIT_SUCCESS
+    threshold = low_confidence_threshold()
 
     for cmd in commands:
         cmd_key = cmd.get("key", "")
@@ -1867,8 +1921,9 @@ def run_command_stage(
         company = cmd.get("company", "")
         route = cmd.get("route", "hot_seat_fetch")
         form = cmd.get("form", "10-K")
+        parse_conf = float(cmd.get("confidence", 1.0))
 
-        _log("command", f"route={route} form={form} company={company!r}")
+        _log("command", f"route={route} form={form} company={company!r} confidence={parse_conf}")
 
         prior = ledger.get(idem)
         if prior and prior.get("status") == "success":
@@ -1877,6 +1932,18 @@ def run_command_stage(
 
         if dry_run:
             _log("command", f"dry-run: would execute route={route} company={company!r}")
+            continue
+
+        # Parse-level confidence gate (applies to every route). With the default
+        # threshold this never blocks — a canonical match is 1.0, an
+        # artifact/spelled match 0.7, both >= 0.6 — but raising the threshold
+        # lets an operator require confirmation for shakier phrasings too.
+        if parse_conf < threshold:
+            _log("command",
+                 f"low confidence parse ({parse_conf:.2f} < {threshold:.2f}) — "
+                 f"needs confirmation, not executing")
+            report_low_confidence_command(state_dir, cmd, parse_conf, company, raw_command)
+            summary.commands_needs_confirmation += 1
             continue
 
         if route == "watchlist_add":
@@ -1900,6 +1967,28 @@ def run_command_stage(
                 traceback.print_exc(file=sys.stderr)
             result = {"ok": False, "stage": "exception", "error": str(exc),
                       "query": company, "form": form}
+
+        # Resolver-confidence gate: compose the parse confidence with the ticker
+        # resolver's confidence using min() (weakest link — a blind product
+        # would over-penalize a legit artifact command, e.g. 0.7*0.5=0.35). The
+        # fuzzy source is only known after fetch_10k resolves, and the 10-K
+        # download is idempotent/cached, so on a sub-threshold fuzzy match we
+        # decline to *commit* — no index, no success ledger row — and flag it
+        # for confirmation instead.
+        if result.get("ok"):
+            resolver_conf = hsf.resolver_confidence(result.get("resolver"))
+            overall_conf = min(parse_conf, resolver_conf)
+            if overall_conf < threshold:
+                _log("command",
+                     f"low confidence resolve ({overall_conf:.2f} < {threshold:.2f}, "
+                     f"resolver={result.get('resolver')}) — needs confirmation, "
+                     f"not indexing/recording")
+                report_low_confidence_command(
+                    state_dir, cmd, overall_conf,
+                    result.get("ticker", company), raw_command,
+                )
+                summary.commands_needs_confirmation += 1
+                continue
 
         # Confirmation note (best-effort; failures are logged, not fatal).
         note_written = ""

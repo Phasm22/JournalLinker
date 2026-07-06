@@ -4,6 +4,7 @@ hot_seat_fetch and Pushover are mocked; filesystem uses tempdirs.
 """
 
 import importlib.util
+import json
 import os
 import sys
 import tempfile
@@ -281,6 +282,110 @@ class TestVoiceAnomalies(unittest.TestCase):
             record = __import__("json").loads(lines[0])
             self.assertEqual(record["tag"], "spelled_out_letters")
             self.assertEqual(record["corrected_term"], "OCM")
+
+
+FUZZY_RESULT = {**OK_RESULT, "resolver": "fuzzy", "ticker": "OMC", "title": "OMNICOM GROUP INC"}
+
+
+class TestConfidenceGate(unittest.TestCase):
+    """A low overall confidence declines to auto-execute: it flags the command
+    for confirmation via the voice-anomaly plumbing instead of committing."""
+
+    def setUp(self):
+        self._env = mock.patch.dict(os.environ, {}, clear=False)
+        self._env.start()
+        for var in ("INTENT_COMMANDS_MODE", "LOW_CONFIDENCE_THRESHOLD",
+                    "SCRIBE_PUSHOVER_APP_TOKEN", "SCRIBE_PUSHOVER_USER_KEY",
+                    "PUSHOVER_TOKEN", "PUSHOVER_KEY"):
+            os.environ.pop(var, None)
+
+    def tearDown(self):
+        self._env.stop()
+
+    def test_fuzzy_resolver_declines_to_commit_and_flags(self):
+        # Canonical verb (parse 1.0) but the ticker only resolved via the fuzzy
+        # tier (0.5); min(1.0, 0.5) = 0.5 < 0.6 default -> needs confirmation.
+        note = "Palindrome, pull the 10-K for OCM."
+        with tempfile.TemporaryDirectory() as td:
+            state, cortex = Path(td) / "state", Path(td) / "cortex"
+            state.mkdir(); cortex.mkdir()
+            src = state / "2026-07-06.md"
+            src.write_text(note, encoding="utf-8")
+            with mock.patch.object(hsf, "fetch_10k", return_value=FUZZY_RESULT) as fetch_mock, \
+                    mock.patch.object(pi, "_push_command_notification") as push_mock, \
+                    mock.patch.object(pi, "index_hot_seat_dir", return_value={"ok": True}) as idx:
+                summary = pi.RunSummary()
+                pi.run_command_stage(
+                    note, src, "2026-07-06", cortex, state, summary,
+                    dry_run=False, verbose=False,
+                )
+                fetch_mock.assert_called_once()      # resolution is bundled in fetch
+                idx.assert_not_called()               # but we do NOT auto-index
+                push_mock.assert_called_once()        # confirmation ping fired
+            self.assertEqual(summary.commands_executed, 0)
+            self.assertEqual(summary.commands_needs_confirmation, 1)
+            # No success ledger row committed.
+            self.assertEqual(pi.load_command_ledger(state), {})
+            # Flagged in the shared anomaly log with the low_confidence tag.
+            log_path = state / pi.VOICE_ANOMALY_LOG_FILENAME
+            lines = log_path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(lines), 1)
+            record = json.loads(lines[0])
+            self.assertEqual(record["tag"], "low_confidence")
+            self.assertEqual(record["route"], "hot_seat_fetch")
+            self.assertEqual(record["confidence"], 0.5)
+            self.assertEqual(record["corrected_term"], "OMC")
+
+    def test_confident_resolver_executes_normally(self):
+        # Same canonical command, but an exact resolver -> 1.0 -> executes.
+        note = "Palindrome, pull the 10-K for Ford."
+        with tempfile.TemporaryDirectory() as td:
+            state, cortex = Path(td) / "state", Path(td) / "cortex"
+            state.mkdir(); cortex.mkdir()
+            src = state / "2026-07-06.md"
+            src.write_text(note, encoding="utf-8")
+            with mock.patch.object(hsf, "fetch_10k", return_value=OK_RESULT), \
+                    mock.patch.object(pi, "_push_command_notification"), \
+                    mock.patch.object(pi, "index_hot_seat_dir", return_value={"ok": True}):
+                summary = pi.RunSummary()
+                pi.run_command_stage(
+                    note, src, "2026-07-06", cortex, state, summary,
+                    dry_run=False, verbose=False,
+                )
+            self.assertEqual(summary.commands_executed, 1)
+            self.assertEqual(summary.commands_needs_confirmation, 0)
+            self.assertFalse((state / pi.VOICE_ANOMALY_LOG_FILENAME).exists())
+
+    def test_raised_threshold_gates_artifact_verb_before_fetch(self):
+        # With a raised threshold, a 0.7 artifact-verb parse is gated *before*
+        # any fetch happens (the parse-level pre-execution gate).
+        os.environ["LOW_CONFIDENCE_THRESHOLD"] = "0.8"
+        note = "Palindrome, pulled the 10-K for Ford."
+        with tempfile.TemporaryDirectory() as td:
+            state, cortex = Path(td) / "state", Path(td) / "cortex"
+            state.mkdir(); cortex.mkdir()
+            src = state / "2026-07-06.md"
+            src.write_text(note, encoding="utf-8")
+            with mock.patch.object(hsf, "fetch_10k") as fetch_mock, \
+                    mock.patch.object(pi, "_push_command_notification") as push_mock:
+                summary = pi.RunSummary()
+                pi.run_command_stage(
+                    note, src, "2026-07-06", cortex, state, summary,
+                    dry_run=False, verbose=False,
+                )
+                fetch_mock.assert_not_called()
+                # "pulled" is also an artifact verb, so it draws its own anomaly
+                # ping in addition to the low-confidence one.
+                self.assertEqual(push_mock.call_count, 2)
+            self.assertEqual(summary.commands_needs_confirmation, 1)
+            records = [
+                json.loads(line)
+                for line in (state / pi.VOICE_ANOMALY_LOG_FILENAME)
+                .read_text(encoding="utf-8").splitlines()
+            ]
+            low = [r for r in records if r["tag"] == "low_confidence"]
+            self.assertEqual(len(low), 1)
+            self.assertEqual(low[0]["confidence"], 0.7)
 
 
 RESOLVED_FORD = {"ticker": "F", "cik_str": 37996, "title": "FORD MOTOR CO", "source": "edgar_local"}
