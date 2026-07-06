@@ -61,10 +61,10 @@ Compared against Alexa Skills Kit, Rasa, and Dialogflow's architectures. Full di
 
 5. Wake-word spotting (Porcupine/openWakeWord) doesn't apply here — Whisper already transcribes to text before `journal_commands.py` runs, so there's no raw-audio hotword-detection stage in this pipeline. Not a gap, just a different pipeline shape.
 
-## Suggested next-session scope (not started)
+## Suggested next-session scope
 
-In rough priority order, if/when you want to resume:
-1. Extract route definitions (verb forms, form patterns, filler derivation) into a declarative config file loaded by `journal_commands.py`.
-2. Add a numeric confidence tier + threshold-based fallback instead of binary parse/no-parse, informed by the artifact/fuzzy distinctions already in place.
-3. Build a small report/summary view over `voice_anomalies.jsonl` (which verbs/routes misfire most) instead of reading the raw log.
+In rough priority order:
+1. ✅ **Done.** Route definitions (verb forms, form patterns, filler derivation) live in `scripts/voice_command_routes.json`, loaded at import by `journal_commands.py`. Recognition is route-generic (`parse_route_diagnostic`, `_find_verb_for_route`, config-order iteration in `find_commands_with_diagnostics`), so adding a route is a config edit with zero code changes. Filler words derive from the union of every configured route's verb forms, preserving the verb/filler-desync invariant.
+2. ✅ **Done.** Numeric confidence tier + threshold fallback replaces binary parse/no-parse. `parse_confidence()` scores canonical→1.0, artifact/spelled→0.7; `hot_seat_fetch.resolver_confidence()` scores fuzzy→0.5, else 1.0. `run_command_stage()` composes them with `min()` and, below env-configurable `LOW_CONFIDENCE_THRESHOLD` (default 0.6), flags for confirmation via the `voice_anomalies.jsonl` + Pushover path with `tag="low_confidence"` instead of auto-executing.
+3. ✅ **Done.** `scripts/voice_anomaly_report.py` summarizes the anomaly log by tag, route, verb form, and corrected term (Rasa `errors.json` equivalent) instead of reading raw JSONL.
 4. Fix the pre-existing test-order flake (already spawned as a separate task — check if it's been picked up).

@@ -342,6 +342,7 @@ def parse_route_diagnostic(command_text: str, route_name: str) -> tuple[dict | N
     requires_form = route["requires_form"]
     diag = {
         "reason": "no_form" if requires_form else "no_verb",
+        "route": route_name,
         "verb_form": None,
         "verb_lemma": None,
         "is_artifact_verb": False,
