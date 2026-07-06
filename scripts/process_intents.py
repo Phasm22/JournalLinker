@@ -1570,6 +1570,146 @@ def write_command_result_note(
     return note_path
 
 
+def _watchlist_note_path(cortex_dir: Path) -> Path:
+    return cortex_dir / "Watchlist.md"
+
+
+def add_to_watchlist(
+    cortex_dir: Path, *, ticker: str, title: str, company: str, source_date: str,
+) -> tuple[Path, bool]:
+    """Append a ticker to Watchlist.md if not already present.
+
+    A single running markdown list (not a per-event note like
+    write_command_result_note) so it stays a stable target for future
+    automations to read from. Returns (note_path, added) where added=False
+    means the ticker was already on the list — idempotent by design, since
+    the command ledger only guards against re-processing the *same* journal
+    span, not against watching the same ticker twice from different notes.
+    """
+    path = _watchlist_note_path(cortex_dir)
+    cortex_dir.mkdir(parents=True, exist_ok=True)
+    display_key = (ticker or company).strip().upper()
+    marker = f"[[{display_key}]]"
+
+    lines: list[str] = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    for line in lines:
+        if marker in line:
+            return path, False
+
+    suffix = f" ({title})" if title else ""
+    new_line = f"- {marker}{suffix} — added {source_date}"
+
+    if not lines:
+        lines = ["# Watchlist", ""]
+    lines.append(new_line)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _log("command", f"wrote {path}")
+    return path, True
+
+
+def _execute_watchlist_add(
+    cmd: dict, cortex_dir: Path, hsf, source_path: Path, source_date: str,
+    idem: str, *, verbose: bool,
+) -> dict:
+    """Execute the watchlist_add route.
+
+    Always records the ticker/company in Watchlist.md — that succeeds or
+    fails independent of filing status. Then best-effort attempts a 10-K
+    fetch afterward so the filing shows up in hot_seat if one exists;
+    fetch failure never affects the watchlist add itself, and doesn't page
+    you the way a real hot_seat_fetch failure does (this is expected to
+    miss sometimes — you're tracking a ticker, not asserting a filing exists).
+    """
+    company = cmd.get("company", "")
+    raw_command = cmd.get("raw", cmd.get("command_text", ""))
+
+    resolved: dict | None = None
+    try:
+        resolved = hsf.resolve_ticker(company)
+    except Exception as exc:
+        _log("command", f"watchlist resolve error (ignored): {exc}")
+
+    ticker = resolved.get("ticker", "") if resolved else ""
+    title = resolved.get("title", "") if resolved else ""
+
+    try:
+        note_path, added = add_to_watchlist(
+            cortex_dir, ticker=ticker, title=title, company=company,
+            source_date=source_date,
+        )
+        note_written = str(note_path)
+        add_status = "success"
+        add_error = ""
+    except Exception as exc:
+        note_written = ""
+        add_status = "failed"
+        add_error = str(exc)
+        added = False
+        _log("command", f"watchlist write error: {exc}")
+
+    fetch_status = "skipped"
+    fetch_error = ""
+    index_status: dict = {}
+    fy = ""
+    folder = ""
+    if add_status == "success":
+        try:
+            result = hsf.fetch_10k(company, form="10-K")
+        except Exception as exc:
+            result = {"ok": False, "stage": "exception", "error": str(exc)}
+            if verbose:
+                traceback.print_exc(file=sys.stderr)
+        if result.get("ok"):
+            fetch_status = "success"
+            ticker = result.get("ticker", ticker)
+            title = result.get("title", title)
+            fy = result.get("fy", "")
+            folder = result.get("folder", "")
+            if folder and result.get("downloaded") and hot_seat_autoindex_enabled():
+                index_status = index_hot_seat_dir(Path(folder).parent)
+        else:
+            fetch_status = "failed"
+            fetch_error = result.get("error", "")
+            _log("command", f"watchlist background fetch failed (non-fatal): {fetch_error}")
+
+    ticker_display = ticker or company.upper()
+    if add_status == "success":
+        if fetch_status == "success":
+            body = f"Added {ticker_display} to watchlist — 10-K on file (FY{fy})."
+        else:
+            body = f"Added {ticker_display} to watchlist (no 10-K on file yet)."
+        _push_command_notification(f"Watchlist: {ticker_display}", body, urgency="today")
+    else:
+        _push_command_notification(
+            f"Watchlist add failed: {company}",
+            f"Could not add {company!r} to watchlist: {add_error}",
+            urgency="today",
+        )
+
+    return {
+        "command_idempotency_key": idem,
+        "source_path": str(source_path),
+        "source_date": source_date,
+        "cmd_key": cmd.get("key", ""),
+        "route": "watchlist_add",
+        "company": company,
+        "ticker": ticker,
+        "form": "",
+        "status": add_status,
+        "stage": "" if add_status == "success" else "watchlist_write",
+        "error": add_error,
+        "folder": folder,
+        "file": "",
+        "fy": fy,
+        "cortex_note": note_written,
+        "indexed": bool(index_status.get("ok")),
+        "watchlist_added": added,
+        "fetch_status": fetch_status,
+        "fetch_error": fetch_error,
+        "executed_at": _now_iso(),
+    }
+
+
 def _push_command_notification(title: str, body: str, urgency: str = "today") -> None:
     """Best-effort phone ping for command results. Never raises.
 
@@ -1725,9 +1865,10 @@ def run_command_stage(
         idem = compute_command_idempotency_key(source_path, source_date, cmd_key)
         raw_command = cmd.get("raw", cmd.get("command_text", ""))
         company = cmd.get("company", "")
+        route = cmd.get("route", "hot_seat_fetch")
         form = cmd.get("form", "10-K")
 
-        _log("command", f"route={cmd.get('route')} form={form} company={company!r}")
+        _log("command", f"route={route} form={form} company={company!r}")
 
         prior = ledger.get(idem)
         if prior and prior.get("status") == "success":
@@ -1735,7 +1876,20 @@ def run_command_stage(
             continue
 
         if dry_run:
-            _log("command", f"dry-run: would fetch {form} for {company!r}")
+            _log("command", f"dry-run: would execute route={route} company={company!r}")
+            continue
+
+        if route == "watchlist_add":
+            record = _execute_watchlist_add(
+                cmd, cortex_dir, hsf, source_path, source_date, idem, verbose=verbose,
+            )
+            if record["status"] == "success":
+                summary.commands_executed += 1
+            else:
+                summary.commands_failed += 1
+                worst_exit = max(worst_exit, EXIT_DELIVERY_TRANSIENT)
+            append_command_ledger(state_dir, record)
+            ledger[idem] = record
             continue
 
         index_status: dict = {}

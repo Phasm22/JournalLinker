@@ -104,3 +104,5 @@ Separate from Scribe: reads a daily note, decides whether it contains actionable
 6. **Deliver** — Push to configured sinks (e.g. Pushover, cortex files, digest queue). Record outcomes in the ledger and run history. Optional paths can schedule Telegram feedback check-ins or append digest lines when those features are enabled.
 
 Design tradeoffs and weak spots (gate vs enrichment, recurrence heuristics, time): see [docs/intent-pipeline-risks.md](docs/intent-pipeline-risks.md).
+
+Voice command routes (`hot_seat_fetch`, `watchlist_add` — wake-word directives in `scripts/journal_commands.py`), pending architecture upgrades, and uncommitted-work handoff notes: see [docs/voice-command-architecture-handoff.md](docs/voice-command-architecture-handoff.md).

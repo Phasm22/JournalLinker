@@ -204,6 +204,56 @@ class TestParseCommandDiagnostic(unittest.TestCase):
         self.assertEqual(diag["reason"], "no_form")
 
 
+class TestWatchlistCommand(unittest.TestCase):
+    def test_basic_watch(self):
+        cmd = jc.parse_watchlist_command("watch APH")
+        self.assertEqual(cmd["route"], "watchlist_add")
+        self.assertEqual(cmd["company"], "aph")
+
+    def test_track_and_follow_synonyms(self):
+        self.assertEqual(jc.parse_watchlist_command("track Ford")["company"], "ford")
+        self.assertEqual(jc.parse_watchlist_command("follow Apple")["company"], "apple")
+
+    def test_no_form_required(self):
+        # Unlike hot_seat_fetch, this route never consults filing type.
+        cmd = jc.parse_watchlist_command("watch the 10-K for Ford")
+        self.assertIsNotNone(cmd)
+        self.assertEqual(cmd["company"], "ford")
+
+    def test_company_before_verb(self):
+        cmd = jc.parse_watchlist_command("Ford, watch it")
+        self.assertEqual(cmd["company"], "ford")
+
+    def test_wikilink_and_spelled_letters(self):
+        cmd = jc.parse_watchlist_command("watch ticker O-C-M")
+        self.assertEqual(cmd["company"], "ocm")
+        cmd2 = jc.parse_watchlist_command("watch [[Ford]]")
+        self.assertEqual(cmd2["company"], "ford")
+
+    def test_requires_verb(self):
+        self.assertIsNone(jc.parse_watchlist_command("I'm thinking about Ford"))
+
+    def test_requires_company(self):
+        self.assertIsNone(jc.parse_watchlist_command("watch it"))
+
+    def test_empty(self):
+        self.assertIsNone(jc.parse_watchlist_command(""))
+
+    def test_past_tense_variants_flagged_as_artifact_but_still_work(self):
+        result, diag = jc.parse_watchlist_command_diagnostic("watched Ford")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["company"], "ford")
+        self.assertTrue(diag["is_artifact_verb"])
+        self.assertEqual(diag["verb_lemma"], "watch")
+
+    def test_fetch_verbs_do_not_trigger_watchlist_route(self):
+        # Disjoint vocabularies by design: "pull" should never parse as watch.
+        self.assertIsNone(jc.parse_watchlist_command("pull the 10-K for Ford"))
+
+    def test_watch_verbs_do_not_trigger_fetch_route(self):
+        self.assertIsNone(jc.parse_command("watch the 10-K for Ford"))
+
+
 class TestFindCommands(unittest.TestCase):
     def test_full_note_single_command(self):
         text = "Morning pages. Palindrome, can you pull the latest ten K for Ford? Gym after."
@@ -279,6 +329,38 @@ class TestFindCommandsWithDiagnostics(unittest.TestCase):
         commands, anomalies = jc.find_commands_with_diagnostics(text)
         self.assertEqual(commands, [])
         self.assertEqual(anomalies, [])
+
+    def test_watchlist_command_dispatched_when_fetch_route_misses(self):
+        text = "Palindrome, watch APH."
+        commands, anomalies = jc.find_commands_with_diagnostics(text)
+        self.assertEqual(len(commands), 1)
+        self.assertEqual(commands[0]["route"], "watchlist_add")
+        self.assertEqual(commands[0]["company"], "aph")
+        self.assertEqual(anomalies, [])
+
+    def test_watchlist_past_tense_produces_command_and_anomaly(self):
+        text = "Palindrome, watched APH."
+        commands, anomalies = jc.find_commands_with_diagnostics(text)
+        self.assertEqual(len(commands), 1)
+        self.assertEqual(commands[0]["route"], "watchlist_add")
+        self.assertEqual(len(anomalies), 1)
+        self.assertTrue(anomalies[0]["is_artifact_verb"])
+
+    def test_watchlist_no_company_produces_anomaly(self):
+        text = "Palindrome, watch it."
+        commands, anomalies = jc.find_commands_with_diagnostics(text)
+        self.assertEqual(commands, [])
+        self.assertEqual(len(anomalies), 1)
+        self.assertEqual(anomalies[0]["reason"], "no_company")
+        self.assertEqual(anomalies[0]["verb_lemma"], "watch")
+
+    def test_fetch_and_watchlist_commands_coexist_in_one_note(self):
+        text = ("Palindrome, pull the 10-K for Ford. "
+                "Palindrome, watch Apple.")
+        commands, _anomalies = jc.find_commands_with_diagnostics(text)
+        routes = sorted((c["route"], c["company"]) for c in commands)
+        self.assertEqual(routes, [("hot_seat_fetch", "ford"), ("watchlist_add", "apple")])
+
 
 class TestStripSpans(unittest.TestCase):
     def test_strips_recognized_span(self):

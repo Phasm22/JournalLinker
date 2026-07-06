@@ -283,5 +283,180 @@ class TestVoiceAnomalies(unittest.TestCase):
             self.assertEqual(record["corrected_term"], "OCM")
 
 
+RESOLVED_FORD = {"ticker": "F", "cik_str": 37996, "title": "FORD MOTOR CO", "source": "edgar_local"}
+
+
+class TestWatchlistAdd(unittest.TestCase):
+    def setUp(self):
+        self._env = mock.patch.dict(os.environ, {}, clear=False)
+        self._env.start()
+        os.environ.pop("INTENT_COMMANDS_MODE", None)
+        os.environ.pop("SCRIBE_PUSHOVER_APP_TOKEN", None)
+        os.environ.pop("SCRIBE_PUSHOVER_USER_KEY", None)
+        os.environ.pop("PUSHOVER_TOKEN", None)
+        os.environ.pop("PUSHOVER_KEY", None)
+
+    def tearDown(self):
+        self._env.stop()
+
+    def test_add_with_successful_background_fetch(self):
+        note = "Palindrome, watch Ford."
+        with tempfile.TemporaryDirectory() as td:
+            state, cortex = Path(td) / "state", Path(td) / "cortex"
+            state.mkdir(); cortex.mkdir()
+            src = state / "2026-07-06.md"
+            src.write_text(note, encoding="utf-8")
+            with mock.patch.object(hsf, "resolve_ticker", return_value=RESOLVED_FORD), \
+                    mock.patch.object(hsf, "fetch_10k", return_value=OK_RESULT) as fetch_mock, \
+                    mock.patch.object(pi, "_push_command_notification") as push_mock, \
+                    mock.patch.object(pi, "index_hot_seat_dir", return_value={"ok": True}):
+                summary = pi.RunSummary()
+                pi.run_command_stage(
+                    note, src, "2026-07-06", cortex, state, summary,
+                    dry_run=False, verbose=False,
+                )
+                fetch_mock.assert_called_once()
+                self.assertEqual(fetch_mock.call_args.args[0], "ford")
+            self.assertEqual(summary.commands_executed, 1)
+            self.assertEqual(summary.commands_failed, 0)
+            push_mock.assert_called_once()
+            watchlist = cortex / "Watchlist.md"
+            self.assertTrue(watchlist.exists())
+            content = watchlist.read_text(encoding="utf-8")
+            self.assertIn("[[F]]", content)
+            self.assertIn("FORD MOTOR CO", content)
+            ledger = pi.load_command_ledger(state)
+            rec = next(iter(ledger.values()))
+            self.assertEqual(rec["route"], "watchlist_add")
+            self.assertEqual(rec["status"], "success")
+            self.assertEqual(rec["fetch_status"], "success")
+
+    def test_add_succeeds_even_when_no_10k_exists(self):
+        # The whole point: the add never depends on filing status.
+        no_filing = {"ok": False, "stage": "filing", "error": "no 10-K found",
+                     "query": "ford", "ticker": "F", "cik": 37996}
+        note = "Palindrome, watch Ford."
+        with tempfile.TemporaryDirectory() as td:
+            state, cortex = Path(td) / "state", Path(td) / "cortex"
+            state.mkdir(); cortex.mkdir()
+            src = state / "2026-07-06.md"
+            src.write_text(note, encoding="utf-8")
+            with mock.patch.object(hsf, "resolve_ticker", return_value=RESOLVED_FORD), \
+                    mock.patch.object(hsf, "fetch_10k", return_value=no_filing), \
+                    mock.patch.object(pi, "_push_command_notification"):
+                summary = pi.RunSummary()
+                pi.run_command_stage(
+                    note, src, "2026-07-06", cortex, state, summary,
+                    dry_run=False, verbose=False,
+                )
+            # Add still counts as executed (success), not failed.
+            self.assertEqual(summary.commands_executed, 1)
+            self.assertEqual(summary.commands_failed, 0)
+            watchlist = cortex / "Watchlist.md"
+            self.assertIn("[[F]]", watchlist.read_text(encoding="utf-8"))
+            ledger = pi.load_command_ledger(state)
+            rec = next(iter(ledger.values()))
+            self.assertEqual(rec["status"], "success")
+            self.assertEqual(rec["fetch_status"], "failed")
+
+    def test_unresolvable_ticker_still_records_company(self):
+        note = "Palindrome, watch Zzznotarealcompany."
+        with tempfile.TemporaryDirectory() as td:
+            state, cortex = Path(td) / "state", Path(td) / "cortex"
+            state.mkdir(); cortex.mkdir()
+            src = state / "2026-07-06.md"
+            src.write_text(note, encoding="utf-8")
+            with mock.patch.object(hsf, "resolve_ticker", return_value=None), \
+                    mock.patch.object(hsf, "fetch_10k",
+                                      return_value={"ok": False, "stage": "resolve", "error": "nope"}), \
+                    mock.patch.object(pi, "_push_command_notification"):
+                summary = pi.RunSummary()
+                pi.run_command_stage(
+                    note, src, "2026-07-06", cortex, state, summary,
+                    dry_run=False, verbose=False,
+                )
+            self.assertEqual(summary.commands_executed, 1)
+            watchlist = cortex / "Watchlist.md"
+            self.assertIn("ZZZNOTAREALCOMPANY", watchlist.read_text(encoding="utf-8"))
+
+    def test_idempotent_second_run_does_not_duplicate_or_refetch(self):
+        note = "Palindrome, watch Ford."
+        with tempfile.TemporaryDirectory() as td:
+            state, cortex = Path(td) / "state", Path(td) / "cortex"
+            state.mkdir(); cortex.mkdir()
+            src = state / "2026-07-06.md"
+            src.write_text(note, encoding="utf-8")
+            with mock.patch.object(hsf, "resolve_ticker", return_value=RESOLVED_FORD), \
+                    mock.patch.object(hsf, "fetch_10k", return_value=OK_RESULT) as fetch_mock, \
+                    mock.patch.object(pi, "_push_command_notification"), \
+                    mock.patch.object(pi, "index_hot_seat_dir", return_value={"ok": True}):
+                for _ in range(2):
+                    pi.run_command_stage(
+                        note, src, "2026-07-06", cortex, state, pi.RunSummary(),
+                        dry_run=False, verbose=False,
+                    )
+                self.assertEqual(fetch_mock.call_count, 1)
+            watchlist_lines = (cortex / "Watchlist.md").read_text(encoding="utf-8").splitlines()
+            self.assertEqual(sum(1 for l in watchlist_lines if "[[F]]" in l), 1)
+
+    def test_write_error_marks_failed_and_transient(self):
+        note = "Palindrome, watch Ford."
+        with tempfile.TemporaryDirectory() as td:
+            state, cortex = Path(td) / "state", Path(td) / "cortex"
+            state.mkdir(); cortex.mkdir()
+            src = state / "2026-07-06.md"
+            src.write_text(note, encoding="utf-8")
+            with mock.patch.object(hsf, "resolve_ticker", return_value=RESOLVED_FORD), \
+                    mock.patch.object(pi, "add_to_watchlist", side_effect=OSError("disk full")), \
+                    mock.patch.object(hsf, "fetch_10k") as fetch_mock, \
+                    mock.patch.object(pi, "_push_command_notification"):
+                summary = pi.RunSummary()
+                exit_code, _gate = pi.run_command_stage(
+                    note, src, "2026-07-06", cortex, state, summary,
+                    dry_run=False, verbose=False,
+                )
+                # Background fetch never attempted when the add itself failed.
+                fetch_mock.assert_not_called()
+            self.assertEqual(summary.commands_failed, 1)
+            self.assertEqual(exit_code, pi.EXIT_DELIVERY_TRANSIENT)
+
+
+class TestAddToWatchlist(unittest.TestCase):
+    def test_creates_file_with_header(self):
+        with tempfile.TemporaryDirectory() as td:
+            cortex = Path(td)
+            path, added = pi.add_to_watchlist(
+                cortex, ticker="F", title="FORD MOTOR CO", company="ford",
+                source_date="2026-07-06",
+            )
+            self.assertTrue(added)
+            content = path.read_text(encoding="utf-8")
+            self.assertIn("# Watchlist", content)
+            self.assertIn("[[F]] (FORD MOTOR CO) — added 2026-07-06", content)
+
+    def test_second_add_of_same_ticker_is_noop(self):
+        with tempfile.TemporaryDirectory() as td:
+            cortex = Path(td)
+            pi.add_to_watchlist(cortex, ticker="F", title="FORD MOTOR CO",
+                                 company="ford", source_date="2026-07-06")
+            path, added = pi.add_to_watchlist(
+                cortex, ticker="F", title="FORD MOTOR CO", company="ford",
+                source_date="2026-07-07",
+            )
+            self.assertFalse(added)
+            lines = path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(sum(1 for l in lines if "[[F]]" in l), 1)
+
+    def test_falls_back_to_company_when_no_ticker(self):
+        with tempfile.TemporaryDirectory() as td:
+            cortex = Path(td)
+            path, added = pi.add_to_watchlist(
+                cortex, ticker="", title="", company="somecompany",
+                source_date="2026-07-06",
+            )
+            self.assertTrue(added)
+            self.assertIn("[[SOMECOMPANY]]", path.read_text(encoding="utf-8"))
+
+
 if __name__ == "__main__":
     unittest.main()
