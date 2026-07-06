@@ -16,3 +16,10 @@ def _isolate_intent_sink_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("INTENT_PUSHOVER_URGENCIES", raising=False)
     monkeypatch.delenv("INTENT_COMMANDS_MODE", raising=False)
     monkeypatch.delenv("INTENT_COMMAND_WAKE_WORDS", raising=False)
+    # Bootstrap-leaked toggle: weekly_insights.py calls
+    # bootstrap_journal_linker_env() at import, which loads the on-disk
+    # journal-linker.env (INTENT_HOTSEAT_AUTOINDEX=off) permanently into
+    # os.environ. Without clearing it here, tests that assume the autoindex
+    # default (on) fail only when a bootstrapping test file runs first —
+    # the pre-existing test-order flake in test_process_intents_commands.py.
+    monkeypatch.delenv("INTENT_HOTSEAT_AUTOINDEX", raising=False)
