@@ -3,6 +3,9 @@
 Description=Journal Linker — voice watcher (process_voice)
 After=network-online.target
 Wants=network-online.target
+# Path unit may fire many times while the mkdir lock is held; do not rate-limit
+# the service into start-limit-hit (which disables the path unit entirely).
+StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot

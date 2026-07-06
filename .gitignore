@@ -1,5 +1,11 @@
-# Secrets and local config
+# Secrets and local config (never commit values)
 .env
+.env.*
+!.env.example
+**/credentials.json
+**/gcp-oauth.keys.json
+**/*.pem
+**/.token
 
 # Python
 ScribeVenv/

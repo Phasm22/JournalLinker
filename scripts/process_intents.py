@@ -38,12 +38,29 @@ Env vars (from .env or environment):
     LLMLIBRARIAN_MCP_N_RESULTS   retrieval count for enrichment (default: 5)
     LLMLIBRARIAN_MCP_SILO        optional silo slug/name; unset uses unified search
     INTENT_MAX_INTENTS_PER_NOTE  max intents extracted per note (default: 5)
+    INTENT_COMMANDS_MODE         off|false|0 disables the wake-word command stage
+                                 (unset => on). Recognizes directives like
+                                 "Palindrome, pull the 10-K for Ford" and runs
+                                 the matching route (see journal_commands.py).
+    INTENT_COMMAND_WAKE_WORDS    comma-separated wake words (default: palindrome)
+    SEC_EDGAR_USER_AGENT         User-Agent for SEC EDGAR fetches (hot_seat route)
+    HOT_SEAT_DIR                 filing download target (default: ~/Documents/hot_seat)
+    INTENT_HOTSEAT_AUTOINDEX     on|off (default on). Fallback: index fetched filings via
+                                 `pal pull` when the llmLibrarian daemon watcher is NOT
+                                 handling hot_seat. Leave OFF when the watcher is healthy
+                                 (it is the single MCP writer; pal pull would fight its lock).
+    HOT_SEAT_PAL_BIN             path to llmLibrarian `pal` CLI (default: auto-detect)
+    INTENT_HOTSEAT_INDEX_RETRIES lock-contention retries for auto-index (default: 5)
+    INTENT_HOTSEAT_INDEX_BACKOFF seconds between auto-index retries (default: 20)
     INTENT_DIGEST_MODE           off|false|0 disables appending intent_digest_queue.jsonl (unset => on, legacy).
     INTENT_FEEDBACK_MODE         off|false|0 disables scheduling Telegram feedback check-ins (unset => on).
     INTENT_FEEDBACK_DELAY_TODAY  seconds before feedback prompt fires for today/immediate urgency (default: 21600 = 6h)
     INTENT_FEEDBACK_DELAY_SOON   seconds before feedback prompt fires for soon urgency (default: 86400 = 24h)
     INTENT_PUSHOVER_URGENCIES    comma-separated urgencies that may trigger Pushover (default: immediate,today,soon).
                                  Set e.g. immediate,today to skip Pushover for urgency=soon.
+                                 Set off|none|false to silence Pushover for ALL intents
+                                 (still tracked to cortex). The wake-word command route
+                                 notifies via a separate path and is unaffected.
     OPENAI_API_KEY               OpenAI API key (required for routing calls)
     SCRIBE_PUSHOVER_APP_TOKEN    Pushover app token (or PUSHOVER_TOKEN)
     SCRIBE_PUSHOVER_USER_KEY     Pushover user key  (or PUSHOVER_KEY)
@@ -94,6 +111,8 @@ class RunSummary:
     intents_failed: int = 0
     retry_queue_in: int = 0
     retry_queue_out: int = 0
+    commands_executed: int = 0
+    commands_failed: int = 0
 
     def to_payload(self) -> dict:
         return {k: v for k, v in asdict(self).items()}
@@ -131,6 +150,7 @@ RETRY_QUEUE_FILENAME = "intent_retry_queue.jsonl"
 DIGEST_QUEUE_FILENAME = "intent_digest_queue.jsonl"
 FEEDBACK_QUEUE_FILENAME = "intent_feedback_queue.jsonl"
 ACTION_QUEUE_FILENAME = "intent_action_queue.jsonl"
+COMMAND_LEDGER_FILENAME = "intent_command_ledger.jsonl"
 CONSENT_FILENAME = "intent_consent.json"
 
 
@@ -1130,11 +1150,19 @@ def prior_sink_delivered_ok(ledger_entry: dict | None, sink: str) -> bool:
 
 
 def parse_pushover_urgencies_allowed() -> set[str]:
-    """Urgencies that may trigger Pushover. Unset env => legacy immediate|today|soon."""
+    """Urgencies that may trigger Pushover for gated intents.
+
+    Unset env => legacy immediate|today|soon. An explicit disable value
+    (off|none|disable|disabled|false|no|0) returns an empty set, which
+    silences Pushover for *all* intents while still tracking them to cortex.
+    The wake-word command route notifies via a separate path and is unaffected.
+    """
     raw = os.getenv("INTENT_PUSHOVER_URGENCIES", "").strip()
     all_u = frozenset({"immediate", "today", "soon", "low"})
     if not raw:
         return {"immediate", "today", "soon"}
+    if raw.lower() in {"off", "none", "disable", "disabled", "false", "no", "0"}:
+        return set()
     parsed = {u.strip().lower() for u in raw.split(",") if u.strip()}
     valid = parsed & all_u
     return valid if valid else {"immediate", "today", "soon"}
@@ -1348,6 +1376,372 @@ def append_feedback_queue(state_dir: Path, entry: dict) -> None:
     with open(queue_path, "a", encoding="utf-8") as fh:
         fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
     _log("feedback", f"queued check-in for {entry.get('title', '?')!r} send_after={entry.get('send_after','?')}")
+
+
+# ---------------------------------------------------------------------------
+# Command stage: wake-word directives -> executable routes
+# ---------------------------------------------------------------------------
+
+def command_mode_enabled() -> bool:
+    """Run the wake-word command stage unless INTENT_COMMANDS_MODE disables it.
+
+    Truthy: unset, on, true, 1, yes. Falsy: off, false, 0, no.
+    """
+    raw = os.getenv("INTENT_COMMANDS_MODE", "").strip().lower()
+    if not raw:
+        return True
+    return raw not in ("0", "false", "no", "off")
+
+
+def _command_ledger_path(state_dir: Path) -> Path:
+    return state_dir / COMMAND_LEDGER_FILENAME
+
+
+def load_command_ledger(state_dir: Path) -> dict:
+    """Load the command ledger as {command_idempotency_key: record}."""
+    path = _command_ledger_path(state_dir)
+    ledger: dict = {}
+    if not path.exists():
+        return ledger
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+            key = record.get("command_idempotency_key")
+            if key:
+                ledger[key] = record
+        except json.JSONDecodeError:
+            pass
+    return ledger
+
+
+def append_command_ledger(state_dir: Path, record: dict) -> None:
+    path = _command_ledger_path(state_dir)
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def compute_command_idempotency_key(source_path: Path, source_date: str, cmd_key: str) -> str:
+    fingerprint = "\n".join([
+        "command_idempotency_version=1",
+        f"source_path={source_path.expanduser().resolve().as_posix()}",
+        f"source_date={source_date}",
+        f"cmd_key={cmd_key}",
+    ])
+    return hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()
+
+
+def write_command_result_note(
+    cortex_dir: Path,
+    result: dict,
+    *,
+    source_date: str,
+    raw_command: str,
+    command_idempotency_key: str,
+) -> Path:
+    """Write a cortex confirmation note for an executed command route."""
+    ticker = str(result.get("ticker") or result.get("query") or "?")
+    form = str(result.get("form") or "10-K")
+    fy = str(result.get("fy") or "")
+    subdir = cortex_dir / "command"
+    subdir.mkdir(parents=True, exist_ok=True)
+    safe_title = re.sub(r'[<>:"/\\|?*]', "-", f"Hot seat - {ticker} {form} {fy}").strip()
+    note_path = subdir / f"{source_date} {safe_title}.md".replace("  ", " ")
+
+    fm_lines = [
+        "---",
+        f'source: "[[{source_date}]]"',
+        "category: command",
+        "route: hot_seat_fetch",
+        f"ticker: {ticker}",
+        f"form: {form}",
+        f"fy: {fy}",
+        f"status: {'done' if result.get('ok') else 'failed'}",
+        "tags: [command, hot_seat]",
+        f"created: {_now_iso()}",
+    ]
+    if result.get("folder"):
+        fm_lines.append(f'folder: "{result.get("folder")}"')
+    if result.get("title"):
+        fm_lines.append(f'company: "{result.get("title")}"')
+    fm_lines.append(f"command_key: {command_idempotency_key[:16]}")
+    fm_lines.append("---")
+
+    if result.get("ok"):
+        verb = "Downloaded" if result.get("downloaded") else "Already present"
+        body = (
+            f"{verb} **{ticker} {form} FY{fy}** "
+            f"({result.get('title', '')}) into hot_seat.\n\n"
+            f"- Folder: `{result.get('folder', '')}`\n"
+            f"- Filing date: {result.get('filing_date', '')}\n"
+            f"- Accession: {result.get('accession', '')}\n"
+            f"- Resolver: {result.get('resolver', '')}\n\n"
+            "The hot_seat daemon indexes new folders automatically "
+            "(query with `silo=` once it appears in `list_silos`)."
+        )
+    else:
+        body = (
+            f"Command failed at stage **{result.get('stage', '?')}**: "
+            f"{result.get('error', 'unknown error')}"
+        )
+
+    body_lines = ["", f"# Hot seat: {ticker} {form} FY{fy}", "", body, ""]
+    if raw_command.strip():
+        body_lines.append("> [!journal] Spoken command")
+        body_lines.append(f"> {raw_command.strip()}")
+        body_lines.append("")
+
+    content = "\n".join(fm_lines) + "\n" + "\n".join(body_lines)
+    note_path.write_text(content, encoding="utf-8")
+    _log("command", f"wrote {note_path}")
+    return note_path
+
+
+def _push_command_notification(title: str, body: str, urgency: str = "today") -> None:
+    """Best-effort phone ping for command results. Never raises.
+
+    Order: pipeline-native Pushover (if SCRIBE_PUSHOVER_*/PUSHOVER_* set), then
+    the `pnotify` CLI (TJ's Pushover wrapper, uses PUSHOVER_APP_TOKEN/USER_KEY).
+    The cortex note is the guaranteed confirmation; this is a bonus.
+    """
+    if _get_pushover_token() and _get_pushover_key():
+        try:
+            status, _ = send_pushover(title, body, urgency)
+            _log("command", f"pushover sent: {status}")
+            return
+        except Exception as exc:
+            _log("command", f"pushover error (trying pnotify): {exc}")
+
+    import shutil
+    import subprocess
+
+    pnotify = shutil.which("pnotify")
+    if not pnotify:
+        candidate = Path.home() / "bin" / "pnotify"
+        pnotify = str(candidate) if os.access(candidate, os.X_OK) else ""
+    if not pnotify:
+        _log("command", "no pushover creds and no pnotify — cortex note only")
+        return
+    try:
+        proc = subprocess.run(
+            [pnotify, title, body],
+            timeout=20, check=False,
+            capture_output=True, text=True,
+        )
+        if proc.returncode == 0:
+            _log("command", "pnotify invoked")
+        else:
+            _log("command", f"pnotify rc={proc.returncode}: {proc.stderr.strip()[:120]}")
+    except Exception as exc:
+        _log("command", f"pnotify error (ignored): {exc}")
+
+
+def hot_seat_autoindex_enabled() -> bool:
+    """Index fetched filings into llmLibrarian unless INTENT_HOTSEAT_AUTOINDEX disables it.
+
+    The llmLibrarian daemon watcher is the ideal mechanism, but its MCP add_silo
+    path is unreliable for large silos; a direct `pal pull` is incremental and
+    fast, so journalLinker indexes what it fetches to keep hot_seat queryable.
+    """
+    raw = os.getenv("INTENT_HOTSEAT_AUTOINDEX", "").strip().lower()
+    if not raw:
+        return True
+    return raw not in ("0", "false", "no", "off")
+
+
+def _resolve_pal_bin() -> str:
+    """Locate the llmLibrarian `pal` CLI. Env override, then common venv, then PATH."""
+    import shutil
+
+    override = os.getenv("HOT_SEAT_PAL_BIN", "").strip()
+    if override:
+        p = Path(override).expanduser()
+        return str(p) if os.access(p, os.X_OK) else ""
+    candidate = Path.home() / "Desktop" / "llmLibrarian" / ".venv" / "bin" / "pal"
+    if os.access(candidate, os.X_OK):
+        return str(candidate)
+    return shutil.which("pal") or ""
+
+
+def index_hot_seat_dir(hot_seat_dir: Path, *, retries: int | None = None,
+                       backoff_seconds: float | None = None) -> dict:
+    """Best-effort incremental index of the hot_seat silo via `pal pull`.
+
+    `pal pull` takes an exclusive index lock that the llmLibrarian MCP server
+    holds intermittently, so lock-timeouts are retried with backoff. Never raises;
+    on give-up the filing is still safely on disk for a later manual `pal pull`.
+    """
+    import subprocess
+
+    pal = _resolve_pal_bin()
+    if not pal:
+        _log("command", "pal CLI not found — skipping auto-index (data is on disk)")
+        return {"ok": False, "skipped": "no_pal_bin"}
+    if retries is None:
+        retries = _env_int("INTENT_HOTSEAT_INDEX_RETRIES", 5)
+    if backoff_seconds is None:
+        backoff_seconds = _env_float("INTENT_HOTSEAT_INDEX_BACKOFF", 20.0)
+    target = str(hot_seat_dir)
+    for attempt in range(1, retries + 1):
+        try:
+            proc = subprocess.run(
+                [pal, "pull", target],
+                timeout=900, check=False,
+                capture_output=True, text=True,
+            )
+        except Exception as exc:
+            _log("command", f"auto-index error (ignored): {exc}")
+            return {"ok": False, "error": str(exc)}
+        out = (proc.stdout or "") + (proc.stderr or "")
+        if proc.returncode == 0:
+            _log("command", f"auto-indexed hot_seat (attempt {attempt})")
+            return {"ok": True}
+        if "lock" in out.lower() and attempt < retries:
+            _log("command", f"auto-index lock contention, retrying ({attempt}/{retries})")
+            _time.sleep(backoff_seconds)
+            continue
+        _log("command", f"auto-index rc={proc.returncode}: {out.strip()[:160]}")
+        return {"ok": False, "rc": proc.returncode}
+    return {"ok": False, "error": "exhausted retries"}
+
+
+def run_command_stage(
+    note_text: str,
+    source_path: Path,
+    source_date: str,
+    cortex_dir: Path,
+    state_dir: Path,
+    summary: RunSummary,
+    *,
+    dry_run: bool,
+    verbose: bool,
+) -> tuple[int, str]:
+    """Detect + execute wake-word commands in a note.
+
+    Returns (worst_exit, gate_text) where gate_text has recognized command
+    spans removed so the intent gate does not re-handle them.
+    """
+    if not command_mode_enabled():
+        return EXIT_SUCCESS, note_text
+
+    try:
+        import journal_commands as jc
+    except Exception as exc:
+        _log("command", f"module unavailable, skipping command stage: {exc}")
+        return EXIT_SUCCESS, note_text
+
+    try:
+        import hot_seat_fetch as hsf
+    except Exception as exc:
+        _log("command", f"hot_seat_fetch unavailable, skipping command stage: {exc}")
+        return EXIT_SUCCESS, note_text
+
+    commands = jc.find_commands(note_text)
+    if not commands:
+        return EXIT_SUCCESS, note_text
+
+    _log("command", f"found {len(commands)} command(s)")
+    ledger = load_command_ledger(state_dir)
+    worst_exit = EXIT_SUCCESS
+
+    for cmd in commands:
+        cmd_key = cmd.get("key", "")
+        idem = compute_command_idempotency_key(source_path, source_date, cmd_key)
+        raw_command = cmd.get("raw", cmd.get("command_text", ""))
+        company = cmd.get("company", "")
+        form = cmd.get("form", "10-K")
+
+        _log("command", f"route={cmd.get('route')} form={form} company={company!r}")
+
+        prior = ledger.get(idem)
+        if prior and prior.get("status") == "success":
+            _log("command", f"already executed (key={idem[:16]}…) — skipping")
+            continue
+
+        if dry_run:
+            _log("command", f"dry-run: would fetch {form} for {company!r}")
+            continue
+
+        index_status: dict = {}
+        try:
+            result = hsf.fetch_10k(company, form=form)
+        except Exception as exc:
+            if verbose:
+                traceback.print_exc(file=sys.stderr)
+            result = {"ok": False, "stage": "exception", "error": str(exc),
+                      "query": company, "form": form}
+
+        # Confirmation note (best-effort; failures are logged, not fatal).
+        note_written = ""
+        try:
+            note_path = write_command_result_note(
+                cortex_dir, result, source_date=source_date,
+                raw_command=raw_command, command_idempotency_key=idem,
+            )
+            note_written = str(note_path)
+        except Exception as exc:
+            _log("command", f"cortex note error (ignored): {exc}")
+
+        if result.get("ok"):
+            ticker = result.get("ticker", company)
+            fy = result.get("fy", "")
+            verb = "downloaded" if result.get("downloaded") else "already had"
+            # Auto-index into llmLibrarian (incremental `pal pull`) so the new
+            # filing is queryable without relying on the MCP daemon watcher.
+            folder = result.get("folder", "")
+            if folder and result.get("downloaded") and hot_seat_autoindex_enabled():
+                index_status = index_hot_seat_dir(Path(folder).parent)
+            indexed_note = (
+                "indexed and queryable" if index_status.get("ok")
+                else "indexing shortly"
+            )
+            _push_command_notification(
+                f"Hot seat: {ticker} {form} FY{fy}",
+                f"Pulled {result.get('title', ticker)} — {verb} into hot_seat, "
+                f"{indexed_note}.",
+                urgency="today",
+            )
+            summary.commands_executed += 1
+            _log("command", f"OK {ticker} {form} FY{fy} -> {result.get('folder', '')}")
+        else:
+            stage = result.get("stage", "?")
+            _push_command_notification(
+                f"Hot seat failed: {company}",
+                f"Could not pull {form} for {company!r} ({stage}): "
+                f"{result.get('error', '')}",
+                urgency="today",
+            )
+            summary.commands_failed += 1
+            if stage in ("download", "exception"):
+                worst_exit = max(worst_exit, EXIT_DELIVERY_TRANSIENT)
+            _log("command", f"FAILED stage={stage}: {result.get('error', '')}")
+
+        record = {
+            "command_idempotency_key": idem,
+            "source_path": str(source_path),
+            "source_date": source_date,
+            "cmd_key": cmd_key,
+            "route": cmd.get("route"),
+            "form": form,
+            "company": company,
+            "ticker": result.get("ticker", ""),
+            "fy": result.get("fy", ""),
+            "status": "success" if result.get("ok") else "failed",
+            "stage": result.get("stage", "") if not result.get("ok") else "",
+            "error": result.get("error", "") if not result.get("ok") else "",
+            "folder": result.get("folder", ""),
+            "file": result.get("file", ""),
+            "cortex_note": note_written,
+            "indexed": bool(index_status.get("ok")),
+            "executed_at": _now_iso(),
+        }
+        append_command_ledger(state_dir, record)
+        ledger[idem] = record
+
+    gate_text = jc.strip_command_spans(note_text, commands)
+    return worst_exit, gate_text
 
 
 # ---------------------------------------------------------------------------
@@ -1802,6 +2196,14 @@ def run_intent_pipeline(
     journal_timestamp = infer_journal_timestamp(source_path)
     source_date = journal_timestamp[:10]  # YYYY-MM-DD
 
+    # ── Command stage (wake-word directives) ───────────────────────────────
+    # Runs before the gate; executes recognized routes (e.g. hot_seat 10-K
+    # fetch) and strips those spans so the intent gate does not re-handle them.
+    command_exit, gate_text = run_command_stage(
+        note_text, source_path, source_date, cortex_dir, state_dir, summary,
+        dry_run=dry_run, verbose=verbose,
+    )
+
     # ── Gate ──────────────────────────────────────────────────────────────
     gate_run_record: dict = {
         "run_id": run_id,
@@ -1814,7 +2216,7 @@ def run_intent_pipeline(
     append_run_record(state_dir, gate_run_record)
 
     try:
-        intents = call_gate(note_text, gate_model, gate_style)
+        intents = call_gate(gate_text, gate_model, gate_style)
     except Exception as exc:
         _log("gate", f"ERROR: {exc}")
         if verbose:
@@ -1837,13 +2239,13 @@ def run_intent_pipeline(
         _log("intent", "no intents detected — clean skip")
         gate_run_record["status"] = "skipped_no_intent"
         append_run_record(state_dir, gate_run_record)
-        return _finalize_run(EXIT_SUCCESS, summary)
+        return _finalize_run(max(EXIT_SUCCESS, command_exit), summary)
 
     gate_run_record["status"] = "gate_complete"
     append_run_record(state_dir, gate_run_record)
 
     # ── Per-intent loop ───────────────────────────────────────────────────
-    worst_exit = EXIT_SUCCESS
+    worst_exit = max(EXIT_SUCCESS, command_exit)
 
     for intent_index, intent_item in enumerate(intents):
         intent_raw = intent_item["intent_raw"]
@@ -1919,7 +2321,7 @@ def run_intent_pipeline(
             source_path, journal_timestamp, source_stat_str,
             intent_raw, category, enrichment_mode,
             intent_class=intent_class,
-            note_text=note_text,
+            note_text=gate_text,
         )
         if enrichment_mode in {"llmlib", "mcp"}:
             envelope = enrich_envelope(envelope)
@@ -2179,6 +2581,7 @@ def cmd_reset_ledger(state_dir: Path) -> int:
         DIGEST_QUEUE_FILENAME,
         FEEDBACK_QUEUE_FILENAME,
         ACTION_QUEUE_FILENAME,
+        COMMAND_LEDGER_FILENAME,
         CONSENT_FILENAME,
         "intent_feedback_reply_trace.jsonl",
         "intent_feedback_reaction_spike.jsonl",

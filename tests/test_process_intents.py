@@ -441,6 +441,40 @@ class TestParsePushoverUrgenciesAllowed(unittest.TestCase):
         with mock.patch.dict(os.environ, {"INTENT_PUSHOVER_URGENCIES": "immediate, today"}):
             self.assertEqual(pi.parse_pushover_urgencies_allowed(), {"immediate", "today"})
 
+    def test_off_disables_all(self):
+        for value in ("off", "none", "false", "no", "0", "disabled", "OFF"):
+            with mock.patch.dict(os.environ, {"INTENT_PUSHOVER_URGENCIES": value}):
+                self.assertEqual(pi.parse_pushover_urgencies_allowed(), set(), value)
+
+
+class TestPushoverDisabledStillTracks(unittest.TestCase):
+    def test_notification_intent_tracks_to_cortex_without_pushover(self):
+        response = {
+            "urgency": "today", "format": "notification", "action": "notification",
+            "title": "Email Dana", "body": "Email Dana about the invoice.",
+            "defer_to": "", "feedback_prompt": "you email Dana?",
+        }
+        envelope = {
+            "source_file": "/tmp/n.md", "timestamp": "2026-07-04T00:00:00",
+            "inferred_category": "task", "intent_class": "task_intent",
+            "intent_raw": "email Dana about the invoice", "surrounding_context": "",
+        }
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.dict(os.environ, {
+                    "INTENT_PUSHOVER_URGENCIES": "off",
+                    "INTENT_DIGEST_MODE": "off",
+                }):
+            cortex = Path(td) / "cortex"
+            state = Path(td) / "state"
+            cortex.mkdir(); state.mkdir()
+            result = pi.route_delivery(
+                response, envelope, cortex, state,
+                "k" * 64, dry_run=False, ledger_entry=None,
+            )
+        self.assertNotIn("pushover", result["planned_route"])
+        self.assertIn("cortex", result["planned_route"])
+        self.assertTrue(result["results_per_sink"]["cortex"]["ok"])
+
 
 class TestSendPushoverContract(unittest.TestCase):
     def test_builds_expected_request_and_returns_response(self):
