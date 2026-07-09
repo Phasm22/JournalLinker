@@ -59,6 +59,15 @@ FAILED_SUFFIX = ".failed"
 # Permanent = do not auto-retry (empty transcript, corrupt audio, bad file).
 FAIL_TRANSIENT = "transient"
 FAIL_PERMANENT = "permanent"
+
+# Structural-completeness probe (see probe_decodable). We decode with the same
+# backend transcription uses. A decoded stream materially shorter than the
+# container's declared duration means a truncated tail (the faststart case: the
+# front-loaded moov advertises the full length but the mdat is short and decode
+# stops early without erroring). Allow a small slack for codec priming / rounding.
+PROBE_SAMPLE_RATE = 16000
+DECODE_DURATION_TOLERANCE = 0.97       # decoded must reach >=97% of declared …
+DECODE_DURATION_ABS_SLACK = 0.5        # … or be within 0.5s, whichever is looser
 VOICEDROP_DEFAULT = (
     Path.home() / "Library" / "Mobile Documents" / "com~apple~CloudDocs" / "VoiceDrop"
 )
@@ -457,6 +466,83 @@ def is_fully_synced(audio_path: Path) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Structural completeness probe
+# ---------------------------------------------------------------------------
+
+def _probe_decode(audio_path: Path) -> tuple[float | None, float]:
+    """Decode `audio_path`'s audio stream to EOF via PyAV.
+
+    Returns (decoded_seconds, declared_seconds), or (None, declared) when the
+    container opens but carries no audio stream (a definitive content defect,
+    not an exception). Decodes with libav directly rather than through
+    faster_whisper.decode_audio: it's the same underlying decoder transcription
+    uses, but surfaces libav's *typed* errors (InvalidDataError / EOFError) on a
+    bad container instead of the bare IndexError decode_audio raises on short
+    input — which we need to disposition correctly. Isolated from
+    probe_decodable() so tests can stub it without real audio fixtures.
+    """
+    import av
+
+    with av.open(str(audio_path)) as container:
+        declared = (container.duration / av.time_base) if container.duration else 0.0
+        if not container.streams.audio:
+            return None, declared
+        stream = container.streams.audio[0]
+        rate = stream.rate or PROBE_SAMPLE_RATE
+        decoded_samples = sum(frame.samples for frame in container.decode(stream))
+    return decoded_samples / rate, declared
+
+
+def _classify_decode_error(exc: BaseException) -> str:
+    """Map a decode exception to a disposition kind.
+
+    Only the two unambiguous *content* errors — a corrupt/invalid container and a
+    premature EOF — are deterministic properties of the bytes and route to
+    FAIL_PERMANENT (retrying re-asks a settled question). Everything else —
+    missing decoder/codec, I/O, OOM, import, or anything unrecognized — is
+    environmental or ambiguous and is default-denied to FAIL_TRANSIENT: it fails
+    toward a retry (bounded by the attempt cap), never toward a silent pass. That
+    default-open silent pass (`except: pass -> return True` in is_fully_synced) is
+    the original bug this whole gate exists to close.
+    """
+    try:
+        import av
+    except Exception:
+        return FAIL_TRANSIENT
+    if isinstance(exc, (av.error.InvalidDataError, av.error.EOFError)):
+        return FAIL_PERMANENT
+    return FAIL_TRANSIENT
+
+
+def probe_decodable(audio_path: Path) -> tuple[bool, str, str]:
+    """Verify a recording is a structurally complete, decodable container.
+
+    Returns (ok, kind, reason). On failure `kind` is FAIL_PERMANENT (the file is
+    deterministically bad — corrupt, no audio stream, or truncated so the decoded
+    stream falls materially short of the declared duration) or FAIL_TRANSIENT (an
+    environmental decode error that may resolve on retry). Runs before
+    transcription so a partial/corrupt file is caught and dispositioned instead
+    of yielding a plausible-but-truncated transcript that gets marked processed.
+    """
+    try:
+        decoded, declared = _probe_decode(audio_path)
+    except Exception as exc:  # noqa: BLE001 — classified below, not swallowed
+        kind = _classify_decode_error(exc)
+        return False, kind, f"decode failed ({type(exc).__name__}: {exc})"
+
+    if decoded is None:
+        return False, FAIL_PERMANENT, "no decodable audio stream in container"
+
+    if declared > 0:
+        allowed_shortfall = max(DECODE_DURATION_ABS_SLACK,
+                                declared * (1.0 - DECODE_DURATION_TOLERANCE))
+        if (declared - decoded) > allowed_shortfall:
+            return (False, FAIL_PERMANENT,
+                    f"truncated: decoded {decoded:.1f}s < declared {declared:.1f}s")
+    return True, "", ""
+
+
+# ---------------------------------------------------------------------------
 # Single-file pipeline
 # ---------------------------------------------------------------------------
 
@@ -478,12 +564,27 @@ def process_file(
     date_str, time_str = resolve_target_date(audio_path, night_cutoff)
     print(f"[voice] target date={date_str} time={time_str}", file=sys.stderr)
 
+    # Structural completeness gate: reject a corrupt or truncated file up front
+    # rather than letting it become a plausible-but-short transcript that gets
+    # marked processed. Content-deterministic failures go straight to permanent;
+    # environmental ones stay transient (see probe_decodable / mark_failed).
+    ok, fail_kind, fail_reason = probe_decodable(audio_path)
+    if not ok:
+        print(f"[voice] incomplete/undecodable {audio_path.name}: {fail_reason} "
+              f"({fail_kind})", file=sys.stderr)
+        if not dry_run:
+            mark_failed(audio_path, fail_reason, kind=fail_kind)
+        return False
+
     if verbose and whisper_prompt:
         print(f"[voice] whisper prompt ({len(whisper_prompt)} chars): {whisper_prompt[:120]}…", file=sys.stderr)
 
     try:
         transcript, duration, language = transcribe_audio(audio_path, model, whisper_prompt)
     except Exception as exc:
+        # Reached only after probe_decodable() vetted the container, so a failure
+        # here is genuinely model/infra (model load, resampler I/O) — not the
+        # file — and is correctly transient.
         print(f"[voice] transcription failed for {audio_path.name}: {exc}", file=sys.stderr)
         if not dry_run:
             # Treat as transient — model load or I/O error may resolve on retry.
