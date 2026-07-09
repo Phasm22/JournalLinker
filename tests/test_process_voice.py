@@ -11,6 +11,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "process_voice.py"
@@ -196,58 +197,96 @@ class TestProbeDecodableIntegration(unittest.TestCase):
                 self.assertEqual(kind, pv.FAIL_PERMANENT, reason)
 
 
+def _fake_proc(returncode, stdout=""):
+    return SimpleNamespace(returncode=returncode, stdout=stdout, stderr="")
+
+
 class TestProbeDecodableClassification(unittest.TestCase):
-    """Disposition of the probe's failure modes, stubbing the decode itself so
-    no fixtures are needed and every branch is covered deterministically."""
+    """Disposition of the probe's failure modes, stubbing the child process so
+    no fixtures are needed and every branch — including a crash — is covered."""
 
     def test_short_decode_vs_declared_is_truncation_permanent(self):
-        # decode returned far fewer seconds than the container declared.
-        with mock.patch.object(pv, "_probe_decode", return_value=(2.0, 30.0)):
+        with mock.patch.object(pv.subprocess, "run",
+                               return_value=_fake_proc(pv.PROBE_EXIT_OK, "[2.0, 30.0]")):
             ok, kind, reason = pv.probe_decodable(Path("x.m4a"))
         self.assertFalse(ok)
         self.assertEqual(kind, pv.FAIL_PERMANENT)
         self.assertIn("truncated", reason)
 
     def test_full_decode_within_slack_passes(self):
-        with mock.patch.object(pv, "_probe_decode", return_value=(29.8, 30.0)):
+        with mock.patch.object(pv.subprocess, "run",
+                               return_value=_fake_proc(pv.PROBE_EXIT_OK, "[29.8, 30.0]")):
             ok, kind, _ = pv.probe_decodable(Path("x.m4a"))
         self.assertTrue(ok)
         self.assertEqual(kind, "")
 
     def test_no_declared_duration_skips_reconciliation(self):
-        # declared==0 -> can't reconcile; a clean decode still passes.
-        with mock.patch.object(pv, "_probe_decode", return_value=(5.0, 0.0)):
+        with mock.patch.object(pv.subprocess, "run",
+                               return_value=_fake_proc(pv.PROBE_EXIT_OK, "[5.0, 0.0]")):
             ok, _, _ = pv.probe_decodable(Path("x.m4a"))
         self.assertTrue(ok)
 
-    def test_no_audio_stream_is_permanent(self):
-        with mock.patch.object(pv, "_probe_decode", return_value=(None, 0.0)):
+    def test_content_exit_is_permanent(self):
+        with mock.patch.object(pv.subprocess, "run",
+                               return_value=_fake_proc(pv.PROBE_EXIT_CONTENT)):
+            ok, kind, _ = pv.probe_decodable(Path("x.m4a"))
+        self.assertFalse(ok)
+        self.assertEqual(kind, pv.FAIL_PERMANENT)
+
+    def test_env_exit_is_transient(self):
+        with mock.patch.object(pv.subprocess, "run",
+                               return_value=_fake_proc(pv.PROBE_EXIT_ENV)):
+            ok, kind, _ = pv.probe_decodable(Path("x.m4a"))
+        self.assertFalse(ok)
+        self.assertEqual(kind, pv.FAIL_TRANSIENT)
+
+    def test_signal_death_survives_and_is_transient(self):
+        # The whole reason the probe is isolated: a libav SIGSEGV (-11) must not
+        # crash the parent — it becomes a bounded transient, not a batch kill.
+        with mock.patch.object(pv.subprocess, "run",
+                               return_value=_fake_proc(-11)):
             ok, kind, reason = pv.probe_decodable(Path("x.m4a"))
         self.assertFalse(ok)
-        self.assertEqual(kind, pv.FAIL_PERMANENT)
-        self.assertIn("no decodable audio stream", reason)
+        self.assertEqual(kind, pv.FAIL_TRANSIENT)
+        self.assertIn("signal 11", reason)
 
-    def test_environmental_decode_error_is_transient(self):
-        # OSError (I/O, missing binary, disk) -> environmental -> transient.
-        with mock.patch.object(pv, "_probe_decode", side_effect=OSError("disk gone")):
+    def test_timeout_is_transient(self):
+        with mock.patch.object(pv.subprocess, "run",
+                               side_effect=pv.subprocess.TimeoutExpired("cmd", 120)):
             ok, kind, _ = pv.probe_decodable(Path("x.m4a"))
         self.assertFalse(ok)
         self.assertEqual(kind, pv.FAIL_TRANSIENT)
 
-    def test_unknown_error_defaults_to_transient(self):
-        # Default-deny: an unrecognized error fails toward retry, never a pass.
-        with mock.patch.object(pv, "_probe_decode", side_effect=RuntimeError("???")):
+    def test_malformed_worker_output_defaults_transient(self):
+        with mock.patch.object(pv.subprocess, "run",
+                               return_value=_fake_proc(pv.PROBE_EXIT_OK, "not json")):
             ok, kind, _ = pv.probe_decodable(Path("x.m4a"))
         self.assertFalse(ok)
         self.assertEqual(kind, pv.FAIL_TRANSIENT)
 
-    def test_invalid_data_error_is_permanent(self):
-        import av
-        with mock.patch.object(pv, "_probe_decode",
-                               side_effect=av.error.InvalidDataError(1, "bad")):
-            ok, kind, _ = pv.probe_decodable(Path("x.m4a"))
-        self.assertFalse(ok)
-        self.assertEqual(kind, pv.FAIL_PERMANENT)
+
+@unittest.skipUnless(_HAVE_AV, "PyAV not available")
+class TestProbeWorker(unittest.TestCase):
+    """The child-process entry point's exit codes, run in-process on fixtures."""
+
+    def test_valid_returns_ok_with_json(self):
+        with tempfile.TemporaryDirectory() as td:
+            good = Path(td) / "g.m4a"
+            _synth_m4a(good)
+            from contextlib import redirect_stdout
+            import io
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = pv._probe_worker(str(good))
+            self.assertEqual(rc, pv.PROBE_EXIT_OK)
+            decoded, declared = json.loads(buf.getvalue())
+            self.assertGreater(decoded, 0.0)
+
+    def test_corrupt_returns_content_exit(self):
+        with tempfile.TemporaryDirectory() as td:
+            bad = Path(td) / "b.m4a"
+            bad.write_bytes(b"nonsense" * 8)
+            self.assertEqual(pv._probe_worker(str(bad)), pv.PROBE_EXIT_CONTENT)
 
 
 class TestProcessFileGate(unittest.TestCase):
@@ -297,6 +336,94 @@ class TestProcessFileGate(unittest.TestCase):
                     night_cutoff=4, dry_run=True, verbose=False,
                 )
             self.assertFalse(pv.is_failed(audio))
+
+
+class TestBoundedRetry(unittest.TestCase):
+    """Transient failures accrue an attempt count and escalate to permanent at
+    the cap, firing exactly one notification."""
+
+    def setUp(self):
+        self._env = mock.patch.dict(os.environ, {}, clear=False)
+        self._env.start()
+        os.environ.pop("SCRIBE_VOICE_MAX_TRANSIENT_ATTEMPTS", None)
+
+    def tearDown(self):
+        self._env.stop()
+
+    def _audio(self, td):
+        p = Path(td) / "2026-07-08-0900.m4a"
+        p.write_bytes(b"placeholder")
+        return p
+
+    def test_permanent_failure_is_not_counted(self):
+        with tempfile.TemporaryDirectory() as td:
+            audio = self._audio(td)
+            with mock.patch.object(pv, "_notify") as notify:
+                pv.mark_failed(audio, "corrupt", kind=pv.FAIL_PERMANENT)
+            self.assertFalse(pv.is_transient_failed(audio))
+            self.assertEqual(pv._read_marker_attempts(audio), 0)
+            notify.assert_not_called()
+
+    def test_transient_increments_attempts(self):
+        os.environ["SCRIBE_VOICE_MAX_TRANSIENT_ATTEMPTS"] = "5"
+        with tempfile.TemporaryDirectory() as td:
+            audio = self._audio(td)
+            with mock.patch.object(pv, "_notify"):
+                pv.mark_failed(audio, "ollama down", kind=pv.FAIL_TRANSIENT)
+                self.assertEqual(pv._read_marker_attempts(audio), 1)
+                self.assertTrue(pv.is_transient_failed(audio))
+                pv.mark_failed(audio, "ollama down", kind=pv.FAIL_TRANSIENT)
+                self.assertEqual(pv._read_marker_attempts(audio), 2)
+                self.assertTrue(pv.is_transient_failed(audio))
+
+    def test_escalates_to_permanent_at_cap_and_notifies_once(self):
+        os.environ["SCRIBE_VOICE_MAX_TRANSIENT_ATTEMPTS"] = "3"
+        with tempfile.TemporaryDirectory() as td:
+            audio = self._audio(td)
+            with mock.patch.object(pv, "_notify") as notify:
+                pv.mark_failed(audio, "reason", kind=pv.FAIL_TRANSIENT)  # 1
+                pv.mark_failed(audio, "reason", kind=pv.FAIL_TRANSIENT)  # 2
+                self.assertTrue(pv.is_transient_failed(audio))
+                notify.assert_not_called()
+                pv.mark_failed(audio, "reason", kind=pv.FAIL_TRANSIENT)  # 3 -> cap
+                # Escalated: now permanent, so the retry loop will skip it.
+                self.assertFalse(pv.is_transient_failed(audio))
+                self.assertTrue(pv.is_failed(audio))
+                notify.assert_called_once()
+                marker = audio.with_suffix(audio.suffix + pv.FAILED_SUFFIX)
+                self.assertIn("escalated", marker.read_text())
+
+    def test_default_cap_is_ten(self):
+        self.assertEqual(pv._max_transient_attempts(), 10)
+
+    def test_bad_cap_env_falls_back_to_default(self):
+        os.environ["SCRIBE_VOICE_MAX_TRANSIENT_ATTEMPTS"] = "not-a-number"
+        self.assertEqual(pv._max_transient_attempts(), 10)
+
+    def test_legacy_marker_without_attempts_reads_zero(self):
+        with tempfile.TemporaryDirectory() as td:
+            audio = self._audio(td)
+            marker = audio.with_suffix(audio.suffix + pv.FAILED_SUFFIX)
+            marker.write_text("kind: transient\nreason: legacy\n", encoding="utf-8")
+            self.assertEqual(pv._read_marker_attempts(audio), 0)
+            # Next transient failure resumes counting from 1.
+            with mock.patch.object(pv, "_notify"):
+                pv.mark_failed(audio, "again", kind=pv.FAIL_TRANSIENT)
+            self.assertEqual(pv._read_marker_attempts(audio), 1)
+
+
+class TestNotifyBestEffort(unittest.TestCase):
+    def test_no_pnotify_falls_back_to_log_without_raising(self):
+        with mock.patch("shutil.which", return_value=None), \
+                mock.patch.object(pv.os, "access", return_value=False):
+            pv._notify("title", "body")  # must not raise
+
+    def test_pnotify_invoked_when_present(self):
+        with mock.patch("shutil.which", return_value="/usr/bin/pnotify"), \
+                mock.patch.object(pv.subprocess, "run") as run:
+            pv._notify("title", "body")
+            run.assert_called_once()
+            self.assertEqual(run.call_args.args[0][0], "/usr/bin/pnotify")
 
 
 if __name__ == "__main__":

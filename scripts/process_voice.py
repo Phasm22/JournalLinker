@@ -68,6 +68,25 @@ FAIL_PERMANENT = "permanent"
 PROBE_SAMPLE_RATE = 16000
 DECODE_DURATION_TOLERANCE = 0.97       # decoded must reach >=97% of declared …
 DECODE_DURATION_ABS_SLACK = 0.5        # … or be within 0.5s, whichever is looser
+PROBE_TIMEOUT_SEC = 120                # a decode that hangs longer is treated as transient
+
+# The decode probe runs in a child process (`--_probe-decode`): a malformed
+# container can make libav *segfault*, and an uncatchable SIGSEGV in-process
+# would take down the whole batch (and, with no marker written, crash it again
+# every run). Isolating the decode lets the parent survive and disposition the
+# child by its exit code — a signal death (negative returncode) is caught, not
+# fatal. Worker exit codes:
+PROBE_EXIT_OK = 0            # decoded; stdout carries [decoded_sec, declared_sec]
+PROBE_EXIT_CONTENT = 3      # caught content defect (corrupt/EOF/no audio stream)
+PROBE_EXIT_ENV = 4         # caught environmental error (I/O, missing codec, …)
+PROBE_WORKER_FLAG = "--_probe-decode"
+
+# A transient failure retries on the voice-retry timer. Genuinely time-based
+# reasons (Ollama down, machine asleep) resolve within a few cycles; a reason
+# that never resolves would otherwise retry forever. Cap the attempts, then
+# escalate to permanent and notify once, so a stuck file leaves the queue
+# instead of silently looping. Override via SCRIBE_VOICE_MAX_TRANSIENT_ATTEMPTS.
+DEFAULT_MAX_TRANSIENT_ATTEMPTS = 10
 VOICEDROP_DEFAULT = (
     Path.home() / "Library" / "Mobile Documents" / "com~apple~CloudDocs" / "VoiceDrop"
 )
@@ -405,14 +424,87 @@ def mark_processed(audio_path: Path) -> None:
     audio_path.with_suffix(audio_path.suffix + PROCESSED_SUFFIX).touch()
 
 
-def mark_failed(audio_path: Path, reason: str = "", kind: str = FAIL_PERMANENT) -> None:
-    """Write a structured .failed marker.
+def _max_transient_attempts() -> int:
+    """Attempt cap before a transient failure escalates to permanent."""
+    raw = os.getenv("SCRIBE_VOICE_MAX_TRANSIENT_ATTEMPTS", "").strip()
+    if not raw:
+        return DEFAULT_MAX_TRANSIENT_ATTEMPTS
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return DEFAULT_MAX_TRANSIENT_ATTEMPTS
 
-    kind is FAIL_TRANSIENT or FAIL_PERMANENT.  Transient failures are eligible
-    for automatic timed retry; permanent ones are not.
-    """
+
+def _read_marker_attempts(audio_path: Path) -> int:
+    """Prior transient-attempt count from an existing .failed marker (0 if none
+    or legacy/unparsable)."""
     marker = audio_path.with_suffix(audio_path.suffix + FAILED_SUFFIX)
-    marker.write_text(f"kind: {kind}\nreason: {reason or 'unknown error'}\n", encoding="utf-8")
+    if not marker.exists():
+        return 0
+    try:
+        for line in marker.read_text(encoding="utf-8").splitlines():
+            if line.strip().startswith("attempts:"):
+                return int(line.split(":", 1)[1].strip())
+    except Exception:
+        return 0
+    return 0
+
+
+def _notify(title: str, body: str) -> None:
+    """Best-effort desktop/push notification via the pnotify CLI (TJ's Pushover
+    wrapper). Mirrors process_intents' pnotify tier without importing that
+    heavy module. Never raises into the pipeline; logs and moves on."""
+    import shutil
+
+    pnotify = shutil.which("pnotify")
+    if not pnotify:
+        candidate = Path.home() / "bin" / "pnotify"
+        pnotify = str(candidate) if os.access(candidate, os.X_OK) else ""
+    if not pnotify:
+        print(f"[voice] (no pnotify) {title}: {body}", file=sys.stderr)
+        return
+    try:
+        subprocess.run([pnotify, title, body], capture_output=True, timeout=15)
+    except Exception as exc:  # noqa: BLE001 — notification is best-effort
+        print(f"[voice] pnotify error (ignored): {exc}", file=sys.stderr)
+
+
+def _write_marker(audio_path: Path, kind: str, reason: str, attempts: int) -> None:
+    marker = audio_path.with_suffix(audio_path.suffix + FAILED_SUFFIX)
+    marker.write_text(
+        f"kind: {kind}\nreason: {reason or 'unknown error'}\nattempts: {attempts}\n",
+        encoding="utf-8",
+    )
+
+
+def mark_failed(audio_path: Path, reason: str = "", kind: str = FAIL_PERMANENT) -> None:
+    """Write a structured .failed marker, with bounded transient retries.
+
+    kind is FAIL_TRANSIENT or FAIL_PERMANENT. Permanent failures (a content
+    verdict — corrupt/truncated audio, empty transcript) are written straight
+    through: not retried, not counted. Transient failures are eligible for the
+    timed retry loop, but the attempt count is tracked in the marker; once it
+    reaches the cap the failure escalates to permanent and fires a one-time
+    notification, so a reason that never resolves leaves the queue instead of
+    looping forever (and silently).
+    """
+    if kind != FAIL_TRANSIENT:
+        _write_marker(audio_path, FAIL_PERMANENT, reason, _read_marker_attempts(audio_path))
+        return
+
+    attempts = _read_marker_attempts(audio_path) + 1
+    cap = _max_transient_attempts()
+    if attempts >= cap:
+        escalated = f"escalated to permanent after {attempts} transient attempts: {reason}"
+        _write_marker(audio_path, FAIL_PERMANENT, escalated, attempts)
+        print(f"[voice] {audio_path.name}: {escalated}", file=sys.stderr)
+        _notify(
+            "Voice recording gave up",
+            f"{audio_path.name} failed {attempts} transient retries and was "
+            f"marked permanent. Last reason: {reason or 'unknown error'}",
+        )
+        return
+    _write_marker(audio_path, FAIL_TRANSIENT, reason, attempts)
 
 
 def is_transient_failed(audio_path: Path) -> bool:
@@ -487,52 +579,41 @@ def _probe_decode(audio_path: Path) -> tuple[float | None, float]:
         declared = (container.duration / av.time_base) if container.duration else 0.0
         if not container.streams.audio:
             return None, declared
-        stream = container.streams.audio[0]
-        rate = stream.rate or PROBE_SAMPLE_RATE
-        decoded_samples = sum(frame.samples for frame in container.decode(stream))
-    return decoded_samples / rate, declared
+        # Sum seconds from each decoded frame's own sample_rate rather than the
+        # stream's — a truncated stream can be missing codec params (stream.rate
+        # raises), but every decoded frame reliably carries samples + sample_rate.
+        decoded_seconds = 0.0
+        for frame in container.decode(audio=0):
+            rate = frame.sample_rate or PROBE_SAMPLE_RATE
+            decoded_seconds += frame.samples / rate
+    return decoded_seconds, declared
 
 
-def _classify_decode_error(exc: BaseException) -> str:
-    """Map a decode exception to a disposition kind.
+def _probe_worker(audio_path: str) -> int:
+    """Child-process entry: decode the file and report via exit code + stdout.
 
-    Only the two unambiguous *content* errors — a corrupt/invalid container and a
-    premature EOF — are deterministic properties of the bytes and route to
-    FAIL_PERMANENT (retrying re-asks a settled question). Everything else —
-    missing decoder/codec, I/O, OOM, import, or anything unrecognized — is
-    environmental or ambiguous and is default-denied to FAIL_TRANSIENT: it fails
-    toward a retry (bounded by the attempt cap), never toward a silent pass. That
-    default-open silent pass (`except: pass -> return True` in is_fully_synced) is
-    the original bug this whole gate exists to close.
+    Only the two unambiguous content errors (invalid container, premature EOF)
+    and a missing audio stream are content defects; everything else is
+    environmental. A libav *segfault* here kills this child with a signal — the
+    parent sees the negative returncode and survives.
     """
     try:
         import av
-    except Exception:
-        return FAIL_TRANSIENT
-    if isinstance(exc, (av.error.InvalidDataError, av.error.EOFError)):
-        return FAIL_PERMANENT
-    return FAIL_TRANSIENT
+        try:
+            decoded, declared = _probe_decode(Path(audio_path))
+        except (av.error.InvalidDataError, av.error.EOFError):
+            return PROBE_EXIT_CONTENT
+    except Exception:  # noqa: BLE001 — import/decode env error, default-deny
+        return PROBE_EXIT_ENV
+    if decoded is None:  # container opened, no audio stream — content defect
+        return PROBE_EXIT_CONTENT
+    sys.stdout.write(json.dumps([decoded, declared]))
+    return PROBE_EXIT_OK
 
 
-def probe_decodable(audio_path: Path) -> tuple[bool, str, str]:
-    """Verify a recording is a structurally complete, decodable container.
-
-    Returns (ok, kind, reason). On failure `kind` is FAIL_PERMANENT (the file is
-    deterministically bad — corrupt, no audio stream, or truncated so the decoded
-    stream falls materially short of the declared duration) or FAIL_TRANSIENT (an
-    environmental decode error that may resolve on retry). Runs before
-    transcription so a partial/corrupt file is caught and dispositioned instead
-    of yielding a plausible-but-truncated transcript that gets marked processed.
-    """
-    try:
-        decoded, declared = _probe_decode(audio_path)
-    except Exception as exc:  # noqa: BLE001 — classified below, not swallowed
-        kind = _classify_decode_error(exc)
-        return False, kind, f"decode failed ({type(exc).__name__}: {exc})"
-
-    if decoded is None:
-        return False, FAIL_PERMANENT, "no decodable audio stream in container"
-
+def _reconcile_duration(decoded: float, declared: float) -> tuple[bool, str, str]:
+    """Flag a decoded stream that falls materially short of the declared
+    duration (the faststart short-decode that doesn't raise)."""
     if declared > 0:
         allowed_shortfall = max(DECODE_DURATION_ABS_SLACK,
                                 declared * (1.0 - DECODE_DURATION_TOLERANCE))
@@ -540,6 +621,45 @@ def probe_decodable(audio_path: Path) -> tuple[bool, str, str]:
             return (False, FAIL_PERMANENT,
                     f"truncated: decoded {decoded:.1f}s < declared {declared:.1f}s")
     return True, "", ""
+
+
+def probe_decodable(audio_path: Path) -> tuple[bool, str, str]:
+    """Verify a recording is a structurally complete, decodable container.
+
+    Returns (ok, kind, reason). The decode runs in an isolated child process so a
+    libav crash on a malformed file can't take down the batch. Disposition:
+    FAIL_PERMANENT for a deterministic content defect (corrupt, no audio stream,
+    or decoded materially shorter than declared); FAIL_TRANSIENT for an
+    environmental error, a timeout, or a signal death (crash/OOM) — default-deny
+    toward a bounded retry, never a silent pass. Runs before transcription so a
+    partial/corrupt file is caught instead of yielding a plausible-but-truncated
+    transcript that gets marked processed.
+    """
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()), PROBE_WORKER_FLAG, str(audio_path)],
+            capture_output=True, text=True, timeout=PROBE_TIMEOUT_SEC,
+        )
+    except subprocess.TimeoutExpired:
+        return False, FAIL_TRANSIENT, f"decode timed out after {PROBE_TIMEOUT_SEC}s"
+
+    rc = proc.returncode
+    if rc == PROBE_EXIT_CONTENT:
+        return False, FAIL_PERMANENT, "corrupt / truncated / no audio stream"
+    if rc == PROBE_EXIT_ENV:
+        return False, FAIL_TRANSIENT, "environmental decode error"
+    if rc < 0:
+        # Killed by a signal (e.g. SIGSEGV from libav on hostile bytes, or OOM):
+        # cause is ambiguous, so default-deny to a bounded transient retry. The
+        # win is that the parent survived and the file got dispositioned.
+        return False, FAIL_TRANSIENT, f"decode crashed (signal {-rc})"
+    if rc != PROBE_EXIT_OK:
+        return False, FAIL_TRANSIENT, f"probe exited {rc}"
+    try:
+        decoded, declared = json.loads(proc.stdout)
+    except Exception:  # noqa: BLE001 — malformed worker output, default-deny
+        return False, FAIL_TRANSIENT, "probe produced no result"
+    return _reconcile_duration(decoded, declared)
 
 
 # ---------------------------------------------------------------------------
@@ -675,6 +795,12 @@ def _write_voice_payload(**fields) -> None:
 
 
 def main() -> int:
+    # Isolated decode-probe child (see probe_decodable). Handled before the
+    # heavy env bootstrap / arg parsing so it stays a cheap, self-contained run.
+    argv = sys.argv[1:]
+    if len(argv) == 2 and argv[0] == PROBE_WORKER_FLAG:
+        return _probe_worker(argv[1])
+
     args = parse_cli()
 
     if not args.journal_dir:
