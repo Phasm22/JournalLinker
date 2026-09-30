@@ -9,7 +9,7 @@ Description=Journal Linker — voice ingest endpoint (Tailscale upload → Voice
 [Service]
 Type=simple
 EnvironmentFile=%h/.config/journal-linker/journal-linker.env
-ExecStart=${JOURNAL_LINKER_REPO}/ScribeVenv/bin/python3 ${JOURNAL_LINKER_REPO}/scripts/voice_ingest_server.py
+ExecStart=/usr/bin/env ${JOURNAL_LINKER_REPO}/ScribeVenv/bin/python3 ${JOURNAL_LINKER_REPO}/scripts/voice_ingest_server.py
 Restart=always
 RestartSec=5
 NoNewPrivileges=yes
