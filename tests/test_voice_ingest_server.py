@@ -35,9 +35,13 @@ class TestValidation(unittest.TestCase):
         self.assertEqual(vis.validate_filename(" 2026-09-30-0841.m4a "), "2026-09-30-0841.m4a")
 
     def test_rejects_traversal_hidden_and_wrong_extension(self):
-        for bad in ["../x.m4a", "a/b.m4a", ".hidden.m4a", "note.txt", "REC.M4A", "", None]:
+        for bad in ["../x.m4a", "a/b.m4a", ".hidden.m4a", "note.txt", "2026-09-30-0841.M4A",
+                    "rec.m4a", "2026-09-30.m4a", "", None]:
             with self.subTest(bad=bad), self.assertRaises(vis.IngestError):
                 vis.validate_filename(bad)
+
+    def test_accepts_upload_shortcut_filename(self):
+        self.assertEqual(vis.validate_filename("2026-09-30_09-26-57.m4a"), "2026-09-30_09-26-57.m4a")
 
     def test_md5_normalized_and_validated(self):
         self.assertEqual(vis.normalize_md5(AUDIO_MD5.upper()), AUDIO_MD5)
@@ -76,34 +80,34 @@ class TestStoreUpload(unittest.TestCase):
 
     def test_md5_mismatch_rejected_and_nothing_written(self):
         with self.assertRaises(vis.IngestError) as ctx:
-            vis.store_upload(self.drop, "a.m4a", AUDIO, "0" * 32)
+            vis.store_upload(self.drop, "2026-09-30_09-26-57.m4a", AUDIO, "0" * 32)
         self.assertEqual(ctx.exception.status, 400)
-        self.assertFalse((self.drop / "a.m4a").exists())
+        self.assertFalse((self.drop / "2026-09-30_09-26-57.m4a").exists())
 
     def test_reupload_same_content_is_idempotent(self):
-        vis.store_upload(self.drop, "a.m4a", AUDIO, AUDIO_MD5)
-        self.assertEqual(vis.store_upload(self.drop, "a.m4a", AUDIO, AUDIO_MD5), "duplicate")
+        vis.store_upload(self.drop, "2026-09-30_09-26-57.m4a", AUDIO, AUDIO_MD5)
+        self.assertEqual(vis.store_upload(self.drop, "2026-09-30_09-26-57.m4a", AUDIO, AUDIO_MD5), "duplicate")
 
     def test_reupload_different_content_conflicts(self):
-        vis.store_upload(self.drop, "a.m4a", AUDIO, AUDIO_MD5)
+        vis.store_upload(self.drop, "2026-09-30_09-26-57.m4a", AUDIO, AUDIO_MD5)
         other = AUDIO + b"x"
         with self.assertRaises(vis.IngestError) as ctx:
-            vis.store_upload(self.drop, "a.m4a", other, hashlib.md5(other).hexdigest())
+            vis.store_upload(self.drop, "2026-09-30_09-26-57.m4a", other, hashlib.md5(other).hexdigest())
         self.assertEqual(ctx.exception.status, 409)
-        self.assertEqual((self.drop / "a.m4a").read_bytes(), AUDIO)
+        self.assertEqual((self.drop / "2026-09-30_09-26-57.m4a").read_bytes(), AUDIO)
 
     def test_processed_marker_without_audio_counts_as_done(self):
-        (self.drop / "a.m4a.processed").touch()
-        self.assertEqual(vis.store_upload(self.drop, "a.m4a", AUDIO, AUDIO_MD5), "already-processed")
-        self.assertFalse((self.drop / "a.m4a").exists())
+        (self.drop / "2026-09-30_09-26-57.m4a.processed").touch()
+        self.assertEqual(vis.store_upload(self.drop, "2026-09-30_09-26-57.m4a", AUDIO, AUDIO_MD5), "already-processed")
+        self.assertFalse((self.drop / "2026-09-30_09-26-57.m4a").exists())
 
     def test_probe_rejection_leaves_no_file(self):
         def reject(path):
             raise vis.IngestError(422, "undecodable audio")
 
         with mock.patch.object(vis, "probe_audio", reject), self.assertRaises(vis.IngestError):
-            vis.store_upload(self.drop, "a.m4a", AUDIO, AUDIO_MD5)
-        self.assertFalse((self.drop / "a.m4a").exists())
+            vis.store_upload(self.drop, "2026-09-30_09-26-57.m4a", AUDIO, AUDIO_MD5)
+        self.assertFalse((self.drop / "2026-09-30_09-26-57.m4a").exists())
         self.assertEqual(list((self.drop / vis.INCOMING_SUBDIR).iterdir()), [])
 
 
@@ -139,23 +143,23 @@ class TestHttpEndpoint(unittest.TestCase):
 
     def test_bad_hash_is_not_ok(self):
         ctype, body = multipart(AUDIO)
-        status, text = self.post(body, {"Content-Type": ctype, "X-Filename": "a.m4a", "X-MD5": "1" * 32})
+        status, text = self.post(body, {"Content-Type": ctype, "X-Filename": "2026-09-30_09-26-57.m4a", "X-MD5": "1" * 32})
         self.assertEqual(status, 400)
         self.assertNotEqual(text, "OK")
 
     def test_funnel_requests_refused(self):
         ctype, body = multipart(AUDIO)
         status, _ = self.post(body, {
-            "Content-Type": ctype, "X-Filename": "a.m4a", "X-MD5": AUDIO_MD5,
+            "Content-Type": ctype, "X-Filename": "2026-09-30_09-26-57.m4a", "X-MD5": AUDIO_MD5,
             "Tailscale-Funnel-Request": "?1",
         })
         self.assertEqual(status, 403)
-        self.assertFalse((self.drop / "a.m4a").exists())
+        self.assertFalse((self.drop / "2026-09-30_09-26-57.m4a").exists())
 
     def test_oversize_rejected(self):
         big = b"x" * ((1 << 20) + 1)
         status, _ = self.post(big, {
-            "Content-Type": "audio/x-m4a", "X-Filename": "a.m4a", "X-MD5": hashlib.md5(big).hexdigest(),
+            "Content-Type": "audio/x-m4a", "X-Filename": "2026-09-30_09-26-57.m4a", "X-MD5": hashlib.md5(big).hexdigest(),
         })
         self.assertEqual(status, 413)
 

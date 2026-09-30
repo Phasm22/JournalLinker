@@ -267,22 +267,26 @@ def extract_whisper_prompt(
 # Date resolution from filename
 # ---------------------------------------------------------------------------
 
-FILENAME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})-(\d{2})(\d{2})$")
+# YYYY-MM-DD-HHmm (Dropbox-era Shortcut) or YYYY-MM-DD_HH-MM-SS (Tailscale upload Shortcut).
+FILENAME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})(?:-(\d{2})(\d{2})|_(\d{2})-(\d{2})-\d{2})$")
 
 
 def resolve_target_date(audio_path: Path, night_cutoff_hour: int = DEFAULT_NIGHT_CUTOFF) -> tuple[str, str]:
     """Return (date_str YYYY-MM-DD, time_str HH:MM) for the recording.
 
-    Filename convention: YYYY-MM-DD-HHmm.m4a  (produced by the iOS Shortcut).
+    Filename convention: YYYY-MM-DD-HHmm.m4a or YYYY-MM-DD_HH-MM-SS.m4a
+    (produced by the iOS Shortcut).
     If the recording hour is before night_cutoff_hour, it is attributed to the
     previous calendar day (e.g. a 01:30 AM recording belongs to "yesterday").
-    Falls back to mtime if the filename doesn't match the convention.
+    Falls back to mtime if the filename doesn't match the convention — which
+    for uploaded files is the *upload* time, so the ingest endpoint rejects
+    names that don't match.
     """
     m = FILENAME_RE.fullmatch(audio_path.stem)
     if m:
         date_str = m.group(1)
-        hour = int(m.group(2))
-        minute = int(m.group(3))
+        hour = int(m.group(2) or m.group(4))
+        minute = int(m.group(3) or m.group(5))
         time_str = f"{hour:02d}:{minute:02d}"
         if hour < night_cutoff_hour:
             dt = datetime.strptime(date_str, "%Y-%m-%d") - timedelta(days=1)

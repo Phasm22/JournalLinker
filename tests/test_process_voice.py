@@ -428,3 +428,18 @@ class TestNotifyBestEffort(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestResolveTargetDate(unittest.TestCase):
+    def test_dropbox_era_name(self):
+        self.assertEqual(pv.resolve_target_date(Path("2026-09-30-0753.m4a")), ("2026-09-30", "07:53"))
+
+    def test_tailscale_upload_name(self):
+        # Regression: this format fell through to mtime (= upload time), so
+        # every upload in a batch got the same date/time and all but one were
+        # skipped as duplicate callouts.
+        self.assertEqual(pv.resolve_target_date(Path("2026-09-30_09-26-57.m4a")), ("2026-09-30", "09:26"))
+        self.assertEqual(pv.resolve_target_date(Path("2026-09-29_23-28-41.m4a")), ("2026-09-29", "23:28"))
+
+    def test_before_night_cutoff_rolls_to_previous_day(self):
+        self.assertEqual(pv.resolve_target_date(Path("2026-09-30_01-30-00.m4a")), ("2026-09-29", "01:30"))

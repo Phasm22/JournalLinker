@@ -81,6 +81,10 @@ def validate_filename(raw: str | None) -> str:
         raise IngestError(400, "missing X-Filename")
     if not FILENAME_RE.fullmatch(name):
         raise IngestError(400, f"bad filename: {name!r}")
+    # process_voice dates the journal entry from the name; without a match it
+    # falls back to mtime, i.e. upload time, and silently misfiles the entry.
+    if not pv.FILENAME_RE.fullmatch(Path(name).stem):
+        raise IngestError(400, f"undatable filename (want YYYY-MM-DD_HH-MM-SS): {name!r}")
     return name
 
 
@@ -146,7 +150,11 @@ def store_upload(drop_dir: Path, filename: str, data: bytes, expected_md5: str) 
     if dest.exists():
         if md5_of_file(dest) == actual:
             return "duplicate"
-        raise IngestError(409, f"{filename} already exists with different content")
+        raise IngestError(
+            409,
+            f"{filename} already exists with different content "
+            f"(have {dest.stat().st_size} bytes, got {len(data)} bytes md5 {actual})",
+        )
 
     # Staging lives in a subdirectory: the path unit watches drop_dir
     # non-recursively, so it only fires on the final rename.
