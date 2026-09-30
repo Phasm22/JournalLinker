@@ -181,7 +181,17 @@ User units and env templates live under [`systemd/`](./systemd/) (see [`systemd/
 - Logs often go to `~/.local/state/journal-linker/` when `SCRIBE_JOB_LOG_DIR` is set that way (see `just doctor`).
 - After amending commits or changing remotes: `git fetch origin` before `git push --force-with-lease` so the lease matches GitHub.
 
-VoiceDrop may be a Dropbox folder instead of iCloud; override `SCRIBE_VOICEDROP_DIR` in the env file.
+### Voice uploads over Tailscale (Linux)
+
+The iOS Shortcut POSTs recordings straight to this host instead of syncing through Dropbox/iCloud. [`scripts/voice_ingest_server.py`](scripts/voice_ingest_server.py) (`journal-linker-voice-ingest.service`) verifies `X-MD5`, probes the audio, and atomically drops the file into `SCRIBE_VOICEDROP_DIR`; the existing `journal-linker-voice-watcher.path` → `process_voice.py` flow is unchanged. It replies exactly `OK` only once the file is durable, which is what the Shortcut's ledger keys on. Protocol and env knobs: module docstring.
+
+```bash
+mkdir -p ~/VoiceDrop                      # must match SCRIBE_VOICEDROP_DIR and the .path unit
+systemctl --user enable --now journal-linker-voice-ingest.service
+tailscale serve --bg --https=8791 http://127.0.0.1:8791   # tailnet-only; never `funnel`
+```
+
+Shortcut URL: `https://<host>.<tailnet>.ts.net:8791/ingest`. Health: `curl https://<host>.<tailnet>.ts.net:8791/healthz`.
 
 ---
 

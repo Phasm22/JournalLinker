@@ -80,6 +80,10 @@ voice-reprocess-all:
 voice-scan:
     "{{py}}" "{{root}}/scripts/process_voice.py"
 
+# Run the Tailscale voice ingest endpoint in the foreground (normally journal-linker-voice-ingest.service)
+voice-ingest:
+    "{{py}}" "{{root}}/scripts/voice_ingest_server.py"
+
 # Install faster-whisper into the project venv
 voice-install:
     "{{py}}" -m pip install faster-whisper
