@@ -1,7 +1,7 @@
 # Receives recordings from the iOS Shortcut over Tailscale and drops them into
 # SCRIBE_VOICEDROP_DIR (journal-linker-voice-watcher.path takes it from there).
 # Binds 127.0.0.1; expose tailnet-only with:
-#   tailscale serve --bg --https=8791 http://127.0.0.1:8791
+#   tailscale serve --bg --https=8797 http://127.0.0.1:8797
 # Always-on (not a pc-stacks cold service): the phone uploads whenever.
 [Unit]
 Description=Journal Linker — voice ingest endpoint (Tailscale upload → VoiceDrop)

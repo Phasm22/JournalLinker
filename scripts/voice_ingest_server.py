@@ -29,7 +29,7 @@ an accidental `tailscale funnel` on this port does not open it to the internet.
 Env (from environment or ~/.config/journal-linker/journal-linker.env):
     SCRIBE_VOICEDROP_DIR   — destination folder (required)
     VOICE_INGEST_HOST      — bind address (default: 127.0.0.1)
-    VOICE_INGEST_PORT      — bind port (default: 8791)
+    VOICE_INGEST_PORT      — bind port (default: 8797)
     VOICE_INGEST_MAX_MB    — per-upload size cap (default: 200)
 """
 
@@ -55,7 +55,7 @@ from journal_linker_env import bootstrap_journal_linker_env
 import process_voice as pv
 
 DEFAULT_HOST = "127.0.0.1"
-DEFAULT_PORT = 8791
+DEFAULT_PORT = 8797
 DEFAULT_MAX_MB = 200
 INCOMING_SUBDIR = ".incoming"
 

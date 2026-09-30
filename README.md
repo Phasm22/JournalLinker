@@ -188,10 +188,10 @@ The iOS Shortcut POSTs recordings straight to this host instead of syncing throu
 ```bash
 mkdir -p ~/VoiceDrop                      # must match SCRIBE_VOICEDROP_DIR and the .path unit
 systemctl --user enable --now journal-linker-voice-ingest.service
-tailscale serve --bg --https=8791 http://127.0.0.1:8791   # tailnet-only; never `funnel`
+tailscale serve --bg --https=8797 http://127.0.0.1:8797   # tailnet-only; never `funnel`
 ```
 
-Shortcut URL: `https://<host>.<tailnet>.ts.net:8791/ingest`. Health: `curl https://<host>.<tailnet>.ts.net:8791/healthz`.
+Port 8797 because 8790–8792 belong to Argus. Shortcut URL: `https://<host>.<tailnet>.ts.net:8797/ingest`. Health: `curl https://<host>.<tailnet>.ts.net:8797/healthz`.
 
 ---
 
