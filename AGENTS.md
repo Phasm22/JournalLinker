@@ -5,7 +5,6 @@
 This repository is a local-first journal pipeline for an Obsidian vault. Core scripts live at the repo root:
 
 - `Scribe.py` - wikilink insertion and learning-store updates
-- `weekly_insights.py` - weekly reflection generation
 - `daily_reflection.py` - day-behind reflection and push delivery
 - `archivist.py` - standalone clipboard/Ollama helper
 
@@ -17,7 +16,6 @@ Use `just` from the repo root:
 
 - `just` - list available recipes
 - `just scribe` - run the wikilink pipeline
-- `just weekly` - generate the weekly insight note
 - `just daily-reflection` - dry-run the Pushover reflection path
 - `just test` - run the test suite with mocked Ollama calls
 - `just doctor` - verify local paths, venv, and config

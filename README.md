@@ -8,10 +8,9 @@ One feedback loop, several moving parts:
 
 - **Scribe** — inserts `[[wikilinks]]` into daily notes using a local Ollama model, re-ranked by a reinforcement learning store that tracks what links actually stuck
 - **Echo** — transcribes iPhone voice recordings with Whisper, using that same learning store as vocabulary context so your project names and proper nouns land correctly
-- **Weekly Insights** — reads the week's entries and the learning store, drafts a reflection note
 - **Daily Reflection Push** — reads yesterday's entry, drafts a short reflection, and sends it once per day through Pushover
 
-Related automation (not always in *this* repo clone) can live under `JOURNAL_LINKER_REPO` on disk — e.g. intent routing, Telegram feedback — but Scribe, voice, reflection, and weekly insights are anchored here.
+Related automation (not always in *this* repo clone) can live under `JOURNAL_LINKER_REPO` on disk — e.g. intent routing and Telegram feedback — but Scribe, voice, and daily reflection are anchored here.
 
 ---
 
@@ -95,7 +94,6 @@ Install [just](https://github.com/casey/just) (`brew install just`).
 | `just scribe-paste`     | macOS: clipboard → Scribe → stdout                                 |
 | `just scribe-writeback` | Read today's note from disk, insert wikilinks, write back in-place |
 | `just scribe-job`       | Same wrapper the launchd agent uses (timestamped logs)             |
-| `just weekly`           | Generate the weekly insights note                                  |
 | `just daily-reflection` | Dry-run the day-behind Pushover reflection and print the notification |
 | `just daily-reflection-send` | Run the real Pushover delivery path manually                 |
 | `just intent-mcp-install` | Install the MCP client used for llmLibrarian intent enrichment |
@@ -225,7 +223,6 @@ For compatibility, `daily_reflection.py` also accepts `PUSHOVER_TOKEN` and `PUSH
 | Path                       | Role                                                           |
 | -------------------------- | -------------------------------------------------------------- |
 | `Scribe.py`                | Wikilink pipeline + learning store                             |
-| `weekly_insights.py`       | Weekly reflection note generator                               |
 | `daily_reflection.py`      | Day-behind Pushover reflection generator + sender              |
 | `archivist.py`             | Standalone Ollama + clipboard utility                          |
 | `scripts/process_voice.py` | Echo: voice-to-journal bridge                                  |

@@ -1,4 +1,4 @@
-# Journal Linker — local Obsidian journal wikilink helper (Scribe + weekly insights).
+# Journal Linker — local Obsidian journal wikilink helper.
 # Install the runner: brew install just   →   https://github.com/casey/just
 #
 # First-time: configure env vars (recommended: ~/.config/journal-linker/journal-linker.env) — see README.
@@ -32,10 +32,6 @@ scribe-job:
 # Set SCRIBE_JOURNAL_DIR in the LaunchAgent plist (safe for paths with apostrophes)
 launchagent-journal p:
     "{{root}}/scripts/patch_launchagent_journal.sh" "{{p}}"
-
-# Weekly insights note (uses the same env bootstrap as Scribe)
-weekly:
-    "{{py}}" "{{root}}/weekly_insights.py"
 
 # Dry-run the daily Pushover reflection without sending
 daily-reflection *ARGS:

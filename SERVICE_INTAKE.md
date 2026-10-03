@@ -36,7 +36,6 @@ This intake process determines whether a service is ready to be monitored. The g
 | `intent-watcher` | `journal-linker-intent-watcher.path` / `com.journal-linker.intent` | PathChanged on journal dir | Pass | N/A (event-driven) |
 | `intent-retry` | `journal-linker-intent-retry.timer` | Every 15 min (boot+active) | Pass | 2 h (stuck transient queue) |
 | `feedback-sender` | `journal-linker-feedback-sender.service` | Continuous (long-poll) | Pass | 5 min (daemon down) |
-| `weekly-insights` | — | Manual (`just weekly`) | **Deferred** | — |
 | `archivist` | — | Manual | **Deferred** | — |
 
 ---
@@ -389,19 +388,6 @@ This intake process determines whether a service is ready to be monitored. The g
 ---
 
 ## Deferred — manual only
-
-### `weekly-insights`
-
-| Gate | Status |
-|------|--------|
-| 1 Trigger | **No** — manual / external cron not defined in repo |
-| 2–4 | Not evaluated until scheduled |
-
-**Blockers:** Add timer or document external schedule; define success as `Insights/Weekly Insight - YYYY-Www.md` mtime for target week.
-
-**When enabled:** Weekly after ISO week close; silence **8 days**; success = note written or logged skip (sparse week).
-
----
 
 ### `archivist`
 

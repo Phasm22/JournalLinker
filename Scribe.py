@@ -253,8 +253,6 @@ SEMANTIC_CONTEXT_LIMIT = 8
 RECENCY_LAMBDA = 0.08
 BURST_LOOKBACK_DAYS = 3
 BURST_WEIGHT = 4.0
-CLUSTER_DIVERSITY_BONUS = 10.0
-CLUSTER_DIVERSITY_MIN_BASE_SCORE = 5.0
 
 STOPWORDS = {
     "a",
@@ -1125,7 +1123,6 @@ def rank_link_candidates(
     current_date: str | None = None,
     journal_dir: str | None = None,
     embedder: LocalEmbeddingCache | None = None,
-    cluster_map: dict[str, int] | None = None,
 ) -> list[str]:
     weights = learning.get("term_weights", {})
     term_memory = learning.get("term_memory", {})
@@ -1220,15 +1217,6 @@ def rank_link_candidates(
         scored.append((score, freq, len(term), -idx, term))
 
     scored.sort(reverse=True)
-    if cluster_map:
-        seen_clusters: set[int | None] = set()
-        for i, (base_score, freq, term_len, neg_idx, term) in enumerate(scored):
-            cid = cluster_map.get(term.lower())
-            if cid not in seen_clusters:
-                seen_clusters.add(cid)
-                if base_score > CLUSTER_DIVERSITY_MIN_BASE_SCORE:
-                    scored[i] = (base_score + CLUSTER_DIVERSITY_BONUS, freq, term_len, neg_idx, term)
-        scored.sort(reverse=True)
     return [term for _, _, _, _, term in scored[:max_links]]
 
 
@@ -1400,11 +1388,7 @@ def insert_ranked_wikilinks(
     max_links: int = 45,
     current_date: str | None = None,
     journal_dir: str | None = None,
-    cluster_map: dict[str, int] | None = None,
 ) -> tuple[str, list[str]]:
-    if cluster_map is None and journal_dir:
-        from vault_mapper import load_cluster_map
-        cluster_map = load_cluster_map(journal_dir)
     ranked_terms = rank_link_candidates(
         original,
         terms,
@@ -1412,7 +1396,6 @@ def insert_ranked_wikilinks(
         max_links=max_links,
         current_date=current_date,
         journal_dir=journal_dir,
-        cluster_map=cluster_map,
     )
     frontmatter, body = split_frontmatter(original)
     linked_body = insert_wikilinks_by_paragraph(body, ranked_terms)
@@ -1579,8 +1562,6 @@ def main() -> int:
             )
 
         memory_store_data = load_memory_store(MEMORY_STORE_FILE)
-        from vault_mapper import load_cluster_map
-        cluster_map = load_cluster_map(JOURNAL_DIR) if JOURNAL_DIR else {}
         current_date = apply_previous_day_feedback(
             memory_store_data,
             input_text,
@@ -1622,13 +1603,7 @@ def main() -> int:
             memory_store_data,
             current_date=current_date,
             journal_dir=JOURNAL_DIR,
-            cluster_map=cluster_map or None,
         )
-        cluster_diversity_count: int | None = None
-        if cluster_map and ranked_terms:
-            represented = {cluster_map.get(t.lower()) for t in ranked_terms
-                           if cluster_map.get(t.lower()) is not None}
-            cluster_diversity_count = len(represented)
         actions.append(
             {
                 "action": "Insert ranked wikilinks",

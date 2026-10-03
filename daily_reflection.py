@@ -13,7 +13,7 @@ from pathlib import Path
 
 from journal_linker_env import bootstrap_journal_linker_env
 from journal_linker_telemetry import maybe_write_job_payload
-from weekly_insights import (
+from reflection_utils import (
     DEFAULT_MEMORY_STORE_FILE,
     MIN_SUBSTANTIVE_ENTRY_WORDS,
     build_entry_excerpt,

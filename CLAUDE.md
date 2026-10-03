@@ -11,7 +11,6 @@ just                    # list recipes
 just scribe             # venv + Scribe.py
 just scribe-paste       # macOS clipboard → Scribe
 just scribe-job         # structured logs (same as launchd wrapper)
-just weekly             # weekly insights
 just test               # pytest
 just doctor             # paths, venv, “what is this on my Mac”
 
@@ -31,8 +30,6 @@ pbpaste | python3 Scribe.py
 # if stdin pipe was empty or input came from the clipboard and a journal note was
 # resolved, the on-disk note body wins over clipboard (launchd-safe).
 
-# Run weekly insights
-python3 weekly_insights.py
 ```
 
 Tests use `importlib` to load `Scribe.py` directly as a module (not a package), so test files import from `SCRIPT_PATH = Path(__file__).resolve().parents[1] / "Scribe.py"`.
@@ -72,8 +69,6 @@ SCRIBE_CTX="8192"             # optional
 6. Output to stdout; update learning state and nav links in journal files as side effects (Yesterday|Tomorrow point at the nearest **substantive** daily notes, skipping empty stubs; calendar ±1 day only if no neighbor on that side)
 
 **`scribe_learning.json`** — per-term memory store. Each term tracks `success`/`failure` counts, `last_seen`/`last_success` dates, and context snippets. Ranking combines heuristic score, reinforcement score, recency decay (`exp(-lambda * days_since_success)`), semantic similarity, and burst boost from recent activity.
-
-**`weekly_insights.py`** — standalone script that reads `scribe_learning.json` and journal entries for an ISO week, calls Ollama, and writes `<journal_dir>/Insights/Weekly Insight - YYYY-Www.md`. Idempotent on rerun.
 
 **`archivist.py`** — separate utility that also uses Ollama and clipboard. Shares the same `SCRIBE_MODEL`/`SCRIBE_CTX` env vars pattern.
 
