@@ -420,7 +420,7 @@ The whole thing felt like carrying too much at once.
     @unittest.skipUnless(LIVE_OLLAMA_SMOKE, "set JOURNAL_LINKER_LIVE_SMOKE=1 to run live Ollama smoke tests")
     def test_live_ollama_smoke_for_weekly_insights(self):
         response = weekly_insights.ollama.chat(
-            model=os.getenv("SCRIBE_MODEL", "llama3.1:8b"),
+            model=os.getenv("SCRIBE_MODEL", "llama3.2:latest"),
             messages=[{"role": "user", "content": "Reply with one short sentence about a weekly reflection."}],
             options={"temperature": 0.2, "num_ctx": 128},
             keep_alive="5m",

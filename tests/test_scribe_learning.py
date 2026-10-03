@@ -754,7 +754,7 @@ class TestScribeLearning(unittest.TestCase):
     @unittest.skipUnless(LIVE_OLLAMA_SMOKE, "set JOURNAL_LINKER_LIVE_SMOKE=1 to run live Ollama smoke tests")
     def test_live_ollama_smoke_for_scribe(self):
         response = scribe.ollama.chat(
-            model=os.getenv("SCRIBE_MODEL", "llama3.1:8b"),
+            model=os.getenv("SCRIBE_MODEL", "llama3.2:latest"),
             messages=[{"role": "user", "content": "Reply with a short sentence that contains the word journal."}],
             options={"temperature": 0, "num_ctx": 128},
             keep_alive="5m",

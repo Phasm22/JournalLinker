@@ -62,7 +62,7 @@ def get_input_text(remaining_args: list[str]) -> tuple[str, str]:
 def parse_cli() -> tuple[str, int, str | None, bool, str | None, str | None, bool, list[str]]:
     bootstrap_journal_linker_env(repo_root=Path(__file__).resolve().parent)
 
-    model = "llama3.1:8b"
+    model = "llama3.2:latest"
     num_ctx = 8192
     journal_dir: str | None = os.getenv("SCRIBE_JOURNAL_DIR")
     reset_learning = False

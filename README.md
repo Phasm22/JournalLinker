@@ -29,7 +29,7 @@ Voice entries are first-class. A recording made at 11 PM is attributed to that d
 
 ## Prerequisites
 
-- **[Ollama](https://ollama.com/)** running locally with a chat model pulled (e.g. `llama3.1:8b`)
+- **[Ollama](https://ollama.com/)** running locally with a chat model pulled (e.g. `llama3.2:latest`)
 - **Python 3** with a venv at `ScribeVenv/` (`just` recipes use it automatically)
 - **faster-whisper** for voice: `just voice-install`
 
@@ -67,7 +67,7 @@ Put at least:
 ```bash
 SCRIBE_JOURNAL_DIR="/path/to/your/daily-notes-folder"
 # optional:
-# SCRIBE_MODEL="llama3.1:8b"
+# SCRIBE_MODEL="llama3.2:latest"
 # SCRIBE_CTX="8192"
 # SCRIBE_WHISPER_MODEL="base.en"
 ```
@@ -201,7 +201,7 @@ Port 8797 because 8790–8792 belong to Argus. Shortcut URL: `https://<host>.<ta
 | Variable               | Default                      | Meaning                                                                         |
 | ---------------------- | ---------------------------- | ------------------------------------------------------------------------------- |
 | `SCRIBE_JOURNAL_DIR`   | —                            | Path to daily notes folder (required)                                           |
-| `SCRIBE_MODEL`         | `llama3.1:8b`                | Ollama model                                                                    |
+| `SCRIBE_MODEL`         | `llama3.2:latest`                | Ollama model                                                                    |
 | `SCRIBE_CTX`           | `8192`                       | Ollama context window                                                           |
 | `SCRIBE_WHISPER_MODEL` | `base.en`                    | faster-whisper model (`base.en`, `small.en`, `medium.en`)                       |
 | `SCRIBE_VOICEDROP_DIR` | `~/…/iCloud Drive/VoiceDrop` | Folder Echo watches for recordings                                              |

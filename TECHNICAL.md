@@ -22,7 +22,7 @@ chmod 600 ~/.config/journal-linker/journal-linker.env
 
 ```bash
 SCRIBE_JOURNAL_DIR="/path/to/your/journal"
-SCRIBE_MODEL="llama3.1:8b"
+SCRIBE_MODEL="llama3.2:latest"
 SCRIBE_CTX="8192"
 SCRIBE_EMBED_MODEL="nomic-embed-text"
 SCRIBE_EMBED_KEEP_ALIVE="5m"
@@ -54,7 +54,7 @@ See `python3 scripts/corpus_sample.py --help`. Output formats: `paths`, `jsonl` 
 ```bash
 python3 Scribe.py [text]
 python3 Scribe.py --journal-dir "/path/to/your/journal"
-python3 Scribe.py --model "llama3.1:8b"
+python3 Scribe.py --model "llama3.2:latest"
 python3 Scribe.py --ctx 8192
 python3 Scribe.py --active-date 2026-03-11
 python3 Scribe.py --active-file "/path/to/your/journal/2026-03-11.md"

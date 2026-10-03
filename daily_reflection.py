@@ -42,7 +42,7 @@ MAX_BODY_CHARS = 360
 MAX_TITLE_CHARS = 80
 MEMORY_HIT_LIMIT = 6
 DATE_FILENAME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})\.md$")
-DEFAULT_DAILY_REFLECTION_MODEL = "llama3.1:8b"
+DEFAULT_DAILY_REFLECTION_MODEL = "llama3.2:latest"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

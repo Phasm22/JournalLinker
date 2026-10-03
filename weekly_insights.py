@@ -455,7 +455,7 @@ def request_weekly_arc(signals: dict) -> dict:
     if ollama is None:
         raise RuntimeError("The 'ollama' Python package is required for weekly insight generation.")
 
-    model = os.getenv("SCRIBE_MODEL", "llama3.1:8b").strip() or "llama3.1:8b"
+    model = os.getenv("SCRIBE_MODEL", "llama3.2:latest").strip() or "llama3.2:latest"
     num_ctx_raw = os.getenv("SCRIBE_CTX", "8192")
     try:
         num_ctx = int(num_ctx_raw)
