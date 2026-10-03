@@ -463,7 +463,6 @@ def build_run_report_markdown(
     ollama_sec: float | None = None,
     postprocess_sec: float | None = None,
     eval_duration_ns: int | None = None,
-    cluster_diversity_count: int | None = None,
 ) -> str:
     status_label = "Success" if status == "success" else "Error"
     suggested_preview = ", ".join(ranked_terms[:12]) if ranked_terms else ", ".join(suggested_terms[:12])
@@ -503,9 +502,6 @@ def build_run_report_markdown(
         lines.append(f"- Post-process seconds: `{postprocess_sec:.3f}`")
     if eval_duration_ns is not None:
         lines.append(f"- Model eval duration ns: `{eval_duration_ns}`")
-    if cluster_diversity_count is not None:
-        lines.append(f"- Cluster diversity (distinct clusters in inserted links): `{cluster_diversity_count}`")
-
     lines.extend(
         [
             "",
@@ -575,7 +571,6 @@ def write_run_report(
     ollama_sec: float | None = None,
     postprocess_sec: float | None = None,
     eval_duration_ns: int | None = None,
-    cluster_diversity_count: int | None = None,
 ) -> Path | None:
     if base_dir is None:
         return None
@@ -618,7 +613,6 @@ def write_run_report(
         ollama_sec=ollama_sec,
         postprocess_sec=postprocess_sec,
         eval_duration_ns=eval_duration_ns,
-        cluster_diversity_count=cluster_diversity_count,
     )
     report_path.write_text(report_body, encoding="utf-8")
 
@@ -1675,7 +1669,6 @@ def main() -> int:
             ollama_sec=(t1 - t0) if t0 is not None and t1 is not None else None,
             postprocess_sec=(t2 - t1) if t1 is not None and t2 is not None else None,
             eval_duration_ns=eval_duration_ns,
-            cluster_diversity_count=cluster_diversity_count,
         )
         if report_path is not None:
             print(f"[Scribe] report={report_path}", file=sys.stderr)
