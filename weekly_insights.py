@@ -32,8 +32,6 @@ def load_local_env(path: Path) -> None:
         os.environ[key] = value
 
 
-bootstrap_journal_linker_env(repo_root=Path(__file__).resolve().parent)
-
 try:
     import ollama
 except Exception:  # pragma: no cover - import availability depends on local runtime
