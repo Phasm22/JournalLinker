@@ -45,6 +45,10 @@ daily-reflection *ARGS:
 daily-reflection-send *ARGS:
     "{{py}}" "{{root}}/daily_reflection.py" {{ARGS}}
 
+# Print today's nutrition summary without sending Pushover
+nutrition-summary *ARGS:
+    "{{py}}" "{{root}}/scripts/nutrition_ledger.py" --summary --dry-run {{ARGS}}
+
 # Tests only (Ollama mocked)
 test:
     "{{py}}" -m pytest tests/

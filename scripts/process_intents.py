@@ -25,6 +25,11 @@ Env vars (from .env or environment):
     INTENT_GATE_MODEL            Ollama gate model (default: phi4:14b)
     INTENT_GATE_STYLE            auto|phi4|qwen25 (default: auto)
     INTENT_ROUTING_MODEL         OpenAI model ID (default: gpt-4o-mini)
+    INTENT_NUTRITION_MODEL       Ollama model for voice nutrition extract
+                                 (default: INTENT_GATE_MODEL)
+    INTENT_NUTRITION_LOOKUP_MODEL
+                                 OpenAI model for branded nutrition lookup
+                                 (default: gpt-4o-mini)
     INTENT_CORTEX_DIR            Obsidian cortex write target (default: <journal_dir>/cortex)
     INTENT_STATE_DIR             local state directory
                                  (default: ~/.local/state/journal-linker/intents)
@@ -114,6 +119,7 @@ class RunSummary:
     commands_executed: int = 0
     commands_failed: int = 0
     commands_needs_confirmation: int = 0
+    nutrition_logged: int = 0
 
     def to_payload(self) -> dict:
         return {k: v for k, v in asdict(self).items()}
@@ -2557,6 +2563,35 @@ def _intent_exit_code(delivery_result: dict, dry_run: bool) -> tuple[str, int]:
     return "succeeded", EXIT_SUCCESS
 
 
+def _run_nutrition_stage(
+    note_text: str,
+    source_path: Path,
+    source_date: str,
+    state_dir: Path,
+    *,
+    dry_run: bool,
+    model: str,
+) -> int:
+    """Log voice intake. Never changes the intent pipeline exit code."""
+    try:
+        scripts_dir = Path(__file__).resolve().parent
+        if str(scripts_dir) not in sys.path:
+            sys.path.insert(0, str(scripts_dir))
+        import nutrition_ledger
+        return int(nutrition_ledger.run_nutrition_stage(
+            note_text,
+            source_path,
+            source_date,
+            state_dir,
+            dry_run=dry_run,
+            journal_dir=source_path.parent,
+            model=model,
+        ))
+    except Exception as exc:
+        _log("nutrition", f"stage failed: {exc}")
+        return 0
+
+
 def run_intent_pipeline(
     source_path: Path,
     *,
@@ -2608,6 +2643,11 @@ def run_intent_pipeline(
 
     journal_timestamp = infer_journal_timestamp(source_path)
     source_date = journal_timestamp[:10]  # YYYY-MM-DD
+
+    summary.nutrition_logged = _run_nutrition_stage(
+        note_text, source_path, source_date, state_dir,
+        dry_run=dry_run, model=gate_model,
+    )
 
     # ── Command stage (wake-word directives) ───────────────────────────────
     # Runs before the gate; executes recognized routes (e.g. hot_seat 10-K

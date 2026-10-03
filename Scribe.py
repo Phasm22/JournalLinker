@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from journal_linker_env import bootstrap_journal_linker_env
-from journal_linker_telemetry import maybe_write_job_payload
+from journal_linker_telemetry import emit_usage_event, maybe_write_job_payload
 from local_embeddings import LocalEmbeddingCache, cosine_similarity as embedding_cosine_similarity, normalize_embedding_text
 
 
@@ -1707,9 +1707,18 @@ def main() -> int:
 
         if WRITE_BACK and resolved_note_path is not None and "journal_file" in input_body_source:
             try:
+                write_mode = "edit" if resolved_note_path.exists() else "new"
                 resolved_note_path.write_text(out, encoding="utf-8")
                 touched_files.append(resolved_note_path)
                 print(f"[Scribe] write_back={resolved_note_path}", file=sys.stderr)
+                emit_usage_event(
+                    "usage.journal.entry_saved",
+                    {
+                        "date": resolved_current_date
+                        or extract_date_from_journal_filename(resolved_note_path),
+                        "mode": write_mode,
+                    },
+                )
             except Exception as wb_err:
                 print(f"[Scribe] write_back failed: {wb_err}", file=sys.stderr)
 

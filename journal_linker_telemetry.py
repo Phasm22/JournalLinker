@@ -101,6 +101,16 @@ def emit_health_probe(service: str, **fields: Any) -> None:
     _emit(event)
 
 
+def emit_usage_event(event_name: str, metrics: dict[str, Any] | None = None) -> None:
+    """Emit a usage-dashboard event using the existing journalLinker marker."""
+    event: dict[str, Any] = {
+        "event": event_name,
+        "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "metrics": dict(metrics or {}),
+    }
+    _emit(event)
+
+
 def parse_event_line(line: str) -> dict[str, Any] | None:
     """Parse a log line containing JOURNAL_LINKER_EVENT=…; for tests."""
     stripped = line.strip()
