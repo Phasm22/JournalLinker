@@ -762,6 +762,62 @@ class TestLedger(unittest.TestCase):
         self.assertEqual(count, 0)
         self.assertEqual(ledger["fresh"]["claude_status"], "in_flight")
 
+    def test_prune_ledger_removes_old_delivery_command_and_history_entries(self):
+        old = "2020-01-01T00:00:00+00:00"
+        fresh = datetime.now(timezone.utc).isoformat()
+        pi.save_ledger(
+            self.state_dir,
+            {
+                "old": {**self._make_entry(key="old"), "created_at": old},
+                "fresh": {**self._make_entry(key="fresh"), "created_at": fresh},
+                "unknown": {k: v for k, v in self._make_entry(key="unknown").items() if k != "journal_timestamp"},
+            },
+        )
+        pi.append_command_ledger(self.state_dir, {"command_idempotency_key": "old-cmd", "executed_at": old})
+        pi.append_command_ledger(self.state_dir, {"command_idempotency_key": "fresh-cmd", "executed_at": fresh})
+        pi.append_run_record(self.state_dir, {"run_id": "old-run", "created_at": old})
+        pi.append_run_record(self.state_dir, {"run_id": "fresh-run", "created_at": fresh})
+        (self.state_dir / pi.RUN_HISTORY_FILENAME).write_text(
+            (self.state_dir / pi.RUN_HISTORY_FILENAME).read_text(encoding="utf-8") + "not-json\n",
+            encoding="utf-8",
+        )
+
+        rc = pi.cmd_prune_ledger(self.state_dir, older_than_days=30)
+
+        self.assertEqual(rc, pi.EXIT_SUCCESS)
+        delivery = pi.load_ledger(self.state_dir)
+        self.assertNotIn("old", delivery)
+        self.assertIn("fresh", delivery)
+        self.assertIn("unknown", delivery)
+        commands = (self.state_dir / pi.COMMAND_LEDGER_FILENAME).read_text(encoding="utf-8")
+        self.assertNotIn("old-cmd", commands)
+        self.assertIn("fresh-cmd", commands)
+        history = (self.state_dir / pi.RUN_HISTORY_FILENAME).read_text(encoding="utf-8")
+        self.assertNotIn("old-run", history)
+        self.assertIn("fresh-run", history)
+        self.assertIn("not-json", history)
+
+    def test_prune_generated_logs_only_deletes_old_timestamped_wrapper_logs(self):
+        state_dir = self.state_dir / "intents"
+        state_dir.mkdir()
+        log_root = self.state_dir
+        old_log = log_root / "intent-retry-20200101-000000-123.log"
+        fresh_log = log_root / "voice-retry-20990101-000000-123.log"
+        latest = log_root / "intent-retry-latest.log"
+        user_file = log_root / "journal-note.log"
+        for path in (old_log, fresh_log, latest, user_file):
+            path.write_text("log\n", encoding="utf-8")
+        old_ts = datetime(2020, 1, 1, tzinfo=timezone.utc).timestamp()
+        os.utime(old_log, (old_ts, old_ts))
+
+        rc = pi.cmd_prune_generated_logs(state_dir, older_than_days=30)
+
+        self.assertEqual(rc, pi.EXIT_SUCCESS)
+        self.assertFalse(old_log.exists())
+        self.assertTrue(fresh_log.exists())
+        self.assertTrue(latest.exists())
+        self.assertTrue(user_file.exists())
+
 
 # ---------------------------------------------------------------------------
 # Exit code mapping via mocked pipeline

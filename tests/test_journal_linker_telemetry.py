@@ -75,6 +75,19 @@ class TestJournalLinkerTelemetry(unittest.TestCase):
         self.assertEqual(event["uptime_sec"], 120)
         self.assertIn("ts", event)
 
+    def test_emit_usage_event(self):
+        buf = io.StringIO()
+        with patch.object(sys, "stderr", buf):
+            telemetry.emit_usage_event(
+                "usage.journal.entry_saved",
+                {"date": "2026-07-08", "mode": "edit"},
+            )
+        event = telemetry.parse_event_line(buf.getvalue().strip())
+        assert event is not None
+        self.assertEqual(event["event"], "usage.journal.entry_saved")
+        self.assertEqual(event["metrics"], {"date": "2026-07-08", "mode": "edit"})
+        self.assertIn("ts", event)
+
     def test_cli_finalize(self):
         with tempfile.TemporaryDirectory() as tmp:
             payload = Path(tmp) / "p.json"

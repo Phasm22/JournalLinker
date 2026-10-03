@@ -4,7 +4,7 @@
 Use this to iterate on historical vault text, export slices for stats (Python/R), or spot-check
 without process_intents, watchers, or Telegram.
 
-Expects daily notes named YYYY-MM-DD.md (same convention as Scribe / vault_mapper).
+Expects daily notes named YYYY-MM-DD.md (the same convention as Scribe).
 
 Examples:
   python3 scripts/corpus_sample.py --journal-dir "$SCRIBE_JOURNAL_DIR" --list

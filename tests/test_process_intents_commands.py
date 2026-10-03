@@ -563,5 +563,143 @@ class TestAddToWatchlist(unittest.TestCase):
             self.assertIn("[[SOMECOMPANY]]", path.read_text(encoding="utf-8"))
 
 
+class TestWordOfTheDay(unittest.TestCase):
+    def setUp(self):
+        self._env = mock.patch.dict(os.environ, {}, clear=False)
+        self._env.start()
+        os.environ.pop("INTENT_COMMANDS_MODE", None)
+        os.environ.pop("SCRIBE_PUSHOVER_APP_TOKEN", None)
+        os.environ.pop("SCRIBE_PUSHOVER_USER_KEY", None)
+        os.environ.pop("PUSHOVER_TOKEN", None)
+        os.environ.pop("PUSHOVER_KEY", None)
+
+    def tearDown(self):
+        self._env.stop()
+
+    def test_appends_word_to_tuff_words_note(self):
+        note = "Word of the day is ephemeral."
+        with tempfile.TemporaryDirectory() as td:
+            state, cortex = Path(td) / "state", Path(td) / "cortex"
+            state.mkdir(); cortex.mkdir()
+            src = state / "2026-07-06.md"
+            src.write_text(note, encoding="utf-8")
+            with mock.patch.object(pi, "_push_command_notification") as push_mock:
+                summary = pi.RunSummary()
+                exit_code, gate_text = pi.run_command_stage(
+                    note, src, "2026-07-06", cortex, state, summary,
+                    dry_run=False, verbose=False,
+                )
+            self.assertEqual(exit_code, pi.EXIT_SUCCESS)
+            self.assertEqual(summary.commands_executed, 1)
+            self.assertEqual(summary.commands_failed, 0)
+            push_mock.assert_called_once()
+            self.assertNotIn("Word of the day", gate_text)
+            tuff_words = cortex / "Tuff words.md"
+            self.assertTrue(tuff_words.exists())
+            content = tuff_words.read_text(encoding="utf-8")
+            self.assertIn("# Tuff words", content)
+            self.assertIn("- ephemeral — 2026-07-06", content)
+            ledger = pi.load_command_ledger(state)
+            rec = next(iter(ledger.values()))
+            self.assertEqual(rec["route"], "word_of_the_day")
+            self.assertEqual(rec["word"], "ephemeral")
+            self.assertEqual(rec["status"], "success")
+
+    def test_write_error_marks_failed_and_transient(self):
+        note = "Word of the day is ephemeral."
+        with tempfile.TemporaryDirectory() as td:
+            state, cortex = Path(td) / "state", Path(td) / "cortex"
+            state.mkdir(); cortex.mkdir()
+            src = state / "2026-07-06.md"
+            src.write_text(note, encoding="utf-8")
+            with mock.patch.object(pi, "append_word_of_the_day",
+                                    side_effect=OSError("disk full")), \
+                    mock.patch.object(pi, "_push_command_notification") as push_mock:
+                summary = pi.RunSummary()
+                exit_code, _gate = pi.run_command_stage(
+                    note, src, "2026-07-06", cortex, state, summary,
+                    dry_run=False, verbose=False,
+                )
+            self.assertEqual(exit_code, pi.EXIT_DELIVERY_TRANSIENT)
+            self.assertEqual(summary.commands_failed, 1)
+            self.assertEqual(summary.commands_executed, 0)
+            push_mock.assert_called_once()
+            ledger = pi.load_command_ledger(state)
+            rec = next(iter(ledger.values()))
+            self.assertEqual(rec["status"], "failed")
+            self.assertIn("disk full", rec["error"])
+
+    def test_idempotent_second_run_does_not_duplicate(self):
+        note = "Word of the day is ephemeral."
+        with tempfile.TemporaryDirectory() as td:
+            state, cortex = Path(td) / "state", Path(td) / "cortex"
+            state.mkdir(); cortex.mkdir()
+            src = state / "2026-07-06.md"
+            src.write_text(note, encoding="utf-8")
+            with mock.patch.object(pi, "_push_command_notification"):
+                for _ in range(2):
+                    pi.run_command_stage(
+                        note, src, "2026-07-06", cortex, state, pi.RunSummary(),
+                        dry_run=False, verbose=False,
+                    )
+            content = (cortex / "Tuff words.md").read_text(encoding="utf-8")
+            self.assertEqual(content.count("ephemeral"), 1)
+
+    def test_two_different_words_both_recorded(self):
+        note = "Word of the day is ephemeral. Later: word of the day is petrichor."
+        with tempfile.TemporaryDirectory() as td:
+            state, cortex = Path(td) / "state", Path(td) / "cortex"
+            state.mkdir(); cortex.mkdir()
+            src = state / "2026-07-06.md"
+            src.write_text(note, encoding="utf-8")
+            with mock.patch.object(pi, "_push_command_notification"):
+                summary = pi.RunSummary()
+                pi.run_command_stage(
+                    note, src, "2026-07-06", cortex, state, summary,
+                    dry_run=False, verbose=False,
+                )
+            content = (cortex / "Tuff words.md").read_text(encoding="utf-8")
+            self.assertIn("- ephemeral — 2026-07-06", content)
+            self.assertIn("- petrichor — 2026-07-06", content)
+            self.assertEqual(summary.commands_executed, 2)
+
+    def test_same_word_different_days_both_recorded(self):
+        # Not deduped across days — a real repeat is a legitimate entry.
+        with tempfile.TemporaryDirectory() as td:
+            state, cortex = Path(td) / "state", Path(td) / "cortex"
+            state.mkdir(); cortex.mkdir()
+            with mock.patch.object(pi, "_push_command_notification"):
+                for i, date in enumerate(["2026-07-06", "2026-07-08"]):
+                    note = "Word of the day is ephemeral."
+                    src = state / f"{date}.md"
+                    src.write_text(note, encoding="utf-8")
+                    pi.run_command_stage(
+                        note, src, date, cortex, state, pi.RunSummary(),
+                        dry_run=False, verbose=False,
+                    )
+            content = (cortex / "Tuff words.md").read_text(encoding="utf-8")
+            self.assertIn("- ephemeral — 2026-07-06", content)
+            self.assertIn("- ephemeral — 2026-07-08", content)
+
+
+class TestAppendWordOfTheDay(unittest.TestCase):
+    def test_creates_file_with_header(self):
+        with tempfile.TemporaryDirectory() as td:
+            cortex = Path(td)
+            path = pi.append_word_of_the_day(cortex, "ephemeral", "2026-07-06")
+            content = path.read_text(encoding="utf-8")
+            self.assertIn("# Tuff words", content)
+            self.assertIn("- ephemeral — 2026-07-06", content)
+
+    def test_appends_without_overwriting(self):
+        with tempfile.TemporaryDirectory() as td:
+            cortex = Path(td)
+            pi.append_word_of_the_day(cortex, "ephemeral", "2026-07-06")
+            pi.append_word_of_the_day(cortex, "petrichor", "2026-07-07")
+            content = (cortex / "Tuff words.md").read_text(encoding="utf-8")
+            self.assertIn("- ephemeral — 2026-07-06", content)
+            self.assertIn("- petrichor — 2026-07-07", content)
+
+
 if __name__ == "__main__":
     unittest.main()
