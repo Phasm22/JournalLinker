@@ -52,6 +52,11 @@ class TestGatePromptTemplates(unittest.TestCase):
         style = pi.resolve_gate_style("qwen2.5:32b")
         self.assertEqual(style, "qwen25")
 
+    def test_default_gate_model_resolves_to_qwen25(self):
+        with mock.patch.dict(os.environ, {"INTENT_GATE_STYLE": "auto"}):
+            style = pi.resolve_gate_style(pi.DEFAULT_GATE_MODEL)
+        self.assertEqual(style, "qwen25")
+
     def test_resolve_gate_style_explicit_override(self):
         with mock.patch.dict(os.environ, {"INTENT_GATE_STYLE": "qwen25"}):
             style = pi.resolve_gate_style("phi4:14b")
@@ -145,7 +150,7 @@ class TestGateChunking(unittest.TestCase):
             mock.patch.dict("sys.modules", {"ollama": mock_ollama}),
             mock.patch.object(pi, "_paragraph_chunks", return_value=["Need to buy bike shoes.", "Also need to buy bike shoes."]),
         ):
-            intents = pi.call_gate(note, model="phi4:14b", style="phi4")
+            intents = pi.call_gate(note, model="qwen2.5:14b", style="qwen25")
         self.assertEqual(len(intents), 1)
         self.assertEqual(intents[0]["intent_raw"], "buy bike shoes")
 
@@ -161,8 +166,8 @@ class TestIdempotencyKey(unittest.TestCase):
             source_date="2026-04-16",
             intent_raw="call doctor",
             category="task",
-            gate_model="phi4:14b",
-            gate_style="phi4",
+            gate_model="qwen2.5:14b",
+            gate_style="qwen25",
             intent_class="task_intent",
         )
         defaults.update(overrides)
@@ -536,8 +541,8 @@ class TestPipelinePushoverDedupe(unittest.TestCase):
                 with mock.patch.object(pi, "send_pushover", return_value=(200, "ok")) as mock_po:
                     e1 = pi.run_intent_pipeline(
                         FIXTURE_NOTE,
-                        gate_model="phi4:14b",
-                        gate_style="phi4",
+                        gate_model="qwen2.5:14b",
+                        gate_style="qwen25",
                         routing_model="gpt-4o-mini",
                         cortex_dir=self.cortex_dir,
                         state_dir=self.state_dir,
@@ -548,8 +553,8 @@ class TestPipelinePushoverDedupe(unittest.TestCase):
                     )
                     e2 = pi.run_intent_pipeline(
                         FIXTURE_NOTE,
-                        gate_model="phi4:14b",
-                        gate_style="phi4",
+                        gate_model="qwen2.5:14b",
+                        gate_style="qwen25",
                         routing_model="gpt-4o-mini",
                         cortex_dir=self.cortex_dir,
                         state_dir=self.state_dir,
@@ -597,8 +602,8 @@ class TestPipelinePushoverDedupe(unittest.TestCase):
                 ):
                     exit_code = pi.run_intent_pipeline(
                         FIXTURE_NOTE,
-                        gate_model="phi4:14b",
-                        gate_style="phi4",
+                        gate_model="qwen2.5:14b",
+                        gate_style="qwen25",
                         routing_model="gpt-4o-mini",
                         cortex_dir=Path(tmpdir) / "cortex",
                         state_dir=state_dir,
@@ -620,9 +625,10 @@ class TestPipelinePushoverDedupe(unittest.TestCase):
     def test_live_ollama_smoke_for_intent_gate(self):
         import ollama as live_ollama
 
-        prompt = pi.build_gate_prompt("I need to call the doctor.", "phi4")
+        model = os.getenv("INTENT_GATE_MODEL", pi.DEFAULT_GATE_MODEL)
+        prompt = pi.build_gate_prompt("I need to call the doctor.", pi.resolve_gate_style(model))
         response = live_ollama.chat(
-            model=os.getenv("INTENT_GATE_MODEL", pi.DEFAULT_GATE_MODEL),
+            model=model,
             messages=[{"role": "user", "content": prompt}],
             options={"temperature": 0.0, "num_ctx": 128},
             keep_alive=pi.KEEP_ALIVE,
@@ -667,8 +673,8 @@ class TestPipelinePartialRetrySkipsPushover(unittest.TestCase):
                     with mock.patch.object(pi, "write_cortex_note", side_effect=write_maybe_fail):
                         e1 = pi.run_intent_pipeline(
                             FIXTURE_NOTE,
-                            gate_model="phi4:14b",
-                            gate_style="phi4",
+                            gate_model="qwen2.5:14b",
+                            gate_style="qwen25",
                             routing_model="gpt-4o-mini",
                             cortex_dir=self.cortex_dir,
                             state_dir=self.state_dir,
@@ -679,8 +685,8 @@ class TestPipelinePartialRetrySkipsPushover(unittest.TestCase):
                         )
                         e2 = pi.run_intent_pipeline(
                             FIXTURE_NOTE,
-                            gate_model="phi4:14b",
-                            gate_style="phi4",
+                            gate_model="qwen2.5:14b",
+                            gate_style="qwen25",
                             routing_model="gpt-4o-mini",
                             cortex_dir=self.cortex_dir,
                             state_dir=self.state_dir,
@@ -844,8 +850,8 @@ class TestExitCodes(unittest.TestCase):
                     mock_claude.return_value = claude_response
                 return pi.run_intent_pipeline(
                     FIXTURE_NOTE,
-                    gate_model="phi4:14b",
-                    gate_style="phi4",
+                    gate_model="qwen2.5:14b",
+                    gate_style="qwen25",
                     routing_model="gpt-4o-mini",
                     cortex_dir=self.cortex_dir,
                     state_dir=self.state_dir,
@@ -878,8 +884,8 @@ class TestExitCodes(unittest.TestCase):
             with mock.patch.dict("sys.modules", {"ollama": mock_ollama}):
                 exit_code = pi.run_intent_pipeline(
                     FIXTURE_NOTE,
-                    gate_model="phi4:14b",
-                    gate_style="phi4",
+                    gate_model="qwen2.5:14b",
+                    gate_style="qwen25",
                     routing_model="gpt-4o-mini",
                     cortex_dir=Path(tmpdir) / "cortex",
                     state_dir=state_dir,
@@ -902,8 +908,8 @@ class TestExitCodes(unittest.TestCase):
                 with mock.patch.object(pi, "call_routing_model", side_effect=ConnectionError("routing model timeout")):
                     exit_code = pi.run_intent_pipeline(
                         FIXTURE_NOTE,
-                        gate_model="phi4:14b",
-                        gate_style="phi4",
+                        gate_model="qwen2.5:14b",
+                        gate_style="qwen25",
                         routing_model="gpt-4o-mini",
                         cortex_dir=Path(tmpdir) / "cortex",
                         state_dir=state_dir,
@@ -929,8 +935,8 @@ class TestExitCodes(unittest.TestCase):
                 "2026-04-16",
                 "rename file",
                 "task",
-                "phi4:14b",
-                "phi4",
+                "qwen2.5:14b",
+                "qwen25",
                 intent_class="task_intent",
             )
             pi.save_ledger(state_dir, {
@@ -948,8 +954,8 @@ class TestExitCodes(unittest.TestCase):
                 with mock.patch.object(pi, "call_routing_model", side_effect=ConnectionError("routing timeout")):
                     exit_code = pi.run_intent_pipeline(
                         note_path,
-                        gate_model="phi4:14b",
-                        gate_style="phi4",
+                        gate_model="qwen2.5:14b",
+                        gate_style="qwen25",
                         routing_model="gpt-4o-mini",
                         cortex_dir=state_dir / "cortex",
                         state_dir=state_dir,
@@ -1032,8 +1038,8 @@ class TestDryRunWorkflow(unittest.TestCase):
                 with mock.patch.object(pi, "call_routing_model", return_value=claude_response):
                     exit_code = pi.run_intent_pipeline(
                         FIXTURE_NOTE,
-                        gate_model="phi4:14b",
-                        gate_style="phi4",
+                        gate_model="qwen2.5:14b",
+                        gate_style="qwen25",
                         routing_model="gpt-4o-mini",
                         cortex_dir=cortex_dir,
                         state_dir=state_dir,

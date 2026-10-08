@@ -22,7 +22,7 @@ Exit codes (stable contract for shell wrappers):
 
 Env vars (from .env or environment):
     SCRIBE_JOURNAL_DIR           journal directory (required)
-    INTENT_GATE_MODEL            Ollama gate model (default: phi4:14b)
+    INTENT_GATE_MODEL            Ollama gate model (default: qwen2.5:14b)
     INTENT_GATE_STYLE            auto|phi4|qwen25 (default: auto)
     INTENT_ROUTING_MODEL         OpenAI model ID (default: gpt-4o-mini)
     INTENT_NUTRITION_MODEL       Ollama model for voice nutrition extract
@@ -134,7 +134,7 @@ def _finalize_run(exit_code: int, summary: RunSummary) -> int:
     return exit_code
 
 
-DEFAULT_GATE_MODEL = "phi4:14b"
+DEFAULT_GATE_MODEL = "qwen2.5:14b"
 DEFAULT_GATE_STYLE = "auto"
 DEFAULT_ROUTING_MODEL = "gpt-4o-mini"
 DEFAULT_IN_FLIGHT_TTL = 300  # seconds

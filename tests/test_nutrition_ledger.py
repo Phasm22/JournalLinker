@@ -595,7 +595,7 @@ class TestPipelineHook(unittest.TestCase):
                 code = pi.run_intent_pipeline(
                     note,
                     gate_model="test-gate",
-                    gate_style="phi4",
+                    gate_style="qwen25",
                     routing_model="test-route",
                     cortex_dir=root / "cortex",
                     state_dir=state,

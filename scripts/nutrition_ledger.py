@@ -40,7 +40,7 @@ CACHE_FILENAME = "nutrition_lookup_cache.json"
 MEMORY_FILENAME = "nutrition_memory.json"
 SUMMARY_STATE_FILENAME = "nutrition_summary_state.json"
 
-DEFAULT_GATE_MODEL = "phi4:14b"
+DEFAULT_GATE_MODEL = "qwen2.5:14b"
 DEFAULT_LOOKUP_MODEL = "gpt-4o-mini"
 DEFAULT_PUSHOVER_SERVER = "https://api.pushover.net"
 PUSHOVER_MESSAGE_LIMIT = 1024
