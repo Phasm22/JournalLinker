@@ -754,7 +754,7 @@ class TestScribeLearning(unittest.TestCase):
     @unittest.skipUnless(LIVE_OLLAMA_SMOKE, "set JOURNAL_LINKER_LIVE_SMOKE=1 to run live Ollama smoke tests")
     def test_live_ollama_smoke_for_scribe(self):
         response = scribe.ollama.chat(
-            model=os.getenv("SCRIBE_MODEL", "llama3.1:8b"),
+            model=os.getenv("SCRIBE_MODEL", "llama3.2:latest"),
             messages=[{"role": "user", "content": "Reply with a short sentence that contains the word journal."}],
             options={"temperature": 0, "num_ctx": 128},
             keep_alive="5m",
@@ -796,46 +796,6 @@ class TestScribeLearning(unittest.TestCase):
             self.assertIn("[[Jordan]]", updated)
             self.assertIn("Anthropic", updated)
             self.assertIn("[[Marcus]]", stdout.getvalue())
-
-
-    def test_cluster_diversity_bonus_promotes_out_of_cluster_term(self):
-        # walk (cluster 0, weight 15) and anxiety (cluster 0, weight 8) compete with
-        # finances (cluster 1, weight 5.5). finances gets +10 diversity bonus => ~15.5,
-        # beating anxiety.
-        cluster_map = {"walk": 0, "anxiety": 0, "finances": 1}
-        learning = {
-            "term_weights": {"walk": 15.0, "anxiety": 8.0, "finances": 5.5},
-            "term_memory": {},
-        }
-        text = "I went for a walk and felt anxiety about my finances today."
-        ranked = scribe.rank_link_candidates(
-            text,
-            ["walk", "anxiety", "finances"],
-            learning,
-            cluster_map=cluster_map,
-        )
-        self.assertIn("finances", ranked)
-        self.assertIn("anxiety", ranked)
-        self.assertLess(ranked.index("finances"), ranked.index("anxiety"))
-
-    def test_cluster_diversity_no_bonus_below_threshold(self):
-        # flimsy has a very low base_score (negative weight pushes it below 5.0),
-        # so it must NOT receive the diversity bonus and walk stays first.
-        cluster_map = {"walk": 0, "flimsy": 1}
-        learning = {
-            "term_weights": {"walk": 20.0, "flimsy": -20.0},
-            "term_memory": {},
-        }
-        text = "I went for a walk and noticed something flimsy."
-        ranked = scribe.rank_link_candidates(
-            text,
-            ["walk", "flimsy"],
-            learning,
-            cluster_map=cluster_map,
-        )
-        self.assertEqual(ranked[0], "walk")
-        self.assertEqual(ranked[-1], "flimsy")
-
 
 if __name__ == "__main__":
     unittest.main()

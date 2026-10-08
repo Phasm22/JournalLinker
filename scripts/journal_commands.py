@@ -6,23 +6,30 @@ Detects directives *addressed to the assistant* inside a daily note, e.g.:
     "Palindrome, can you pull the latest 10-K for Ford?"
 
 This is distinct from the intent gate (which extracts personal to-dos). A
-recognized command maps to an executable route. Two routes exist:
-`hot_seat_fetch` (pull a company's latest 10-K into hot_seat) and
-`watchlist_add` ("Palindrome, watch/track/follow <company>" — record the
-ticker in the Obsidian watchlist, independent of whether a 10-K exists or
-was ever fetched). The two routes use disjoint verb vocabularies so they
-never compete for the same utterance.
+recognized command maps to an executable route. Three routes exist:
+`hot_seat_fetch` (pull a company's latest 10-K into hot_seat), `watchlist_add`
+("Palindrome, watch/track/follow <company>" — record the ticker in the
+Obsidian watchlist, independent of whether a 10-K exists or was ever
+fetched), and `word_of_the_day` ("word of the day is <word>" — append the
+word to the "Tuff words" Obsidian note in cortex, no wake word required).
+The two wake-word routes use
+disjoint verb vocabularies so they never compete for the same utterance;
+word_of_the_day uses a distinct fixed-phrase anchor instead of a verb, so it
+never collides with either.
 
-Recognition is deterministic (no LLM): a wake word anchors the command, and a
-few normalizers turn spoken forms ("ten K", "annual report") into a route +
-company reference. Company -> ticker resolution happens later in
-hot_seat_fetch (OpenAI + EDGAR), not here.
+Recognition is deterministic (no LLM): a wake word anchors hot_seat_fetch and
+watchlist_add, and a few normalizers turn spoken forms ("ten K", "annual
+report") into a route + company reference. Company -> ticker resolution
+happens later in hot_seat_fetch (OpenAI + EDGAR), not here. word_of_the_day
+is anchored by its own fixed phrase instead (see extract_word_of_day_spans).
 
 Design notes:
-- High precision by construction: nothing fires without the wake word, so
-  normal journaling never triggers a route.
-- Only fetch-verb or watch-verb phrasing is claimed; any other wake-word
-  sentence returns None and falls through to normal intent handling.
+- High precision by construction: nothing fires without the wake word (or,
+  for word_of_the_day, the "word of the day" phrase), so normal journaling
+  never triggers a route.
+- Only fetch-verb, watch-verb, or word-of-the-day phrasing is claimed; any
+  other wake-word sentence returns None and falls through to normal intent
+  handling.
 """
 
 import json
@@ -435,12 +442,91 @@ def parse_watchlist_command(command_text: str) -> dict | None:
     return result
 
 
+# word_of_the_day is a third, structurally different route: it has no wake
+# word (per spec, "word of the day is X" fires on its own) and no verb
+# vocabulary — the anchor is the fixed phrase "word of the day" itself, with
+# the target word taken from whatever follows "is"/":"/the phrase. Because
+# the grammar doesn't fit the wake-word + verb + object shape the config-driven
+# _ROUTES machinery models, recognition lives here as a dedicated function
+# rather than a voice_command_routes.json entry.
+_WORD_OF_DAY_ROUTE = "word_of_the_day"
+
+_WORD_OF_DAY_ANCHOR_RE = re.compile(r"(?i)\bword\s+of\s+the\s+day\b")
+_WORD_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z'\-]*")
+# Skipped when scanning for the target word after the anchor, so "is",
+# "the word of the day is a corker", and "word of the day: ephemeral" all
+# resolve to the intended word rather than the filler in front of it.
+_WORD_OF_DAY_SKIP = {"a", "an", "the", "is", "was", "s", "um", "uh"}
+
+
+def _first_meaningful_word_after(text: str, pos: int) -> tuple[str, int, int] | None:
+    """First word token at/after `pos` that isn't filler, or None.
+
+    Stops (returns None) if a sentence terminator appears before a real word
+    is found — "what's the word of the day?" is a question, not a command.
+    """
+    for tok in _WORD_TOKEN_RE.finditer(text, pos):
+        if any(c in text[pos:tok.start()] for c in _SENTENCE_TERMINATORS):
+            return None
+        if tok.group().lower() in _WORD_OF_DAY_SKIP:
+            continue
+        return tok.group(), tok.start(), tok.end()
+    return None
+
+
+def extract_word_of_day_spans(note_text: str) -> list[dict]:
+    """Find 'word of the day' mentions and the word that follows.
+
+    No wake word required — "word of the day is ephemeral" fires the same as
+    "hey palindrome, word of the day is ephemeral" (a leading wake word, if
+    present, is just ordinary sentence text and is ignored). Each result:
+    {route, word, command_text, raw, start, end}.
+    """
+    if not note_text:
+        return []
+    spans: list[dict] = []
+    for m in _WORD_OF_DAY_ANCHOR_RE.finditer(note_text):
+        found = _first_meaningful_word_after(note_text, m.end())
+        if not found:
+            continue
+        word, _w_start, w_end = found
+        span_start, span_end = m.start(), w_end
+        raw = note_text[span_start:span_end].strip()
+        spans.append({
+            "route": _WORD_OF_DAY_ROUTE,
+            "word": word,
+            "command_text": raw,
+            "raw": raw,
+            "start": span_start,
+            "end": span_end,
+        })
+    return spans
+
+
+def find_word_of_day_commands(note_text: str) -> list[dict]:
+    """Find + key 'word of the day' commands.
+
+    Duplicate identical words within one note collapse to one command (first
+    occurrence wins), same convention as find_commands().
+    """
+    commands: list[dict] = []
+    seen: set[str] = set()
+    for span in extract_word_of_day_spans(note_text):
+        key = command_key(span)
+        if key in seen:
+            continue
+        seen.add(key)
+        commands.append({**span, "key": key})
+    return commands
+
+
 def command_key(cmd: dict) -> str:
-    """Stable per-command key for idempotency (route + form + company)."""
+    """Stable per-command key for idempotency (route + form + company/word)."""
+    identity = cmd.get("company") or cmd.get("word") or ""
     return "|".join([
         str(cmd.get("route", "")),
         str(cmd.get("form", "")).upper(),
-        _norm(cmd.get("company", "")),
+        _norm(identity),
     ])
 
 

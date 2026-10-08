@@ -1,4 +1,4 @@
-# Journal Linker — local Obsidian journal wikilink helper (Scribe + weekly insights).
+# Journal Linker — local Obsidian journal wikilink helper.
 # Install the runner: brew install just   →   https://github.com/casey/just
 #
 # First-time: configure env vars (recommended: ~/.config/journal-linker/journal-linker.env) — see README.
@@ -33,10 +33,6 @@ scribe-job:
 launchagent-journal p:
     "{{root}}/scripts/patch_launchagent_journal.sh" "{{p}}"
 
-# Weekly insights note (uses the same env bootstrap as Scribe)
-weekly:
-    "{{py}}" "{{root}}/weekly_insights.py"
-
 # Dry-run the daily Pushover reflection without sending
 daily-reflection *ARGS:
     "{{py}}" "{{root}}/daily_reflection.py" --dry-run {{ARGS}}
@@ -44,6 +40,10 @@ daily-reflection *ARGS:
 # Real daily Pushover reflection run (same core path as the scheduled job)
 daily-reflection-send *ARGS:
     "{{py}}" "{{root}}/daily_reflection.py" {{ARGS}}
+
+# Print today's nutrition summary without sending Pushover
+nutrition-summary *ARGS:
+    "{{py}}" "{{root}}/scripts/nutrition_ledger.py" --summary --dry-run {{ARGS}}
 
 # Tests only (Ollama mocked)
 test:
@@ -79,6 +79,10 @@ voice-reprocess-all:
 # Scan VoiceDrop folder and process all unprocessed recordings
 voice-scan:
     "{{py}}" "{{root}}/scripts/process_voice.py"
+
+# Run the Tailscale voice ingest endpoint in the foreground (normally journal-linker-voice-ingest.service)
+voice-ingest:
+    "{{py}}" "{{root}}/scripts/voice_ingest_server.py"
 
 # Install faster-whisper into the project venv
 voice-install:

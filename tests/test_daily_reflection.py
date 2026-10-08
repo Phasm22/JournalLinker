@@ -477,7 +477,7 @@ class TestDailyReflection(unittest.TestCase):
             "confidence": 0.5,
         }
         response = daily_reflection.ollama.chat(
-            model=os.getenv("SCRIBE_DAILY_REFLECTION_MODEL", os.getenv("SCRIBE_MODEL", "llama3.1:8b")),
+            model=os.getenv("SCRIBE_DAILY_REFLECTION_MODEL", os.getenv("SCRIBE_MODEL", "llama3.2:latest")),
             messages=[{"role": "user", "content": daily_reflection.build_daily_reflection_prompt(signals)}],
             options={"temperature": 0.45, "num_ctx": 128},
             keep_alive="5m",

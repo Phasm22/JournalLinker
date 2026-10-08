@@ -8,10 +8,9 @@ One feedback loop, several moving parts:
 
 - **Scribe** — inserts `[[wikilinks]]` into daily notes using a local Ollama model, re-ranked by a reinforcement learning store that tracks what links actually stuck
 - **Echo** — transcribes iPhone voice recordings with Whisper, using that same learning store as vocabulary context so your project names and proper nouns land correctly
-- **Weekly Insights** — reads the week's entries and the learning store, drafts a reflection note
 - **Daily Reflection Push** — reads yesterday's entry, drafts a short reflection, and sends it once per day through Pushover
 
-Related automation (not always in *this* repo clone) can live under `JOURNAL_LINKER_REPO` on disk — e.g. intent routing, Telegram feedback — but Scribe, voice, reflection, and weekly insights are anchored here.
+Related automation (not always in *this* repo clone) can live under `JOURNAL_LINKER_REPO` on disk — e.g. intent routing and Telegram feedback — but Scribe, voice, and daily reflection are anchored here.
 
 ---
 
@@ -29,7 +28,7 @@ Voice entries are first-class. A recording made at 11 PM is attributed to that d
 
 ## Prerequisites
 
-- **[Ollama](https://ollama.com/)** running locally with a chat model pulled (e.g. `llama3.1:8b`)
+- **[Ollama](https://ollama.com/)** running locally with a chat model pulled (e.g. `llama3.2:latest`)
 - **Python 3** with a venv at `ScribeVenv/` (`just` recipes use it automatically)
 - **faster-whisper** for voice: `just voice-install`
 
@@ -67,7 +66,7 @@ Put at least:
 ```bash
 SCRIBE_JOURNAL_DIR="/path/to/your/daily-notes-folder"
 # optional:
-# SCRIBE_MODEL="llama3.1:8b"
+# SCRIBE_MODEL="llama3.2:latest"
 # SCRIBE_CTX="8192"
 # SCRIBE_WHISPER_MODEL="base.en"
 ```
@@ -95,7 +94,6 @@ Install [just](https://github.com/casey/just) (`brew install just`).
 | `just scribe-paste`     | macOS: clipboard → Scribe → stdout                                 |
 | `just scribe-writeback` | Read today's note from disk, insert wikilinks, write back in-place |
 | `just scribe-job`       | Same wrapper the launchd agent uses (timestamped logs)             |
-| `just weekly`           | Generate the weekly insights note                                  |
 | `just daily-reflection` | Dry-run the day-behind Pushover reflection and print the notification |
 | `just daily-reflection-send` | Run the real Pushover delivery path manually                 |
 | `just intent-mcp-install` | Install the MCP client used for llmLibrarian intent enrichment |
@@ -181,7 +179,17 @@ User units and env templates live under [`systemd/`](./systemd/) (see [`systemd/
 - Logs often go to `~/.local/state/journal-linker/` when `SCRIBE_JOB_LOG_DIR` is set that way (see `just doctor`).
 - After amending commits or changing remotes: `git fetch origin` before `git push --force-with-lease` so the lease matches GitHub.
 
-VoiceDrop may be a Dropbox folder instead of iCloud; override `SCRIBE_VOICEDROP_DIR` in the env file.
+### Voice uploads over Tailscale (Linux)
+
+The iOS Shortcut POSTs recordings straight to this host instead of syncing through Dropbox/iCloud. [`scripts/voice_ingest_server.py`](scripts/voice_ingest_server.py) (`journal-linker-voice-ingest.service`) verifies `X-MD5`, probes the audio, and atomically drops the file into `SCRIBE_VOICEDROP_DIR`; the existing `journal-linker-voice-watcher.path` → `process_voice.py` flow is unchanged. It replies exactly `OK` only once the file is durable, which is what the Shortcut's ledger keys on. Protocol and env knobs: module docstring.
+
+```bash
+mkdir -p ~/VoiceDrop                      # must match SCRIBE_VOICEDROP_DIR and the .path unit
+systemctl --user enable --now journal-linker-voice-ingest.service
+tailscale serve --bg --https=8797 http://127.0.0.1:8797   # tailnet-only; never `funnel`
+```
+
+Port 8797 because 8790–8792 belong to Argus. Shortcut URL: `https://<host>.<tailnet>.ts.net:8797/ingest`. Health: `curl https://<host>.<tailnet>.ts.net:8797/healthz`.
 
 ---
 
@@ -191,7 +199,7 @@ VoiceDrop may be a Dropbox folder instead of iCloud; override `SCRIBE_VOICEDROP_
 | Variable               | Default                      | Meaning                                                                         |
 | ---------------------- | ---------------------------- | ------------------------------------------------------------------------------- |
 | `SCRIBE_JOURNAL_DIR`   | —                            | Path to daily notes folder (required)                                           |
-| `SCRIBE_MODEL`         | `llama3.1:8b`                | Ollama model                                                                    |
+| `SCRIBE_MODEL`         | `llama3.2:latest`                | Ollama model                                                                    |
 | `SCRIBE_CTX`           | `8192`                       | Ollama context window                                                           |
 | `SCRIBE_WHISPER_MODEL` | `base.en`                    | faster-whisper model (`base.en`, `small.en`, `medium.en`)                       |
 | `SCRIBE_VOICEDROP_DIR` | `~/…/iCloud Drive/VoiceDrop` | Folder Echo watches for recordings                                              |
@@ -215,7 +223,6 @@ For compatibility, `daily_reflection.py` also accepts `PUSHOVER_TOKEN` and `PUSH
 | Path                       | Role                                                           |
 | -------------------------- | -------------------------------------------------------------- |
 | `Scribe.py`                | Wikilink pipeline + learning store                             |
-| `weekly_insights.py`       | Weekly reflection note generator                               |
 | `daily_reflection.py`      | Day-behind Pushover reflection generator + sender              |
 | `archivist.py`             | Standalone Ollama + clipboard utility                          |
 | `scripts/process_voice.py` | Echo: voice-to-journal bridge                                  |

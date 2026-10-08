@@ -46,19 +46,38 @@ job_log_init() {
     mkdir -p "$LOG_DIR"
   fi
 
+  # A mkdir-based lock survives an unclean shutdown, which is especially bad
+  # for Restart=always services: every restart sees the orphan and exits.
+  # On Linux, keep the lock on an inherited flock file descriptor instead.
+  # The kernel releases it automatically if either the wrapper or its child
+  # is killed. The mkdir implementation remains as a portable fallback for
+  # hosts without flock.
   LOCK_DIR="$LOG_DIR/$lock_name"
+  LOCK_FILE="$LOG_DIR/${lock_name}.flock"
   RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"
   LOG_FILE="$LOG_DIR/${log_basename}-$RUN_ID.log"
   LATEST_LINK="$LOG_DIR/${log_basename}-latest.log"
   JOURNAL_LINKER_JOB_PAYLOAD_FILE="$LOG_DIR/.payload-${log_basename}-$RUN_ID.json"
   export JOURNAL_LINKER_SERVICE JOURNAL_LINKER_JOB_PAYLOAD_FILE
 
-  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-    echo "${service}: skipped — another job is running (lock: $LOCK_DIR). If stuck: rmdir \"$LOCK_DIR\"" >&2
-    job_log_lock_skip
-    exit 0
+  if command -v flock >/dev/null 2>&1; then
+    # FD 9 is inherited by the Python child, so it remains locked for the
+    # whole supervised run rather than only while this helper returns.
+    exec 9>"$LOCK_FILE"
+    if ! flock -n 9; then
+      echo "${service}: skipped — another job is running (lock: $LOCK_FILE)" >&2
+      job_log_lock_skip
+      exit 0
+    fi
+    trap 'flock -u 9 2>/dev/null || true; exec 9>&-' EXIT INT TERM HUP
+  else
+    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+      echo "${service}: skipped — another job is running (lock: $LOCK_DIR). If stuck: rmdir \"$LOCK_DIR\"" >&2
+      job_log_lock_skip
+      exit 0
+    fi
+    trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT INT TERM HUP
   fi
-  trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT INT TERM HUP
 }
 
 job_log_header() {

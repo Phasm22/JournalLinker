@@ -326,54 +326,6 @@ Expected: `[voice] vocab prompt: N terms` in the log.
 
 ---
 
-## weekly_insights.py
-
-**Current week (default)**
-TJ runs the insights script on a Friday afternoon. It reads the current ISO week
-and writes `Insights/Weekly Insight - YYYY-Www.md`.
-```
-python3 weekly_insights.py
-```
-
----
-
-**Explicit week**
-TJ wants insights for a past week.
-```
-python3 weekly_insights.py --week 2026-W10
-```
-
----
-
-**Idempotent rerun**
-The insight file already exists. Running again does not overwrite it (the caller
-checks the output path before writing).
-```
-python3 weekly_insights.py --week 2026-W10
-# precondition: Insights/Weekly Insight - 2026-W10.md exists
-```
-Expected: no change to the file.
-
----
-
-**Skip: sparse week** · `tests/fixtures/flows/entry_weekly_sparse.md`
-Only one journal entry for the week, and it's below 35 words. The script
-decides `substantive_entries < 2` and skips generating an insight.
-
-Precondition: only `entry_weekly_sparse.md`-style entries in the target week.
-Expected: output path is `None`, no file written.
-
----
-
-**Write: substantive week** · `tests/fixtures/flows/entry_weekly_substantive.md`
-Two or more rich entries exist for the week (≥ 35 words each, ≥ 80 total words,
-confidence ≥ 0.45). The script generates and writes the insight.
-
-Precondition: at least two `entry_weekly_substantive.md`-style entries in the
-target week (e.g. dated 2026-04-07 and 2026-04-08).
-
----
-
 ## daily_reflection.py
 
 **Within window, note present → push sent**
@@ -443,13 +395,3 @@ echo "Ran into Marcus at the coffee shop near the Riverside trail." | python3 ar
 Expected: linked version printed to stdout; no state file changes.
 
 ---
-
-## vault_mapper.py
-
-**Co-occurrence clustering**
-TJ wants to see which terms cluster together across all journal entries.
-```
-python3 vault_mapper.py
-```
-Expected: JSON/text listing of term clusters (e.g. `["Marcus", "cycling", "Jordan"]`)
-where each group co-occurs in ≥ 2 entries (default `--min-cooccurrence`).

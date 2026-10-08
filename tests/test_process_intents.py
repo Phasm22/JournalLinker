@@ -52,6 +52,11 @@ class TestGatePromptTemplates(unittest.TestCase):
         style = pi.resolve_gate_style("qwen2.5:32b")
         self.assertEqual(style, "qwen25")
 
+    def test_default_gate_model_resolves_to_qwen25(self):
+        with mock.patch.dict(os.environ, {"INTENT_GATE_STYLE": "auto"}):
+            style = pi.resolve_gate_style(pi.DEFAULT_GATE_MODEL)
+        self.assertEqual(style, "qwen25")
+
     def test_resolve_gate_style_explicit_override(self):
         with mock.patch.dict(os.environ, {"INTENT_GATE_STYLE": "qwen25"}):
             style = pi.resolve_gate_style("phi4:14b")
@@ -145,7 +150,7 @@ class TestGateChunking(unittest.TestCase):
             mock.patch.dict("sys.modules", {"ollama": mock_ollama}),
             mock.patch.object(pi, "_paragraph_chunks", return_value=["Need to buy bike shoes.", "Also need to buy bike shoes."]),
         ):
-            intents = pi.call_gate(note, model="phi4:14b", style="phi4")
+            intents = pi.call_gate(note, model="qwen2.5:14b", style="qwen25")
         self.assertEqual(len(intents), 1)
         self.assertEqual(intents[0]["intent_raw"], "buy bike shoes")
 
@@ -161,8 +166,8 @@ class TestIdempotencyKey(unittest.TestCase):
             source_date="2026-04-16",
             intent_raw="call doctor",
             category="task",
-            gate_model="phi4:14b",
-            gate_style="phi4",
+            gate_model="qwen2.5:14b",
+            gate_style="qwen25",
             intent_class="task_intent",
         )
         defaults.update(overrides)
@@ -536,8 +541,8 @@ class TestPipelinePushoverDedupe(unittest.TestCase):
                 with mock.patch.object(pi, "send_pushover", return_value=(200, "ok")) as mock_po:
                     e1 = pi.run_intent_pipeline(
                         FIXTURE_NOTE,
-                        gate_model="phi4:14b",
-                        gate_style="phi4",
+                        gate_model="qwen2.5:14b",
+                        gate_style="qwen25",
                         routing_model="gpt-4o-mini",
                         cortex_dir=self.cortex_dir,
                         state_dir=self.state_dir,
@@ -548,8 +553,8 @@ class TestPipelinePushoverDedupe(unittest.TestCase):
                     )
                     e2 = pi.run_intent_pipeline(
                         FIXTURE_NOTE,
-                        gate_model="phi4:14b",
-                        gate_style="phi4",
+                        gate_model="qwen2.5:14b",
+                        gate_style="qwen25",
                         routing_model="gpt-4o-mini",
                         cortex_dir=self.cortex_dir,
                         state_dir=self.state_dir,
@@ -597,8 +602,8 @@ class TestPipelinePushoverDedupe(unittest.TestCase):
                 ):
                     exit_code = pi.run_intent_pipeline(
                         FIXTURE_NOTE,
-                        gate_model="phi4:14b",
-                        gate_style="phi4",
+                        gate_model="qwen2.5:14b",
+                        gate_style="qwen25",
                         routing_model="gpt-4o-mini",
                         cortex_dir=Path(tmpdir) / "cortex",
                         state_dir=state_dir,
@@ -620,9 +625,10 @@ class TestPipelinePushoverDedupe(unittest.TestCase):
     def test_live_ollama_smoke_for_intent_gate(self):
         import ollama as live_ollama
 
-        prompt = pi.build_gate_prompt("I need to call the doctor.", "phi4")
+        model = os.getenv("INTENT_GATE_MODEL", pi.DEFAULT_GATE_MODEL)
+        prompt = pi.build_gate_prompt("I need to call the doctor.", pi.resolve_gate_style(model))
         response = live_ollama.chat(
-            model=os.getenv("INTENT_GATE_MODEL", pi.DEFAULT_GATE_MODEL),
+            model=model,
             messages=[{"role": "user", "content": prompt}],
             options={"temperature": 0.0, "num_ctx": 128},
             keep_alive=pi.KEEP_ALIVE,
@@ -667,8 +673,8 @@ class TestPipelinePartialRetrySkipsPushover(unittest.TestCase):
                     with mock.patch.object(pi, "write_cortex_note", side_effect=write_maybe_fail):
                         e1 = pi.run_intent_pipeline(
                             FIXTURE_NOTE,
-                            gate_model="phi4:14b",
-                            gate_style="phi4",
+                            gate_model="qwen2.5:14b",
+                            gate_style="qwen25",
                             routing_model="gpt-4o-mini",
                             cortex_dir=self.cortex_dir,
                             state_dir=self.state_dir,
@@ -679,8 +685,8 @@ class TestPipelinePartialRetrySkipsPushover(unittest.TestCase):
                         )
                         e2 = pi.run_intent_pipeline(
                             FIXTURE_NOTE,
-                            gate_model="phi4:14b",
-                            gate_style="phi4",
+                            gate_model="qwen2.5:14b",
+                            gate_style="qwen25",
                             routing_model="gpt-4o-mini",
                             cortex_dir=self.cortex_dir,
                             state_dir=self.state_dir,
@@ -762,6 +768,62 @@ class TestLedger(unittest.TestCase):
         self.assertEqual(count, 0)
         self.assertEqual(ledger["fresh"]["claude_status"], "in_flight")
 
+    def test_prune_ledger_removes_old_delivery_command_and_history_entries(self):
+        old = "2020-01-01T00:00:00+00:00"
+        fresh = datetime.now(timezone.utc).isoformat()
+        pi.save_ledger(
+            self.state_dir,
+            {
+                "old": {**self._make_entry(key="old"), "created_at": old},
+                "fresh": {**self._make_entry(key="fresh"), "created_at": fresh},
+                "unknown": {k: v for k, v in self._make_entry(key="unknown").items() if k != "journal_timestamp"},
+            },
+        )
+        pi.append_command_ledger(self.state_dir, {"command_idempotency_key": "old-cmd", "executed_at": old})
+        pi.append_command_ledger(self.state_dir, {"command_idempotency_key": "fresh-cmd", "executed_at": fresh})
+        pi.append_run_record(self.state_dir, {"run_id": "old-run", "created_at": old})
+        pi.append_run_record(self.state_dir, {"run_id": "fresh-run", "created_at": fresh})
+        (self.state_dir / pi.RUN_HISTORY_FILENAME).write_text(
+            (self.state_dir / pi.RUN_HISTORY_FILENAME).read_text(encoding="utf-8") + "not-json\n",
+            encoding="utf-8",
+        )
+
+        rc = pi.cmd_prune_ledger(self.state_dir, older_than_days=30)
+
+        self.assertEqual(rc, pi.EXIT_SUCCESS)
+        delivery = pi.load_ledger(self.state_dir)
+        self.assertNotIn("old", delivery)
+        self.assertIn("fresh", delivery)
+        self.assertIn("unknown", delivery)
+        commands = (self.state_dir / pi.COMMAND_LEDGER_FILENAME).read_text(encoding="utf-8")
+        self.assertNotIn("old-cmd", commands)
+        self.assertIn("fresh-cmd", commands)
+        history = (self.state_dir / pi.RUN_HISTORY_FILENAME).read_text(encoding="utf-8")
+        self.assertNotIn("old-run", history)
+        self.assertIn("fresh-run", history)
+        self.assertIn("not-json", history)
+
+    def test_prune_generated_logs_only_deletes_old_timestamped_wrapper_logs(self):
+        state_dir = self.state_dir / "intents"
+        state_dir.mkdir()
+        log_root = self.state_dir
+        old_log = log_root / "intent-retry-20200101-000000-123.log"
+        fresh_log = log_root / "voice-retry-20990101-000000-123.log"
+        latest = log_root / "intent-retry-latest.log"
+        user_file = log_root / "journal-note.log"
+        for path in (old_log, fresh_log, latest, user_file):
+            path.write_text("log\n", encoding="utf-8")
+        old_ts = datetime(2020, 1, 1, tzinfo=timezone.utc).timestamp()
+        os.utime(old_log, (old_ts, old_ts))
+
+        rc = pi.cmd_prune_generated_logs(state_dir, older_than_days=30)
+
+        self.assertEqual(rc, pi.EXIT_SUCCESS)
+        self.assertFalse(old_log.exists())
+        self.assertTrue(fresh_log.exists())
+        self.assertTrue(latest.exists())
+        self.assertTrue(user_file.exists())
+
 
 # ---------------------------------------------------------------------------
 # Exit code mapping via mocked pipeline
@@ -788,8 +850,8 @@ class TestExitCodes(unittest.TestCase):
                     mock_claude.return_value = claude_response
                 return pi.run_intent_pipeline(
                     FIXTURE_NOTE,
-                    gate_model="phi4:14b",
-                    gate_style="phi4",
+                    gate_model="qwen2.5:14b",
+                    gate_style="qwen25",
                     routing_model="gpt-4o-mini",
                     cortex_dir=self.cortex_dir,
                     state_dir=self.state_dir,
@@ -822,8 +884,8 @@ class TestExitCodes(unittest.TestCase):
             with mock.patch.dict("sys.modules", {"ollama": mock_ollama}):
                 exit_code = pi.run_intent_pipeline(
                     FIXTURE_NOTE,
-                    gate_model="phi4:14b",
-                    gate_style="phi4",
+                    gate_model="qwen2.5:14b",
+                    gate_style="qwen25",
                     routing_model="gpt-4o-mini",
                     cortex_dir=Path(tmpdir) / "cortex",
                     state_dir=state_dir,
@@ -846,8 +908,8 @@ class TestExitCodes(unittest.TestCase):
                 with mock.patch.object(pi, "call_routing_model", side_effect=ConnectionError("routing model timeout")):
                     exit_code = pi.run_intent_pipeline(
                         FIXTURE_NOTE,
-                        gate_model="phi4:14b",
-                        gate_style="phi4",
+                        gate_model="qwen2.5:14b",
+                        gate_style="qwen25",
                         routing_model="gpt-4o-mini",
                         cortex_dir=Path(tmpdir) / "cortex",
                         state_dir=state_dir,
@@ -873,8 +935,8 @@ class TestExitCodes(unittest.TestCase):
                 "2026-04-16",
                 "rename file",
                 "task",
-                "phi4:14b",
-                "phi4",
+                "qwen2.5:14b",
+                "qwen25",
                 intent_class="task_intent",
             )
             pi.save_ledger(state_dir, {
@@ -892,8 +954,8 @@ class TestExitCodes(unittest.TestCase):
                 with mock.patch.object(pi, "call_routing_model", side_effect=ConnectionError("routing timeout")):
                     exit_code = pi.run_intent_pipeline(
                         note_path,
-                        gate_model="phi4:14b",
-                        gate_style="phi4",
+                        gate_model="qwen2.5:14b",
+                        gate_style="qwen25",
                         routing_model="gpt-4o-mini",
                         cortex_dir=state_dir / "cortex",
                         state_dir=state_dir,
@@ -976,8 +1038,8 @@ class TestDryRunWorkflow(unittest.TestCase):
                 with mock.patch.object(pi, "call_routing_model", return_value=claude_response):
                     exit_code = pi.run_intent_pipeline(
                         FIXTURE_NOTE,
-                        gate_model="phi4:14b",
-                        gate_style="phi4",
+                        gate_model="qwen2.5:14b",
+                        gate_style="qwen25",
                         routing_model="gpt-4o-mini",
                         cortex_dir=cortex_dir,
                         state_dir=state_dir,

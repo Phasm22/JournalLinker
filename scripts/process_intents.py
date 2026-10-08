@@ -22,9 +22,14 @@ Exit codes (stable contract for shell wrappers):
 
 Env vars (from .env or environment):
     SCRIBE_JOURNAL_DIR           journal directory (required)
-    INTENT_GATE_MODEL            Ollama gate model (default: phi4:14b)
+    INTENT_GATE_MODEL            Ollama gate model (default: qwen2.5:14b)
     INTENT_GATE_STYLE            auto|phi4|qwen25 (default: auto)
     INTENT_ROUTING_MODEL         OpenAI model ID (default: gpt-4o-mini)
+    INTENT_NUTRITION_MODEL       Ollama model for voice nutrition extract
+                                 (default: INTENT_GATE_MODEL)
+    INTENT_NUTRITION_LOOKUP_MODEL
+                                 OpenAI model for branded nutrition lookup
+                                 (default: gpt-4o-mini)
     INTENT_CORTEX_DIR            Obsidian cortex write target (default: <journal_dir>/cortex)
     INTENT_STATE_DIR             local state directory
                                  (default: ~/.local/state/journal-linker/intents)
@@ -114,6 +119,7 @@ class RunSummary:
     commands_executed: int = 0
     commands_failed: int = 0
     commands_needs_confirmation: int = 0
+    nutrition_logged: int = 0
 
     def to_payload(self) -> dict:
         return {k: v for k, v in asdict(self).items()}
@@ -128,7 +134,7 @@ def _finalize_run(exit_code: int, summary: RunSummary) -> int:
     return exit_code
 
 
-DEFAULT_GATE_MODEL = "phi4:14b"
+DEFAULT_GATE_MODEL = "qwen2.5:14b"
 DEFAULT_GATE_STYLE = "auto"
 DEFAULT_ROUTING_MODEL = "gpt-4o-mini"
 DEFAULT_IN_FLIGHT_TTL = 300  # seconds
@@ -154,6 +160,9 @@ ACTION_QUEUE_FILENAME = "intent_action_queue.jsonl"
 COMMAND_LEDGER_FILENAME = "intent_command_ledger.jsonl"
 VOICE_ANOMALY_LOG_FILENAME = "voice_anomalies.jsonl"
 CONSENT_FILENAME = "intent_consent.json"
+GENERATED_RUN_LOG_RE = re.compile(
+    r"^(?:intent|intent-retry|voice-retry|daily-reflection)-\d{8}-\d{6}-\d+\.log$"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1763,6 +1772,78 @@ def _execute_watchlist_add(
     }
 
 
+def _tuff_words_note_path(cortex_dir: Path) -> Path:
+    return cortex_dir / "Tuff words.md"
+
+
+def append_word_of_the_day(cortex_dir: Path, word: str, source_date: str) -> Path:
+    """Append '<word> — <date>' as a bullet to the Tuff words Obsidian note,
+    creating it (with a header) if it doesn't exist yet.
+
+    Unlike add_to_watchlist(), this never dedupes by content — the same word
+    said on two different days is two legitimate entries. Idempotency for a
+    *single* utterance is handled upstream by the command ledger (same
+    command_idempotency_key -> skipped before this is ever called).
+    """
+    path = _tuff_words_note_path(cortex_dir)
+    cortex_dir.mkdir(parents=True, exist_ok=True)
+    lines: list[str] = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    if not lines:
+        lines = ["# Tuff words", ""]
+    lines.append(f"- {word} — {source_date}")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _log("command", f"wrote {path}")
+    return path
+
+
+def _execute_word_of_the_day(
+    cmd: dict, cortex_dir: Path, source_path: Path, source_date: str, idem: str, *, verbose: bool,
+) -> dict:
+    """Execute the word_of_the_day route: append the spoken word (+ date) to
+    the Tuff words Obsidian note. Write errors are caught and recorded in the
+    ledger/notification, never raised — same best-effort contract as every
+    other command route.
+    """
+    word = cmd.get("word", "").strip()
+    status = "failed"
+    error = ""
+    note_written = ""
+    try:
+        note_path = append_word_of_the_day(cortex_dir, word, source_date)
+        note_written = str(note_path)
+        status = "success"
+    except Exception as exc:
+        error = str(exc)
+        if verbose:
+            traceback.print_exc(file=sys.stderr)
+        _log("command", f"word_of_the_day write error: {exc}")
+
+    if status == "success":
+        _push_command_notification(
+            "Word of the day", f'Added "{word}" to Tuff words.', urgency="today",
+        )
+    else:
+        _push_command_notification(
+            f"Word of the day failed: {word}",
+            f"Could not add {word!r} to Tuff words: {error}",
+            urgency="today",
+        )
+
+    return {
+        "command_idempotency_key": idem,
+        "source_path": str(source_path),
+        "source_date": source_date,
+        "cmd_key": cmd.get("key", ""),
+        "route": "word_of_the_day",
+        "word": word,
+        "status": status,
+        "stage": "" if status == "success" else "write",
+        "error": error,
+        "cortex_note": note_written,
+        "executed_at": _now_iso(),
+    }
+
+
 def _push_command_notification(title: str, body: str, urgency: str = "today") -> None:
     """Best-effort phone ping for command results. Never raises.
 
@@ -1903,6 +1984,11 @@ def run_command_stage(
         return EXIT_SUCCESS, note_text
 
     commands, anomalies = jc.find_commands_with_diagnostics(note_text)
+    # word_of_the_day has no wake word and no verb grammar (fixed-phrase
+    # anchor instead), so it's recognized separately and merged in here —
+    # strip_command_spans() below works uniformly off start/end regardless
+    # of which recognizer produced a command.
+    commands = commands + jc.find_word_of_day_commands(note_text)
     if anomalies:
         _log("command", f"found {len(anomalies)} voice anomaly(ies)")
         report_voice_anomalies(state_dir, anomalies)
@@ -1921,9 +2007,12 @@ def run_command_stage(
         company = cmd.get("company", "")
         route = cmd.get("route", "hot_seat_fetch")
         form = cmd.get("form", "10-K")
+        word = cmd.get("word", "")
         parse_conf = float(cmd.get("confidence", 1.0))
 
-        _log("command", f"route={route} form={form} company={company!r} confidence={parse_conf}")
+        _log("command",
+             f"route={route} form={form} company={company!r} word={word!r} "
+             f"confidence={parse_conf}")
 
         prior = ledger.get(idem)
         if prior and prior.get("status") == "success":
@@ -1949,6 +2038,19 @@ def run_command_stage(
         if route == "watchlist_add":
             record = _execute_watchlist_add(
                 cmd, cortex_dir, hsf, source_path, source_date, idem, verbose=verbose,
+            )
+            if record["status"] == "success":
+                summary.commands_executed += 1
+            else:
+                summary.commands_failed += 1
+                worst_exit = max(worst_exit, EXIT_DELIVERY_TRANSIENT)
+            append_command_ledger(state_dir, record)
+            ledger[idem] = record
+            continue
+
+        if route == "word_of_the_day":
+            record = _execute_word_of_the_day(
+                cmd, cortex_dir, source_path, source_date, idem, verbose=verbose,
             )
             if record["status"] == "success":
                 summary.commands_executed += 1
@@ -2461,6 +2563,35 @@ def _intent_exit_code(delivery_result: dict, dry_run: bool) -> tuple[str, int]:
     return "succeeded", EXIT_SUCCESS
 
 
+def _run_nutrition_stage(
+    note_text: str,
+    source_path: Path,
+    source_date: str,
+    state_dir: Path,
+    *,
+    dry_run: bool,
+    model: str,
+) -> int:
+    """Log voice intake. Never changes the intent pipeline exit code."""
+    try:
+        scripts_dir = Path(__file__).resolve().parent
+        if str(scripts_dir) not in sys.path:
+            sys.path.insert(0, str(scripts_dir))
+        import nutrition_ledger
+        return int(nutrition_ledger.run_nutrition_stage(
+            note_text,
+            source_path,
+            source_date,
+            state_dir,
+            dry_run=dry_run,
+            journal_dir=source_path.parent,
+            model=model,
+        ))
+    except Exception as exc:
+        _log("nutrition", f"stage failed: {exc}")
+        return 0
+
+
 def run_intent_pipeline(
     source_path: Path,
     *,
@@ -2512,6 +2643,11 @@ def run_intent_pipeline(
 
     journal_timestamp = infer_journal_timestamp(source_path)
     source_date = journal_timestamp[:10]  # YYYY-MM-DD
+
+    summary.nutrition_logged = _run_nutrition_stage(
+        note_text, source_path, source_date, state_dir,
+        dry_run=dry_run, model=gate_model,
+    )
 
     # ── Command stage (wake-word directives) ───────────────────────────────
     # Runs before the gate; executes recognized routes (e.g. hot_seat 10-K
@@ -2926,21 +3062,105 @@ def cmd_prune_ledger(state_dir: Path, older_than_days: int) -> int:
         _log("ledger", f"pruned {removed} entries older than {older_than_days}d")
     else:
         _log("ledger", f"nothing to prune (all entries within {older_than_days}d)")
+    command_removed = _prune_jsonl_records(state_dir / COMMAND_LEDGER_FILENAME, cutoff)
+    history_removed = _prune_jsonl_records(state_dir / RUN_HISTORY_FILENAME, cutoff)
+    if command_removed:
+        _log("ledger", f"pruned {command_removed} command ledger entries older than {older_than_days}d")
+    if history_removed:
+        _log("ledger", f"pruned {history_removed} run history entries older than {older_than_days}d")
     return EXIT_SUCCESS
 
 
 def _entry_older_than(entry: dict, cutoff: datetime) -> bool:
-    for field in ("claude_in_flight_since",):
+    seen_timestamp = False
+    for field in (
+        "created_at",
+        "updated_at",
+        "executed_at",
+        "enqueued_at",
+        "attempted_at",
+        "journal_timestamp",
+        "claude_in_flight_since",
+    ):
         raw = entry.get(field, "")
         if raw:
             try:
                 dt = datetime.fromisoformat(raw)
                 if dt.tzinfo is None:
                     dt = dt.replace(tzinfo=timezone.utc)
-                return dt < cutoff
+                seen_timestamp = True
+                if dt >= cutoff:
+                    return False
             except Exception:
                 pass
-    return False
+    return seen_timestamp
+
+
+def _prune_jsonl_records(path: Path, cutoff: datetime) -> int:
+    if not path.exists():
+        return 0
+    kept: list[str] = []
+    removed = 0
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            record = json.loads(stripped)
+        except json.JSONDecodeError:
+            kept.append(line)
+            continue
+        if isinstance(record, dict) and _entry_older_than(record, cutoff):
+            removed += 1
+            continue
+        kept.append(json.dumps(record, ensure_ascii=False) if isinstance(record, dict) else line)
+    if removed:
+        tmp_fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+        try:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as fh:
+                for line in kept:
+                    fh.write(line + "\n")
+            os.replace(tmp_path, path)
+        finally:
+            try:
+                Path(tmp_path).unlink()
+            except FileNotFoundError:
+                pass
+    return removed
+
+
+def _generated_log_root(state_dir: Path) -> Path:
+    return state_dir.parent if state_dir.name == "intents" else state_dir
+
+
+def cmd_prune_generated_logs(state_dir: Path, older_than_days: int, *, dry_run: bool = False) -> int:
+    """Delete only known timestamped wrapper logs; never touch latest logs or journal content."""
+    log_root = _generated_log_root(state_dir)
+    if not log_root.exists():
+        _log("cleanup", f"log root not found: {log_root}")
+        return EXIT_SUCCESS
+    cutoff_ts = (datetime.now(timezone.utc) - timedelta(days=older_than_days)).timestamp()
+    removed = 0
+    for path in sorted(log_root.iterdir()):
+        if not path.is_file() or not GENERATED_RUN_LOG_RE.fullmatch(path.name):
+            continue
+        try:
+            if path.stat().st_mtime >= cutoff_ts:
+                continue
+        except OSError:
+            continue
+        removed += 1
+        if dry_run:
+            _log("cleanup", f"would delete {path.name}")
+            continue
+        try:
+            path.unlink()
+            _log("cleanup", f"deleted {path.name}")
+        except FileNotFoundError:
+            pass
+    action = "would delete" if dry_run else "deleted"
+    _log("cleanup", f"{action} {removed} generated log(s) older than {older_than_days}d")
+    return EXIT_SUCCESS
 
 
 def _parse_older_than(value: str) -> int:
@@ -2987,7 +3207,12 @@ def parse_cli() -> argparse.Namespace:
     parser.add_argument(
         "--prune-ledger",
         action="store_true",
-        help="Remove ledger entries older than --older-than.",
+        help="Remove generated ledger/run-history entries older than --older-than.",
+    )
+    parser.add_argument(
+        "--prune-generated-logs",
+        action="store_true",
+        help="Remove timestamped generated run logs older than --older-than; preserves *-latest.log.",
     )
     parser.add_argument(
         "--older-than",
@@ -3045,6 +3270,14 @@ def main() -> int:
             print(f"[intent] {exc}", file=sys.stderr)
             return EXIT_PERMANENT
         return cmd_prune_ledger(state_dir, days)
+
+    if args.prune_generated_logs:
+        try:
+            days = _parse_older_than(args.older_than)
+        except ValueError as exc:
+            print(f"[intent] {exc}", file=sys.stderr)
+            return EXIT_PERMANENT
+        return cmd_prune_generated_logs(state_dir, days, dry_run=args.dry_run)
 
     # Resolve parameters
     gate_model = args.gate_model

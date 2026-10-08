@@ -59,6 +59,34 @@ FAILED_SUFFIX = ".failed"
 # Permanent = do not auto-retry (empty transcript, corrupt audio, bad file).
 FAIL_TRANSIENT = "transient"
 FAIL_PERMANENT = "permanent"
+
+# Structural-completeness probe (see probe_decodable). We decode with the same
+# backend transcription uses. A decoded stream materially shorter than the
+# container's declared duration means a truncated tail (the faststart case: the
+# front-loaded moov advertises the full length but the mdat is short and decode
+# stops early without erroring). Allow a small slack for codec priming / rounding.
+PROBE_SAMPLE_RATE = 16000
+DECODE_DURATION_TOLERANCE = 0.97       # decoded must reach >=97% of declared …
+DECODE_DURATION_ABS_SLACK = 0.5        # … or be within 0.5s, whichever is looser
+PROBE_TIMEOUT_SEC = 120                # a decode that hangs longer is treated as transient
+
+# The decode probe runs in a child process (`--_probe-decode`): a malformed
+# container can make libav *segfault*, and an uncatchable SIGSEGV in-process
+# would take down the whole batch (and, with no marker written, crash it again
+# every run). Isolating the decode lets the parent survive and disposition the
+# child by its exit code — a signal death (negative returncode) is caught, not
+# fatal. Worker exit codes:
+PROBE_EXIT_OK = 0            # decoded; stdout carries [decoded_sec, declared_sec]
+PROBE_EXIT_CONTENT = 3      # caught content defect (corrupt/EOF/no audio stream)
+PROBE_EXIT_ENV = 4         # caught environmental error (I/O, missing codec, …)
+PROBE_WORKER_FLAG = "--_probe-decode"
+
+# A transient failure retries on the voice-retry timer. Genuinely time-based
+# reasons (Ollama down, machine asleep) resolve within a few cycles; a reason
+# that never resolves would otherwise retry forever. Cap the attempts, then
+# escalate to permanent and notify once, so a stuck file leaves the queue
+# instead of silently looping. Override via SCRIBE_VOICE_MAX_TRANSIENT_ATTEMPTS.
+DEFAULT_MAX_TRANSIENT_ATTEMPTS = 10
 VOICEDROP_DEFAULT = (
     Path.home() / "Library" / "Mobile Documents" / "com~apple~CloudDocs" / "VoiceDrop"
 )
@@ -239,22 +267,26 @@ def extract_whisper_prompt(
 # Date resolution from filename
 # ---------------------------------------------------------------------------
 
-FILENAME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})-(\d{2})(\d{2})$")
+# YYYY-MM-DD-HHmm (Dropbox-era Shortcut) or YYYY-MM-DD_HH-MM-SS (Tailscale upload Shortcut).
+FILENAME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})(?:-(\d{2})(\d{2})|_(\d{2})-(\d{2})-\d{2})$")
 
 
 def resolve_target_date(audio_path: Path, night_cutoff_hour: int = DEFAULT_NIGHT_CUTOFF) -> tuple[str, str]:
     """Return (date_str YYYY-MM-DD, time_str HH:MM) for the recording.
 
-    Filename convention: YYYY-MM-DD-HHmm.m4a  (produced by the iOS Shortcut).
+    Filename convention: YYYY-MM-DD-HHmm.m4a or YYYY-MM-DD_HH-MM-SS.m4a
+    (produced by the iOS Shortcut).
     If the recording hour is before night_cutoff_hour, it is attributed to the
     previous calendar day (e.g. a 01:30 AM recording belongs to "yesterday").
-    Falls back to mtime if the filename doesn't match the convention.
+    Falls back to mtime if the filename doesn't match the convention — which
+    for uploaded files is the *upload* time, so the ingest endpoint rejects
+    names that don't match.
     """
     m = FILENAME_RE.fullmatch(audio_path.stem)
     if m:
         date_str = m.group(1)
-        hour = int(m.group(2))
-        minute = int(m.group(3))
+        hour = int(m.group(2) or m.group(4))
+        minute = int(m.group(3) or m.group(5))
         time_str = f"{hour:02d}:{minute:02d}"
         if hour < night_cutoff_hour:
             dt = datetime.strptime(date_str, "%Y-%m-%d") - timedelta(days=1)
@@ -396,14 +428,87 @@ def mark_processed(audio_path: Path) -> None:
     audio_path.with_suffix(audio_path.suffix + PROCESSED_SUFFIX).touch()
 
 
-def mark_failed(audio_path: Path, reason: str = "", kind: str = FAIL_PERMANENT) -> None:
-    """Write a structured .failed marker.
+def _max_transient_attempts() -> int:
+    """Attempt cap before a transient failure escalates to permanent."""
+    raw = os.getenv("SCRIBE_VOICE_MAX_TRANSIENT_ATTEMPTS", "").strip()
+    if not raw:
+        return DEFAULT_MAX_TRANSIENT_ATTEMPTS
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return DEFAULT_MAX_TRANSIENT_ATTEMPTS
 
-    kind is FAIL_TRANSIENT or FAIL_PERMANENT.  Transient failures are eligible
-    for automatic timed retry; permanent ones are not.
-    """
+
+def _read_marker_attempts(audio_path: Path) -> int:
+    """Prior transient-attempt count from an existing .failed marker (0 if none
+    or legacy/unparsable)."""
     marker = audio_path.with_suffix(audio_path.suffix + FAILED_SUFFIX)
-    marker.write_text(f"kind: {kind}\nreason: {reason or 'unknown error'}\n", encoding="utf-8")
+    if not marker.exists():
+        return 0
+    try:
+        for line in marker.read_text(encoding="utf-8").splitlines():
+            if line.strip().startswith("attempts:"):
+                return int(line.split(":", 1)[1].strip())
+    except Exception:
+        return 0
+    return 0
+
+
+def _notify(title: str, body: str) -> None:
+    """Best-effort desktop/push notification via the pnotify CLI (TJ's Pushover
+    wrapper). Mirrors process_intents' pnotify tier without importing that
+    heavy module. Never raises into the pipeline; logs and moves on."""
+    import shutil
+
+    pnotify = shutil.which("pnotify")
+    if not pnotify:
+        candidate = Path.home() / "bin" / "pnotify"
+        pnotify = str(candidate) if os.access(candidate, os.X_OK) else ""
+    if not pnotify:
+        print(f"[voice] (no pnotify) {title}: {body}", file=sys.stderr)
+        return
+    try:
+        subprocess.run([pnotify, title, body], capture_output=True, timeout=15)
+    except Exception as exc:  # noqa: BLE001 — notification is best-effort
+        print(f"[voice] pnotify error (ignored): {exc}", file=sys.stderr)
+
+
+def _write_marker(audio_path: Path, kind: str, reason: str, attempts: int) -> None:
+    marker = audio_path.with_suffix(audio_path.suffix + FAILED_SUFFIX)
+    marker.write_text(
+        f"kind: {kind}\nreason: {reason or 'unknown error'}\nattempts: {attempts}\n",
+        encoding="utf-8",
+    )
+
+
+def mark_failed(audio_path: Path, reason: str = "", kind: str = FAIL_PERMANENT) -> None:
+    """Write a structured .failed marker, with bounded transient retries.
+
+    kind is FAIL_TRANSIENT or FAIL_PERMANENT. Permanent failures (a content
+    verdict — corrupt/truncated audio, empty transcript) are written straight
+    through: not retried, not counted. Transient failures are eligible for the
+    timed retry loop, but the attempt count is tracked in the marker; once it
+    reaches the cap the failure escalates to permanent and fires a one-time
+    notification, so a reason that never resolves leaves the queue instead of
+    looping forever (and silently).
+    """
+    if kind != FAIL_TRANSIENT:
+        _write_marker(audio_path, FAIL_PERMANENT, reason, _read_marker_attempts(audio_path))
+        return
+
+    attempts = _read_marker_attempts(audio_path) + 1
+    cap = _max_transient_attempts()
+    if attempts >= cap:
+        escalated = f"escalated to permanent after {attempts} transient attempts: {reason}"
+        _write_marker(audio_path, FAIL_PERMANENT, escalated, attempts)
+        print(f"[voice] {audio_path.name}: {escalated}", file=sys.stderr)
+        _notify(
+            "Voice recording gave up",
+            f"{audio_path.name} failed {attempts} transient retries and was "
+            f"marked permanent. Last reason: {reason or 'unknown error'}",
+        )
+        return
+    _write_marker(audio_path, FAIL_TRANSIENT, reason, attempts)
 
 
 def is_transient_failed(audio_path: Path) -> bool:
@@ -457,6 +562,111 @@ def is_fully_synced(audio_path: Path) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Structural completeness probe
+# ---------------------------------------------------------------------------
+
+def _probe_decode(audio_path: Path) -> tuple[float | None, float]:
+    """Decode `audio_path`'s audio stream to EOF via PyAV.
+
+    Returns (decoded_seconds, declared_seconds), or (None, declared) when the
+    container opens but carries no audio stream (a definitive content defect,
+    not an exception). Decodes with libav directly rather than through
+    faster_whisper.decode_audio: it's the same underlying decoder transcription
+    uses, but surfaces libav's *typed* errors (InvalidDataError / EOFError) on a
+    bad container instead of the bare IndexError decode_audio raises on short
+    input — which we need to disposition correctly. Isolated from
+    probe_decodable() so tests can stub it without real audio fixtures.
+    """
+    import av
+
+    with av.open(str(audio_path)) as container:
+        declared = (container.duration / av.time_base) if container.duration else 0.0
+        if not container.streams.audio:
+            return None, declared
+        # Sum seconds from each decoded frame's own sample_rate rather than the
+        # stream's — a truncated stream can be missing codec params (stream.rate
+        # raises), but every decoded frame reliably carries samples + sample_rate.
+        decoded_seconds = 0.0
+        for frame in container.decode(audio=0):
+            rate = frame.sample_rate or PROBE_SAMPLE_RATE
+            decoded_seconds += frame.samples / rate
+    return decoded_seconds, declared
+
+
+def _probe_worker(audio_path: str) -> int:
+    """Child-process entry: decode the file and report via exit code + stdout.
+
+    Only the two unambiguous content errors (invalid container, premature EOF)
+    and a missing audio stream are content defects; everything else is
+    environmental. A libav *segfault* here kills this child with a signal — the
+    parent sees the negative returncode and survives.
+    """
+    try:
+        import av
+        try:
+            decoded, declared = _probe_decode(Path(audio_path))
+        except (av.error.InvalidDataError, av.error.EOFError):
+            return PROBE_EXIT_CONTENT
+    except Exception:  # noqa: BLE001 — import/decode env error, default-deny
+        return PROBE_EXIT_ENV
+    if decoded is None:  # container opened, no audio stream — content defect
+        return PROBE_EXIT_CONTENT
+    sys.stdout.write(json.dumps([decoded, declared]))
+    return PROBE_EXIT_OK
+
+
+def _reconcile_duration(decoded: float, declared: float) -> tuple[bool, str, str]:
+    """Flag a decoded stream that falls materially short of the declared
+    duration (the faststart short-decode that doesn't raise)."""
+    if declared > 0:
+        allowed_shortfall = max(DECODE_DURATION_ABS_SLACK,
+                                declared * (1.0 - DECODE_DURATION_TOLERANCE))
+        if (declared - decoded) > allowed_shortfall:
+            return (False, FAIL_PERMANENT,
+                    f"truncated: decoded {decoded:.1f}s < declared {declared:.1f}s")
+    return True, "", ""
+
+
+def probe_decodable(audio_path: Path) -> tuple[bool, str, str]:
+    """Verify a recording is a structurally complete, decodable container.
+
+    Returns (ok, kind, reason). The decode runs in an isolated child process so a
+    libav crash on a malformed file can't take down the batch. Disposition:
+    FAIL_PERMANENT for a deterministic content defect (corrupt, no audio stream,
+    or decoded materially shorter than declared); FAIL_TRANSIENT for an
+    environmental error, a timeout, or a signal death (crash/OOM) — default-deny
+    toward a bounded retry, never a silent pass. Runs before transcription so a
+    partial/corrupt file is caught instead of yielding a plausible-but-truncated
+    transcript that gets marked processed.
+    """
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()), PROBE_WORKER_FLAG, str(audio_path)],
+            capture_output=True, text=True, timeout=PROBE_TIMEOUT_SEC,
+        )
+    except subprocess.TimeoutExpired:
+        return False, FAIL_TRANSIENT, f"decode timed out after {PROBE_TIMEOUT_SEC}s"
+
+    rc = proc.returncode
+    if rc == PROBE_EXIT_CONTENT:
+        return False, FAIL_PERMANENT, "corrupt / truncated / no audio stream"
+    if rc == PROBE_EXIT_ENV:
+        return False, FAIL_TRANSIENT, "environmental decode error"
+    if rc < 0:
+        # Killed by a signal (e.g. SIGSEGV from libav on hostile bytes, or OOM):
+        # cause is ambiguous, so default-deny to a bounded transient retry. The
+        # win is that the parent survived and the file got dispositioned.
+        return False, FAIL_TRANSIENT, f"decode crashed (signal {-rc})"
+    if rc != PROBE_EXIT_OK:
+        return False, FAIL_TRANSIENT, f"probe exited {rc}"
+    try:
+        decoded, declared = json.loads(proc.stdout)
+    except Exception:  # noqa: BLE001 — malformed worker output, default-deny
+        return False, FAIL_TRANSIENT, "probe produced no result"
+    return _reconcile_duration(decoded, declared)
+
+
+# ---------------------------------------------------------------------------
 # Single-file pipeline
 # ---------------------------------------------------------------------------
 
@@ -478,12 +688,27 @@ def process_file(
     date_str, time_str = resolve_target_date(audio_path, night_cutoff)
     print(f"[voice] target date={date_str} time={time_str}", file=sys.stderr)
 
+    # Structural completeness gate: reject a corrupt or truncated file up front
+    # rather than letting it become a plausible-but-short transcript that gets
+    # marked processed. Content-deterministic failures go straight to permanent;
+    # environmental ones stay transient (see probe_decodable / mark_failed).
+    ok, fail_kind, fail_reason = probe_decodable(audio_path)
+    if not ok:
+        print(f"[voice] incomplete/undecodable {audio_path.name}: {fail_reason} "
+              f"({fail_kind})", file=sys.stderr)
+        if not dry_run:
+            mark_failed(audio_path, fail_reason, kind=fail_kind)
+        return False
+
     if verbose and whisper_prompt:
         print(f"[voice] whisper prompt ({len(whisper_prompt)} chars): {whisper_prompt[:120]}…", file=sys.stderr)
 
     try:
         transcript, duration, language = transcribe_audio(audio_path, model, whisper_prompt)
     except Exception as exc:
+        # Reached only after probe_decodable() vetted the container, so a failure
+        # here is genuinely model/infra (model load, resampler I/O) — not the
+        # file — and is correctly transient.
         print(f"[voice] transcription failed for {audio_path.name}: {exc}", file=sys.stderr)
         if not dry_run:
             # Treat as transient — model load or I/O error may resolve on retry.
@@ -574,6 +799,12 @@ def _write_voice_payload(**fields) -> None:
 
 
 def main() -> int:
+    # Isolated decode-probe child (see probe_decodable). Handled before the
+    # heavy env bootstrap / arg parsing so it stays a cheap, self-contained run.
+    argv = sys.argv[1:]
+    if len(argv) == 2 and argv[0] == PROBE_WORKER_FLAG:
+        return _probe_worker(argv[1])
+
     args = parse_cli()
 
     if not args.journal_dir:
