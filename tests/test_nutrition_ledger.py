@@ -808,7 +808,7 @@ LIVE_VLOG_WIKILINKED = (
     "Add a [[Snickers]] bar, too. And some [[chicken biryani]]."
 )
 
-# Realistic multi-capture model output for the live vlog utterance.
+# Ideal model output (correct classification).
 LIVE_VLOG_CAPTURES = {
     "captures": [
         {
@@ -902,6 +902,70 @@ LIVE_VLOG_CAPTURES = {
                 "unit": "bottle",
                 "serving_basis": "stated",
             }],
+        },
+    ],
+}
+
+# What the live model actually returned after PR #5 (mistakes post-processing must fix).
+LIVE_VLOG_MISTAKEN_MODEL = {
+    "captures": [
+        {
+            "capture_type": "meal",
+            "meal_slot": "breakfast",
+            "is_intake": True,
+            "water_oz": None,
+            "items": [
+                {"label": "cinnamon roll", "kind": "food", "identity": "generic",
+                 "quantity": 1, "unit": "serving", "serving_basis": "default_serving"},
+                {"label": "cold brew", "kind": "drink", "identity": "generic",
+                 "quantity": 1, "unit": "serving", "serving_basis": "default_serving"},
+            ],
+        },
+        {
+            "capture_type": "meal",
+            "meal_slot": "lunch",
+            "is_intake": True,
+            "water_oz": None,
+            "items": [
+                {"label": "bison burger", "kind": "food", "identity": "generic",
+                 "quantity": 1, "unit": "serving", "serving_basis": "default_serving"},
+                {"label": "truffle fries", "kind": "food", "identity": "generic",
+                 "quantity": 1, "unit": "serving", "serving_basis": "default_serving"},
+            ],
+        },
+        {
+            "capture_type": "craving",
+            "meal_slot": "snack",
+            "is_intake": False,
+            "water_oz": None,
+            "items": [
+                {"label": "Snickers bar", "kind": "food", "identity": "branded",
+                 "quantity": 1, "unit": "bar", "serving_basis": "default_serving",
+                 "needs_lookup": True},
+            ],
+        },
+        {
+            "capture_type": "craving",
+            "meal_slot": "unknown",
+            "is_intake": False,
+            "water_oz": None,
+            "items": [
+                {"label": "chicken biryani", "kind": "food", "identity": "generic",
+                 "quantity": 1, "unit": "serving", "serving_basis": "approximate"},
+            ],
+        },
+        {
+            "capture_type": "water",
+            "meal_slot": "drink",
+            "is_intake": True,
+            # Live bug: model summed bottle + liter ≈ 67.628 fl oz
+            "water_oz": 67.628,
+            "items": [
+                {"label": "water", "kind": "drink", "identity": "generic",
+                 "quantity": 1, "unit": "bottle", "serving_basis": "stated"},
+                {"label": "water", "kind": "drink", "identity": "generic",
+                 "quantity": 1, "unit": "l", "serving_basis": "stated"},
+            ],
         },
     ],
 }
@@ -1095,3 +1159,82 @@ class TestLiveVlogRegression(unittest.TestCase):
         self.assertEqual(empty, "meal")
         water = nl._wellness_filename_slug("water", "drink", [], 33.814)
         self.assertIn("oz", water)
+
+    def test_mistaken_live_model_is_corrected_by_postprocess(self):
+        """Exercise the real path: mistaken model JSON + validate_captures guards."""
+        with mock.patch.dict(os.environ, {"INTENT_WATER_BOTTLE_ML": "1000"}):
+            captures = nl.validate_captures(LIVE_VLOG_MISTAKEN_MODEL, LIVE_VLOG)
+
+        types_slots = [(c["capture_type"], c.get("meal_slot"), nl.item_labels(c["items"]))
+                       for c in captures]
+        # Cravings must be rewritten to meal intake.
+        self.assertFalse(any(c["capture_type"] == "craving" for c in captures))
+        meal_caps = [c for c in captures if c["capture_type"] == "meal"]
+        self.assertGreaterEqual(len(meal_caps), 3)
+        labels = {label for c in meal_caps for label in nl.item_labels(c["items"])}
+        self.assertIn("Snickers bar", labels)
+        self.assertIn("chicken biryani", labels)
+        for cap in meal_caps:
+            if "Snickers bar" in nl.item_labels(cap["items"]):
+                self.assertTrue(cap["is_intake"])
+                self.assertIn(cap.get("meal_slot"), {"snack", "unknown"})
+            if "chicken biryani" in nl.item_labels(cap["items"]):
+                self.assertTrue(cap["is_intake"])
+
+        water_caps = [c for c in captures if c["capture_type"] == "water"]
+        self.assertEqual(len(water_caps), 1)
+        self.assertAlmostEqual(float(water_caps[0]["water_oz"]), 1000 / nl.ML_PER_FL_OZ, places=1)
+        # Must not keep the model's doubled sum.
+        self.assertLess(float(water_caps[0]["water_oz"]), 40.0)
+        self.assertEqual(len(water_caps[0]["items"]), 1)
+        self.assertEqual(water_caps[0]["items"][0]["unit"], "bottle")
+
+    def test_mistaken_live_model_end_to_end_writes_corrected_notes(self):
+        text = self._note_text(LIVE_VLOG)
+        with mock.patch.object(nl, "call_nutrition_model", return_value=LIVE_VLOG_MISTAKEN_MODEL), \
+                mock.patch.object(nl, "lookup_product", return_value={
+                    "status": "miss", "query": "", "matched_name": "",
+                    "serving_description": "", "source_urls": [], "per_serving": None,
+                }), \
+                mock.patch.dict(os.environ, {"INTENT_WATER_BOTTLE_ML": "1000"}):
+            result = nl.run_nutrition_stage(
+                text, self.note, "2026-10-10", self.state, journal_dir=self.journal,
+            )
+        # breakfast + lunch + snickers + biryani + water = 5 notes
+        self.assertEqual(result["wellness_notes"], 5)
+        bodies = [p.read_text(encoding="utf-8") for p in self.wellness.glob("*.md")]
+        self.assertFalse(any("type: craving" in b for b in bodies))
+        water_bodies = [b for b in bodies if "type: water" in b]
+        self.assertEqual(len(water_bodies), 1)
+        self.assertRegex(water_bodies[0], r"water_oz: 33\.8")
+        self.assertNotRegex(water_bodies[0], r"water_oz: 67")
+        joined = "\n".join(bodies)
+        self.assertIn("Snickers bar", joined)
+        self.assertIn("chicken biryani", joined)
+        self.assertIn("type: meal", joined)
+
+    def test_explicit_craving_language_is_kept(self):
+        text = "I'm craving a Snickers bar right now."
+        payload = {
+            "captures": [{
+                "capture_type": "craving",
+                "meal_slot": "snack",
+                "is_intake": False,
+                "items": [{
+                    "label": "Snickers bar", "kind": "food", "identity": "branded",
+                    "quantity": 1, "unit": "bar", "serving_basis": "default_serving",
+                }],
+            }],
+        }
+        captures = nl.validate_captures(payload, text)
+        self.assertEqual(len(captures), 1)
+        self.assertEqual(captures[0]["capture_type"], "craving")
+        self.assertFalse(captures[0]["is_intake"])
+
+    def test_separate_liter_drink_is_still_summed(self):
+        text = "I drank one water bottle. Later I drank a liter of water."
+        with mock.patch.dict(os.environ, {"INTENT_WATER_BOTTLE_ML": "1000"}):
+            oz, items = nl.extract_water_from_text(text)
+        self.assertIsNotNone(oz)
+        self.assertGreater(float(oz), 60.0)
+        self.assertEqual(len(items), 2)
