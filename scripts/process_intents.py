@@ -132,6 +132,7 @@ class RunSummary:
     commands_needs_confirmation: int = 0
     nutrition_logged: int = 0
     wellness_notes: int = 0
+    nutrition_failed: int = 0
 
     def to_payload(self) -> dict:
         return {k: v for k, v in asdict(self).items()}
@@ -2605,7 +2606,7 @@ def _run_nutrition_stage(
     wellness_dir: Path | None = None,
 ) -> dict:
     """Log voice intake + wellness captures. Never changes the intent exit code."""
-    empty = {"intake_logged": 0, "wellness_notes": 0}
+    empty = {"intake_logged": 0, "wellness_notes": 0, "nutrition_failed": 0}
     try:
         scripts_dir = Path(__file__).resolve().parent
         if str(scripts_dir) not in sys.path:
@@ -2626,12 +2627,13 @@ def _run_nutrition_stage(
             return {
                 "intake_logged": int(result.get("intake_logged") or 0),
                 "wellness_notes": int(result.get("wellness_notes") or 0),
+                "nutrition_failed": int(result.get("nutrition_failed") or 0),
             }
         # Older return shape (int) — treat as intake-only.
-        return {"intake_logged": int(result or 0), "wellness_notes": 0}
+        return {"intake_logged": int(result or 0), "wellness_notes": 0, "nutrition_failed": 0}
     except Exception as exc:
         _log("nutrition", f"stage failed: {exc}")
-        return empty
+        return {"intake_logged": 0, "wellness_notes": 0, "nutrition_failed": 1}
 
 
 def run_intent_pipeline(
@@ -2696,6 +2698,7 @@ def run_intent_pipeline(
     )
     summary.nutrition_logged = nutrition_counts["intake_logged"]
     summary.wellness_notes = nutrition_counts["wellness_notes"]
+    summary.nutrition_failed = nutrition_counts.get("nutrition_failed", 0)
 
     # ── Command stage (wake-word directives) ───────────────────────────────
     # Runs before the gate; executes recognized routes (e.g. hot_seat 10-K
