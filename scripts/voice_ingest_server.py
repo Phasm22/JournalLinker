@@ -15,6 +15,11 @@ Protocol (matches the Shortcut):
 
     GET /healthz → 200 "ok"
 
+Health: service.state events on stderr (journal_linker_telemetry), on
+transitions only — ready once listening, error on startup failure, degraded
+when a server-side write fails, recovered on the next stored upload, stopping
+on SIGTERM / Ctrl-C. Client rejects (4xx) are not health events.
+
 Durability: the upload is written to <drop>/.incoming/, fsynced, MD5-checked,
 run through process_voice's crash-isolated decode probe, then hard-linked into <drop>/ (atomic, never
 clobbers). The path unit only ever sees complete files.
@@ -37,6 +42,7 @@ import argparse
 import hashlib
 import os
 import re
+import signal
 import sys
 import tempfile
 from email.parser import BytesParser
@@ -52,7 +58,10 @@ if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
 from journal_linker_env import bootstrap_journal_linker_env
+from journal_linker_telemetry import HealthState
 import process_voice as pv
+
+SERVICE_NAME = "voice-ingest"
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8797
@@ -191,7 +200,9 @@ def store_upload(drop_dir: Path, filename: str, data: bytes, expected_md5: str) 
 # HTTP
 # ---------------------------------------------------------------------------
 
-def make_handler(drop_dir: Path, max_bytes: int):
+def make_handler(drop_dir: Path, max_bytes: int, health: HealthState | None = None):
+    health = health or HealthState(SERVICE_NAME)
+
     class Handler(BaseHTTPRequestHandler):
         server_version = "journal-linker-voice-ingest/1"
 
@@ -241,9 +252,12 @@ def make_handler(drop_dir: Path, max_bytes: int):
                 return
             except Exception as exc:
                 print(f"[ingest] error: {exc!r}", file=sys.stderr, flush=True)
+                health.set("degraded", f"write failed: {type(exc).__name__}")
                 self._reply(500, "internal error")
                 return
             print(f"[ingest] {outcome}: {filename} ({len(data)} bytes)", file=sys.stderr, flush=True)
+            if outcome == "stored":
+                health.ok("write succeeded")
             self._reply(200, "OK")
 
     return Handler
@@ -261,22 +275,38 @@ def parse_cli() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _interrupt_on_sigterm(signum, frame):
+    raise KeyboardInterrupt
+
+
 def main() -> int:
     args = parse_cli()
+    health = HealthState(SERVICE_NAME)
     if not args.drop_dir:
         print("[ingest] SCRIBE_VOICEDROP_DIR is not set (or pass --drop-dir)", file=sys.stderr)
+        health.set("error", "drop dir not configured")
         return 1
     drop_dir = Path(args.drop_dir).expanduser()
     if not drop_dir.is_dir():
         print(f"[ingest] VoiceDrop dir not found: {drop_dir}", file=sys.stderr)
+        health.set("error", "drop dir missing")
         return 1
 
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(drop_dir, args.max_mb * 1024 * 1024))
+    try:
+        server = ThreadingHTTPServer(
+            (args.host, args.port), make_handler(drop_dir, args.max_mb * 1024 * 1024, health)
+        )
+    except OSError as exc:
+        print(f"[ingest] cannot bind {args.host}:{args.port}: {exc}", file=sys.stderr, flush=True)
+        health.set("error", "bind failed")
+        return 1
+    signal.signal(signal.SIGTERM, _interrupt_on_sigterm)
     print(f"[ingest] listening on http://{args.host}:{args.port} → {drop_dir}", file=sys.stderr, flush=True)
+    health.set("ready", "listening")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        pass
+        health.set("stopping", "shutdown")
     finally:
         server.server_close()
     return 0

@@ -2,7 +2,8 @@
 
 Emits one-line JSON events on stderr with prefix JOURNAL_LINKER_EVENT=
 for monitoring ingestion. Wrappers finalize job.completed after Python exits;
-long-running daemons emit health.probe periodically.
+long-running services emit service.state on health transitions only (see
+HealthState), never on a timer.
 """
 
 from __future__ import annotations
@@ -12,6 +13,8 @@ import contextlib
 import json
 import os
 import sys
+import threading
+import warnings
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -90,8 +93,71 @@ def finalize_job_event(
             Path(payload_file).unlink(missing_ok=True)
 
 
+SERVICE_STATUSES = frozenset({"ready", "degraded", "recovered", "stopping", "error"})
+
+
+def emit_service_state(service: str, status: str, reason: str, **metrics: Any) -> None:
+    """Emit a health transition. Call only when status or reason changes.
+
+    status is one of SERVICE_STATUSES; the monitor treats error as unhealthy and
+    degraded as a warning. reason should be short, stable wording per cause so
+    repeated causes compare equal. metrics, if given, ride along under "metrics".
+    """
+    if status not in SERVICE_STATUSES:
+        raise ValueError(f"unknown service status: {status!r}")
+    event: dict[str, Any] = {
+        "event": "service.state",
+        "service": service,
+        "status": status,
+        "reason": reason,
+        "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
+    }
+    if metrics:
+        event["metrics"] = metrics
+    _emit(event)
+
+
+class HealthState:
+    """Per-process health tracker that emits service.state only on change.
+
+    set() emits when (status, reason) differs from the last emitted pair.
+    ok() is the success path: ready on first success, recovered after a
+    degraded/error state, otherwise silent. Thread-safe.
+    """
+
+    def __init__(self, service: str) -> None:
+        self.service = service
+        self.status: str | None = None
+        self.reason: str | None = None
+        self._lock = threading.RLock()
+
+    def set(self, status: str, reason: str, **metrics: Any) -> bool:
+        with self._lock:
+            if (status, reason) == (self.status, self.reason):
+                return False
+            emit_service_state(self.service, status, reason, **metrics)
+            self.status, self.reason = status, reason
+            return True
+
+    def ok(self, reason: str, **metrics: Any) -> bool:
+        with self._lock:
+            if self.status is None:
+                return self.set("ready", reason, **metrics)
+            if self.status in ("degraded", "error"):
+                return self.set("recovered", reason, **metrics)
+            return False
+
+
 def emit_health_probe(service: str, **fields: Any) -> None:
-    """Emit a periodic health line for long-running services."""
+    """Deprecated: periodic heartbeat. Use HealthState / emit_service_state.
+
+    Kept for out-of-tree callers; nothing in this repo emits health.probe.
+    """
+    warnings.warn(
+        "emit_health_probe is deprecated; emit service.state transitions via HealthState",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     event: dict[str, Any] = {
         "event": "health.probe",
         "service": service,

@@ -3,6 +3,9 @@
 import hashlib
 import http.client
 import importlib.util
+import io
+import json
+import sys
 import tempfile
 import threading
 import unittest
@@ -116,7 +119,10 @@ class TestHttpEndpoint(unittest.TestCase):
     def setUp(self):
         self._td = tempfile.TemporaryDirectory()
         self.drop = Path(self._td.name)
-        self.server = vis.ThreadingHTTPServer(("127.0.0.1", 0), vis.make_handler(self.drop, 1 << 20))
+        self.health = vis.HealthState(vis.SERVICE_NAME)
+        self.server = vis.ThreadingHTTPServer(
+            ("127.0.0.1", 0), vis.make_handler(self.drop, 1 << 20, self.health)
+        )
         self.port = self.server.server_address[1]
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
@@ -163,12 +169,100 @@ class TestHttpEndpoint(unittest.TestCase):
         })
         self.assertEqual(status, 413)
 
+    def _upload(self, name: str) -> tuple[int, str]:
+        ctype, body = multipart(AUDIO)
+        return self.post(body, {"Content-Type": ctype, "X-Filename": name, "X-MD5": AUDIO_MD5})
+
+    def test_server_side_failure_degrades_then_recovers(self):
+        self.health.set("ready", "listening")
+        buf = io.StringIO()
+        disk_full = OSError(28, "No space left on device")
+        with mock.patch.object(sys, "stderr", buf):
+            with mock.patch.object(vis, "store_upload", side_effect=disk_full):
+                self.assertEqual(self._upload("2026-09-30_09-26-57.m4a")[0], 500)
+                self.assertEqual(self._upload("2026-09-30_09-26-58.m4a")[0], 500)
+            self.assertEqual(self._upload("2026-09-30_09-26-59.m4a"), (200, "OK"))
+            self.assertEqual(self._upload("2026-09-30_09-27-00.m4a"), (200, "OK"))
+        events = [
+            json.loads(line.split("=", 1)[1])
+            for line in buf.getvalue().splitlines()
+            if line.startswith("JOURNAL_LINKER_EVENT=")
+        ]
+        self.assertEqual(
+            [(e["status"], e["reason"]) for e in events],
+            [("degraded", "write failed: OSError"), ("recovered", "write succeeded")],
+        )
+
+    def test_client_rejects_are_not_health_events(self):
+        buf = io.StringIO()
+        with mock.patch.object(sys, "stderr", buf):
+            ctype, body = multipart(AUDIO)
+            status, _ = self.post(body, {"Content-Type": ctype, "X-Filename": "nope.m4a", "X-MD5": AUDIO_MD5})
+        self.assertEqual(status, 400)
+        self.assertNotIn("JOURNAL_LINKER_EVENT=", buf.getvalue())
+        self.assertIsNone(self.health.status)
+
     def test_healthz(self):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
         conn.request("GET", "/healthz")
         resp = conn.getresponse()
         self.assertEqual((resp.status, resp.read()), (200, b"ok"))
         conn.close()
+
+
+class TestStartupHealth(unittest.TestCase):
+    def _main_events(self, argv: list[str]) -> tuple[int, list[dict]]:
+        buf = io.StringIO()
+        with (
+            mock.patch.object(sys, "argv", ["voice_ingest_server.py", *argv]),
+            mock.patch.object(vis, "bootstrap_journal_linker_env"),
+            mock.patch.dict(vis.os.environ, {}, clear=False),
+            mock.patch.object(sys, "stderr", buf),
+        ):
+            vis.os.environ.pop("SCRIBE_VOICEDROP_DIR", None)
+            code = vis.main()
+        events = [
+            json.loads(line.split("=", 1)[1])
+            for line in buf.getvalue().splitlines()
+            if line.startswith("JOURNAL_LINKER_EVENT=")
+        ]
+        return code, events
+
+    def test_missing_drop_dir_config_is_error(self):
+        code, events = self._main_events([])
+        self.assertEqual(code, 1)
+        self.assertEqual([(e["status"], e["reason"]) for e in events], [("error", "drop dir not configured")])
+
+    def test_nonexistent_drop_dir_is_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, events = self._main_events(["--drop-dir", str(Path(tmp) / "missing")])
+        self.assertEqual(code, 1)
+        self.assertEqual([(e["status"], e["reason"]) for e in events], [("error", "drop dir missing")])
+
+    def test_ready_once_then_stopping(self):
+        class FakeServer:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def serve_forever(self):
+                raise KeyboardInterrupt
+
+            def server_close(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(vis, "ThreadingHTTPServer", FakeServer), \
+                mock.patch.object(vis.signal, "signal"):
+            code, events = self._main_events(["--drop-dir", tmp, "--port", "0"])
+        self.assertEqual(code, 0)
+        self.assertEqual([(e["status"], e["reason"]) for e in events], [("ready", "listening"), ("stopping", "shutdown")])
+
+    def test_bind_failure_is_error(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(vis, "ThreadingHTTPServer", side_effect=OSError(98, "Address in use")):
+            code, events = self._main_events(["--drop-dir", tmp])
+        self.assertEqual(code, 1)
+        self.assertEqual([(e["status"], e["reason"]) for e in events], [("error", "bind failed")])
 
 
 class TestProbeAudio(unittest.TestCase):
