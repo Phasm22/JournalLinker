@@ -349,7 +349,7 @@ This intake process determines whether a service is ready to be monitored. The g
 |---------------|--------|
 | Trigger? | **Continuous** — systemd `Type=simple` `Restart=always`; `feedback_sender.py --daemon` |
 | Observable success? | Process running; `getUpdates` loop active; callbacks written to ledger |
-| Structured output? | **Yes** — `health.probe` while daemon runs; `job.completed` on process exit |
+| Structured output? | **Yes** — `service.state` on health transitions; `job.completed` on process exit |
 | Max silence? | **5 min** process down (RestartSec=10 should recover sooner) |
 
 ### Stage 2 — Questionnaire
@@ -362,7 +362,7 @@ This intake process determines whether a service is ready to be monitored. The g
 **Execution**
 
 - **Frequency:** Continuous; restarts every 10 s on failure.
-- **Max duration:** N/A (long-lived); **stuck** if no `health.probe` line for **> 30 min** (default emit every 300 s via `INTENT_FEEDBACK_HEARTBEAT_SEC`).
+- **Max duration:** N/A (long-lived). Liveness comes from the systemd unit; "running but unable to poll" is reported once as a `service.state` `degraded` line. No heartbeat, so silence is not a failure signal.
 
 **Health**
 
@@ -422,10 +422,10 @@ JOURNAL_LINKER_EVENT={"event":"job.completed","service":"scribe",...}
 
 Grep pattern: `^JOURNAL_LINKER_EVENT=`
 
-Long-running **`feedback-sender`** also emits periodic probes while the daemon runs:
+Long-running services (**`feedback-sender`**, **`voice-ingest`**) emit a `service.state` line when their health changes, never on a timer:
 
 ```text
-JOURNAL_LINKER_EVENT={"event":"health.probe","service":"feedback-sender",...}
+JOURNAL_LINKER_EVENT={"event":"service.state","service":"voice-ingest","status":"ready","reason":"listening",...}
 ```
 
 Implementation: [`journal_linker_telemetry.py`](journal_linker_telemetry.py) (emit/finalize), [`scripts/job_log_lib.sh`](scripts/job_log_lib.sh) (wrapper finalize), per-entrypoint `write_job_payload` via `JOURNAL_LINKER_JOB_PAYLOAD_FILE`.
@@ -454,17 +454,24 @@ Human-readable header/footer (`start`, `end`, `duration_sec`, `exit_code` text l
 | `intent-watcher`, `intent-retry` | `intents_gated`, `intents_delivered`, `intents_suppressed`, `intents_failed`, `retry_queue_in`, `retry_queue_out`, `worst_exit_code` |
 | `feedback-sender` (one-shot) | `updates_received`, `feedback_queue_pending`, `poll_offset` |
 
-### `health.probe` (feedback-sender daemon)
+### `service.state` (long-running services)
+
+Emitted via `HealthState` in [`journal_linker_telemetry.py`](journal_linker_telemetry.py) only when `(status, reason)` changes.
 
 | Field | Meaning |
 |-------|---------|
+| `service` | `feedback-sender`, `voice-ingest` |
+| `status` | `ready`, `degraded`, `recovered`, `stopping`, `error` |
+| `reason` | Short, stable cause (e.g. `listening`, `poll failed: URLError`, `write failed: OSError`) |
 | `ts` | ISO timestamp |
-| `uptime_sec` | Monotonic uptime |
-| `poll_offset` | Telegram `getUpdates` offset |
-| `updates_last_cycle` | Updates handled since previous probe |
-| `feedback_queue_pending` | Queue rows in `pending` state |
+| `metrics` | Optional debugging numbers (feedback-sender: `poll_offset`, `feedback_queue_pending`) |
 
-Default interval: **300 s** (`INTENT_FEEDBACK_HEARTBEAT_SEC`).
+| Service | Transitions |
+|---------|-------------|
+| `voice-ingest` | `ready` once listening; `error` on startup failure (drop dir unset/missing, bind failed); `degraded` on a server-side write failure; `recovered` on the next stored upload; `stopping` on SIGTERM/Ctrl-C. Client 4xx rejects are not health events. |
+| `feedback-sender --daemon` | `ready` on the first good poll; `degraded` on poll/API failure; `recovered` on the next good poll; `stopping` on SIGTERM/Ctrl-C. |
+
+`health.probe` (periodic heartbeat) is retired; `emit_health_probe` remains only as a deprecated shim.
 
 ---
 

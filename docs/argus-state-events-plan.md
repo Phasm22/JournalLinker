@@ -1,6 +1,6 @@
 # Plan: state-change events instead of heartbeats and polling
 
-Status: proposed (2026-10-07). No code changes yet.
+Status: implemented (2026-10-10) for `voice_ingest_server.py` and `feedback_sender.py --daemon`.
 
 ## Why
 
