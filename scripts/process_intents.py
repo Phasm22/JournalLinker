@@ -5,6 +5,11 @@ Reads a daily note, gates actionable intent via a local Ollama model,
 packages context, calls an OpenAI model for structured routing output, then delivers
 to Pushover / Obsidian cortex/ / JSON digest queue.
 
+Also runs a voice wellness/nutrition stage (see nutrition_ledger.py) that extracts
+meal|water|craving|want_to_cook|preference captures from `> [!voice]` callouts into
+cortex/wellness/ notes with filterable YAML frontmatter (plus the calorie JSONL ledger
+for intake).
+
 Usage:
     python3 scripts/process_intents.py --file /path/to/2026-04-16.md
     python3 scripts/process_intents.py --file note.md --dry-run
