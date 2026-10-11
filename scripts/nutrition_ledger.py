@@ -79,19 +79,26 @@ COUNT_UNITS = {
     "plate", "slice", "container", "item", "drink", "carton", "pouch",
     "bar", "packet", "bag",
 }
-# Default fluid ounces when the speaker says "a glass/cup/bottle" of water.
-WATER_UNIT_OZ = {
+# Fluid-ounce factors for water units. "bottle" is filled from INTENT_WATER_BOTTLE_ML
+# at runtime (default 1000 ml ≈ 33.814 fl oz) — the user's typical bottle size.
+ML_PER_FL_OZ = 29.5735
+DEFAULT_WATER_BOTTLE_ML = 1000.0
+WATER_UNIT_OZ_BASE = {
     "oz": 1.0,
     "ounce": 1.0,
     "ounces": 1.0,
     "glass": 8.0,
     "cup": 8.0,
-    "bottle": 16.0,
     "can": 12.0,
-    "ml": 1.0 / 29.5735,
+    "ml": 1.0 / ML_PER_FL_OZ,
+    "l": 1000.0 / ML_PER_FL_OZ,
+    "liter": 1000.0 / ML_PER_FL_OZ,
+    "litre": 1000.0 / ML_PER_FL_OZ,
     "serving": 8.0,
     "drink": 8.0,
 }
+# Backward-compatible name; prefer water_unit_oz_map() so bottle picks up env.
+WATER_UNIT_OZ = {**WATER_UNIT_OZ_BASE, "bottle": DEFAULT_WATER_BOTTLE_ML / ML_PER_FL_OZ}
 
 _VOICE_HEADER_RE = re.compile(r"^> \[!voice\]\s+(\d{1,2}:\d{2})\s*$")
 _DATE_NOTE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})\.md$")
@@ -99,77 +106,51 @@ _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 
 NUTRITION_LEDGER_PROMPT = (
     "You are a nutrition ledger clerk for one spoken journal utterance.\n"
-    "Decide whether the speaker is reporting food or drink they are consuming or already consumed.\n"
-    "Also classify a wellness capture_type for downstream meal planning.\n"
-    "Then extract every relevant item. Reason about vague speech. Do not invent a stricter phrase than they used.\n"
+    "The speaker often vlogs casually and may pack several meals, snacks, and water into one utterance.\n"
+    "Split the utterance into SEPARATE captures — one per meal_slot for food, plus a separate water "
+    "capture when plain water is mentioned. Reason about vague speech. Do not invent stricter phrases.\n"
     "\n"
-    "capture_type (pick exactly one):\n"
-    "- meal: reported eating food (or a mixed meal/drink that is not plain water).\n"
-    "- water: reported drinking water (plain water only; not coffee, soda, milk, juice).\n"
-    "- craving: wants or craves a food/drink now without clearly consuming it "
-    "(\"I'm craving chips\", \"really want ice cream\").\n"
-    "- want_to_cook: wants to cook, make, or prepare a dish "
-    "(\"I want to cook salmon\", \"thinking of making chili this week\").\n"
-    "- preference: likes, dislikes, or is thinking about a food preference "
-    "(\"I love roasted broccoli\", \"not a fan of cilantro\", \"been thinking about miso soup\").\n"
-    "- none: none of the above.\n"
+    "Return JSON: {\"captures\": [capture, ...]}\n"
+    "Each capture object fields:\n"
+    "  capture_type: meal|water|craving|want_to_cook|preference|none\n"
+    "  meal_slot: breakfast|lunch|dinner|snack|drink|unknown\n"
+    "  is_intake: bool\n"
+    "  water_oz: number|null  (fluid ounces; only for capture_type=water)\n"
+    "  notes: string\n"
+    "  items: [{{label, kind, identity, quantity, unit, serving_basis, unresolved, needs_lookup, "
+    "calories_est, protein_g_est, carbs_g_est, fat_g_est, assumption}}]\n"
     "\n"
-    "Log intake (is_intake true) when they report consuming food/drink, including present tense "
-    "(\"I'm drinking...\"), past tense (\"I had...\"), "
-    "and bare fragments (\"two glasses of milk\", \"fourteen grams of chicken\").\n"
-    "For craving, want_to_cook, and preference: is_intake false. Still list the named foods in items "
-    "(quantity 1, unit serving, identity generic, estimates null) so a meal planner can read them.\n"
-    "Do not log generic advice with no named food (\"I should eat more protein\") as anything but none.\n"
-    "Do not log other people's meals unless the speaker clearly ate or drank it too "
-    "(\"we had pizza\" counts as one share for the speaker).\n"
-    "A mention of food that is only a story, with no intake and no craving/preference/cook signal, is none.\n"
+    "Splitting rules:\n"
+    "- If they say \"for breakfast …\" and \"for lunch …\", emit two meal captures with those meal_slots.\n"
+    "- Foods mentioned without a slot (\"add a Snickers\", \"and some biryani\") go in a meal capture "
+    "with meal_slot \"unknown\" or \"snack\" when clearly a snack.\n"
+    "- Plain water (\"water bottle\", \"a liter\" of water, \"filled up my water bottle\") is NEVER folded "
+    "into a meal capture. Emit a separate capture_type=water. Cold brew, coffee, soda, milk, juice "
+    "stay on the meal capture as drink items.\n"
+    "- \"Filled up my water bottle\" / finishing a bottle counts as drinking one bottle "
+    "(the configured bottle size — typically 1 liter).\n"
+    "- \"One water bottle\" + \"also, a liter\" is two water amounts (sum them into one water capture).\n"
     "\n"
-    "water_oz: when capture_type is water, set water_oz to fluid ounces consumed "
-    "(stated oz wins; a glass/cup is 8; a bottle is 16 unless they said otherwise). "
-    "Otherwise water_oz null.\n"
+    "capture_type meanings:\n"
+    "- meal: eating food or non-water drinks.\n"
+    "- water: plain water only.\n"
+    "- craving / want_to_cook / preference: not consumed; is_intake false; still list named foods.\n"
+    "- none: skip.\n"
     "\n"
-    "Quantity rules, in order:\n"
-    "- A stated count or measure wins: \"eleven carrots\" is 11 carrots; \"fourteen grams of chicken\" is 14 g; "
-    "\"two glasses\" is 2 glasses. Never replace a stated amount with a standard serving.\n"
-    "- Number words and digits are the same (two, eleven, 14).\n"
-    "- \"A glass\", \"a cup\", \"a bowl\", \"a bottle\", \"a serving\", \"some\", \"a bit\", or no amount at all, "
-    "and the food or drink is named: quantity 1, unit \"serving\" or the container they named, "
-    "serving_basis \"default_serving\". Use one ordinary single-person portion of that item "
-    "(one plate of chicken alfredo, one 8 fl oz glass, one medium piece). Say what you assumed.\n"
-    "- The food itself is only \"this\", \"that\", or \"it\", with no name in the utterance: still log it, "
-    "label \"unresolved\", identity \"unresolved\", unresolved true, needs_lookup false, "
-    "keep any stated quantity and container (\"a glass of this\" is 1 glass). "
-    "Leave calories and macros null. Do not guess the food.\n"
-    "- If preparation changes the estimate and they did not say (fried vs grilled, sweetened vs unsweetened), "
-    "pick the common plain version and record that in assumption.\n"
-    "- Keep the speaker's name. \"Bev\" stays \"Bev\". Do not expand a brand, product, or proper noun "
-    "into a generic food you happen to know.\n"
+    "Item rules:\n"
+    "- Every food/drink MUST have label (the spoken name) and quantity (default 1 when unstated).\n"
+    "- unit: serving, glass, cup, bottle, g, oz, ml, l, bar, piece, plate, bowl, can, …\n"
+    "- Stated counts/measures win. Number words = digits.\n"
+    "- identity generic for ordinary foods; branded for brands (Snickers, Bev) with needs_lookup true "
+    "and null macros; unresolved for this/that/it.\n"
+    "- Keep brand names as spoken. Do not invent macros for brands.\n"
+    "- For generic intake, rough USDA-like calorie/macro estimates are OK.\n"
     "\n"
-    "Identity:\n"
-    "- generic: ordinary foods and dishes a plain foods table would cover "
-    "(carrots, milk, chicken, coffee, chicken alfredo). needs_lookup false. You may estimate.\n"
-    "- branded: a brand, product line, packaged name, restaurant item, or any niche name you would not "
-    "trust from memory alone. That includes short proper nouns like \"Bev\". identity \"branded\", "
-    "needs_lookup true, and all four estimate fields null. Do not guess brand nutrition from memory.\n"
-    "- unresolved: identity \"unresolved\", needs_lookup false, estimates null.\n"
+    "water_oz: stated oz wins; glass/cup=8; bottle=the user's bottle (about 33.8 fl oz / 1 L unless "
+    "they said otherwise); liter/litre/l=33.814. Sum multiple water mentions in one water capture.\n"
     "\n"
-    "Known items:\n"
-    "The user message may include a Known items block. Prefer a stated amount over that block.\n"
-    "When the utterance names a known item and gives no amount, set serving_basis to \"remembered\" "
-    "and use the stored typical quantity and unit.\n"
-    "\n"
-    "Estimates (generic only):\n"
-    "- Fill calories_est, protein_g_est, carbs_g_est, fat_g_est with rough USDA-like numbers for the "
-    "quantity you settled on. These are estimates, not measurements.\n"
-    "- Scale estimates to the stated quantity (14 g is not a full chicken breast).\n"
-    "\n"
-    "meal_slot is breakfast, lunch, dinner, snack, or drink only when the utterance or the clock time "
-    "makes it plain. Otherwise \"unknown\". A drink can be meal_slot \"drink\".\n"
-    "\n"
+    "If nothing to capture: {\"captures\": []}\n"
     "Respond with one JSON object and no other text.\n"
-    "If nothing to capture, return "
-    '{"is_intake": false, "capture_type": "none", "water_oz": null, "items": [], "notes": ""}.\n'
-    "Always include capture_type and water_oz (null when not water).\n"
 )
 
 NUTRITION_LOOKUP_PROMPT = (
@@ -257,6 +238,8 @@ def normalize_unit(unit: str) -> str:
         "g": "g",
         "ounces": "oz",
         "ounce": "oz",
+        "fl oz": "oz",
+        "floz": "oz",
         "cans": "can",
         "cups": "cup",
         "bowls": "bowl",
@@ -265,12 +248,39 @@ def normalize_unit(unit: str) -> str:
         "plates": "plate",
         "slices": "slice",
         "servings": "serving",
+        "liters": "l",
+        "litres": "l",
+        "liter": "l",
+        "litre": "l",
+        "l": "l",
+        "milliliters": "ml",
+        "millilitres": "ml",
+        "milliliter": "ml",
+        "millilitre": "ml",
     }
     if text in aliases:
         return aliases[text]
     if text.endswith("s") and text[:-1] in COUNT_UNITS:
         return text[:-1]
     return text
+
+
+def water_bottle_ml() -> float:
+    raw = os.getenv("INTENT_WATER_BOTTLE_ML", "").strip()
+    if not raw:
+        return DEFAULT_WATER_BOTTLE_ML
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_WATER_BOTTLE_ML
+    return value if value > 0 else DEFAULT_WATER_BOTTLE_ML
+
+
+def water_unit_oz_map() -> dict[str, float]:
+    bottle_oz = water_bottle_ml() / ML_PER_FL_OZ
+    mapping = dict(WATER_UNIT_OZ_BASE)
+    mapping["bottle"] = bottle_oz
+    return mapping
 
 
 def _as_number(value) -> float | None:
@@ -733,6 +743,7 @@ def derive_water_oz(items: list[dict], water_oz_raw) -> float | None:
     direct = _as_number(water_oz_raw)
     if direct is not None and direct > 0:
         return _clean_qty(direct)
+    unit_map = water_unit_oz_map()
     total = 0.0
     found = False
     for item in items:
@@ -743,7 +754,7 @@ def derive_water_oz(items: list[dict], water_oz_raw) -> float | None:
         if quantity is None or quantity <= 0:
             continue
         unit = normalize_unit(str(item.get("unit") or ""))
-        factor = WATER_UNIT_OZ.get(unit)
+        factor = unit_map.get(unit)
         if factor is None:
             continue
         total += quantity * factor
@@ -753,8 +764,151 @@ def derive_water_oz(items: list[dict], water_oz_raw) -> float | None:
     return _clean_qty(total)
 
 
+_NUMBER_WORDS = {
+    "a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11,
+    "twelve": 12, "half": 0.5,
+}
+
+
+def _parse_number_token(token: str) -> float | None:
+    text = str(token or "").strip().lower()
+    if not text:
+        return None
+    if text in _NUMBER_WORDS:
+        return float(_NUMBER_WORDS[text])
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _water_item(quantity: float, unit: str, *, assumption: str = "") -> dict:
+    return {
+        "label": "water",
+        "kind": "drink",
+        "identity": "generic",
+        "quantity": _clean_qty(quantity),
+        "unit": unit,
+        "serving_basis": "stated",
+        "unresolved": False,
+        "needs_lookup": False,
+        "assumption": assumption,
+        **_null_estimates(),
+    }
+
+
+def extract_water_from_text(raw_text: str) -> tuple[float | None, list[dict]]:
+    """Deterministic water amounts from casual speech (bottle / liter / oz / ml).
+
+    \"Filled up my water bottle\" counts as one configured bottle. Multiple
+    distinct mentions in one utterance are summed. Overlapping regex hits on
+    the same span are ignored.
+    """
+    text = strip_wikilinks(raw_text or "")
+    if not text.strip():
+        return None, []
+    unit_map = water_unit_oz_map()
+    bottle_assumption = f"bottle={water_bottle_ml():g}ml"
+    patterns: list[tuple[re.Pattern[str], str]] = [
+        # filled/finished/emptied my water bottle → 1 bottle
+        (
+            re.compile(
+                r"\b(?:filled(?:\s+up)?|finished|emptied)\s+(?:my\s+|the\s+)?water\s+bottle\b",
+                re.I,
+            ),
+            "fill_bottle",
+        ),
+        # one water bottle / bottles of water
+        (
+            re.compile(
+                r"\b(?P<qty>\d+(?:\.\d+)?|a|an|one|two|three|four|five|six|seven|eight|nine|ten)\s+"
+                r"(?:water\s+bottles?|bottles?\s+of\s+water)\b",
+                re.I,
+            ),
+            "bottle",
+        ),
+        # bare "water bottle" without a leading count (still one bottle)
+        (
+            re.compile(r"\bwater\s+bottles?\b", re.I),
+            "bare_bottle",
+        ),
+        # a liter / one litre / 2 liters (standalone or of water)
+        (
+            re.compile(
+                r"\b(?P<qty>\d+(?:\.\d+)?|a|an|one|two|three|four|five)\s+"
+                r"(?:liters?|litres?)\b(?:\s+of\s+water)?",
+                re.I,
+            ),
+            "liter",
+        ),
+        # 16 oz of water / 500 ml water
+        (
+            re.compile(
+                r"\b(?P<qty>\d+(?:\.\d+)?)\s*(?P<unit>oz|ounces?|ml|milliliters?)\s+(?:of\s+)?water\b",
+                re.I,
+            ),
+            "measure",
+        ),
+    ]
+
+    hits: list[tuple[int, int, dict]] = []
+    for pattern, kind in patterns:
+        for match in pattern.finditer(text):
+            if kind == "fill_bottle":
+                item = _water_item(1.0, "bottle", assumption=bottle_assumption)
+            elif kind in {"bottle", "bare_bottle"}:
+                qty = _parse_number_token(match.groupdict().get("qty") or "1") or 1.0
+                item = _water_item(qty, "bottle", assumption=bottle_assumption)
+            elif kind == "liter":
+                qty = _parse_number_token(match.group("qty")) or 1.0
+                item = _water_item(qty, "l")
+            else:
+                qty = _as_number(match.group("qty"))
+                unit = normalize_unit(match.group("unit"))
+                if qty is None or unit not in unit_map:
+                    continue
+                item = _water_item(qty, unit)
+            hits.append((match.start(), match.end(), item))
+
+    # Drop hits whose span is wholly inside an earlier (longer/earlier) hit.
+    hits.sort(key=lambda row: (row[0], -(row[1] - row[0])))
+    accepted: list[tuple[int, int, dict]] = []
+    covered: list[tuple[int, int]] = []
+    for start, end, item in hits:
+        if any(start >= c0 and end <= c1 for c0, c1 in covered):
+            continue
+        covered.append((start, end))
+        accepted.append((start, end, item))
+
+    # "I drank one water bottle. Also, a liter." — when the bottle is already 1 L,
+    # a bare trailing liter is a size restatement, not a second drink. Keep the
+    # liter only when it carries its own "of water" / drink framing, or when no
+    # bottle was logged.
+    has_bottle = any(item["unit"] == "bottle" for _, _, item in accepted)
+    if has_bottle:
+        filtered: list[tuple[int, int, dict]] = []
+        for start, end, item in accepted:
+            if item["unit"] != "l":
+                filtered.append((start, end, item))
+                continue
+            window = text[max(0, start - 24):end + 16].lower()
+            if "of water" in window or re.search(r"\b(drank|drink|drinking)\b", window):
+                filtered.append((start, end, item))
+                # else: drop restatement
+        accepted = filtered
+
+    if not accepted:
+        return None, []
+    items = [item for _, _, item in accepted]
+    total = 0.0
+    for item in items:
+        total += float(item["quantity"]) * unit_map[item["unit"]]
+    return _clean_qty(total), items
+
+
 def validate_extract(payload: dict) -> dict:
-    """Type-check model JSON. Stated numbers are kept. Brand macros are cleared."""
+    """Type-check a single capture object. Stated numbers are kept. Brand macros cleared."""
     if not isinstance(payload, dict):
         raise ValueError("nutrition extract was not an object")
     is_intake = bool(payload.get("is_intake"))
@@ -776,32 +930,153 @@ def validate_extract(payload: dict) -> dict:
                     item["needs_lookup"] = False
                     if item.get("identity") == "branded":
                         item["identity"] = "generic"
+                slot = str(raw.get("meal_slot") or "").strip().lower() if isinstance(raw, dict) else ""
+                if slot in MEAL_SLOTS:
+                    item["meal_slot"] = slot
                 items.append(item)
-    if is_intake and not items:
+    if is_intake and not items and capture_hint != "water":
         is_intake = False
     capture_type = _infer_capture_type(is_intake, items, capture_hint)
+    # Empty meal/craving with no items is not a real capture — collapse to none.
+    if capture_type != "water" and not items:
+        capture_type = "none"
+        is_intake = False
     if capture_type == "none" and not is_intake:
         items = []
     water_oz = derive_water_oz(items, payload.get("water_oz")) if capture_type == "water" else None
+    if capture_type == "water" and water_oz is not None:
+        is_intake = True
     return {
         "is_intake": is_intake,
         "capture_type": capture_type,
-        "meal_slot": meal_slot if is_intake else "unknown",
+        "meal_slot": meal_slot if capture_type != "none" else "unknown",
         "water_oz": water_oz,
         "items": items,
         "notes": notes,
     }
 
 
+def _capture_is_meaningful(cap: dict) -> bool:
+    capture_type = cap.get("capture_type")
+    if capture_type == "water":
+        return cap.get("water_oz") is not None or bool(cap.get("items"))
+    if capture_type in WELLNESS_CAPTURE_TYPES:
+        return bool(cap.get("items"))
+    return False
+
+
+def _split_capture_by_slot(cap: dict) -> list[dict]:
+    """Split one capture whose items carry per-item meal_slot into several."""
+    items = list(cap.get("items") or [])
+    if cap.get("capture_type") == "water":
+        return [cap] if _capture_is_meaningful(cap) else []
+    water_items = [
+        item for item in items
+        if normalize_label(str(item.get("label") or "")) in {"water", "plain water", "tap water"}
+        and str(item.get("kind") or "") == "drink"
+    ]
+    food_items = [item for item in items if item not in water_items]
+    out: list[dict] = []
+    groups: dict[str, list[dict]] = {}
+    for item in food_items:
+        slot = str(item.get("meal_slot") or cap.get("meal_slot") or "unknown").strip().lower()
+        if slot not in MEAL_SLOTS:
+            slot = "unknown"
+        groups.setdefault(slot, []).append({k: v for k, v in item.items() if k != "meal_slot"})
+    for slot, grouped in groups.items():
+        child = dict(cap)
+        child["items"] = grouped
+        child["meal_slot"] = slot
+        child["capture_type"] = child.get("capture_type") if child.get("capture_type") != "water" else "meal"
+        if child["capture_type"] == "none":
+            child["capture_type"] = "meal"
+        child["water_oz"] = None
+        child["is_intake"] = bool(cap.get("is_intake")) and child["capture_type"] == "meal"
+        if _capture_is_meaningful(child):
+            out.append(child)
+    if water_items:
+        water_cap = {
+            "is_intake": True,
+            "capture_type": "water",
+            "meal_slot": "drink",
+            "water_oz": derive_water_oz(water_items, None),
+            "items": water_items,
+            "notes": "",
+        }
+        if _capture_is_meaningful(water_cap):
+            out.append(water_cap)
+    return out
+
+
+def validate_captures(payload: dict, raw_text: str = "") -> list[dict]:
+    """Normalize model JSON into a list of meaningful captures.
+
+    Accepts the new {captures:[...]} shape or the legacy single-object shape.
+    Merges deterministic water mentions from raw_text when the model omits water.
+    """
+    if not isinstance(payload, dict):
+        raise ValueError("nutrition extract was not an object")
+    raw_list = payload.get("captures")
+    captures_in: list[dict]
+    if isinstance(raw_list, list) and raw_list:
+        captures_in = [row for row in raw_list if isinstance(row, dict)]
+    else:
+        captures_in = [payload]
+
+    expanded: list[dict] = []
+    for raw in captures_in:
+        validated = validate_extract(raw)
+        expanded.extend(_split_capture_by_slot(validated) or (
+            [validated] if _capture_is_meaningful(validated) else []
+        ))
+
+    # Deterministic water fallback / merge
+    text_oz, text_items = extract_water_from_text(raw_text)
+    water_caps = [c for c in expanded if c.get("capture_type") == "water"]
+    if text_oz is not None:
+        if water_caps:
+            existing = _as_number(water_caps[0].get("water_oz")) or 0.0
+            # Prefer the larger of model vs text when both present (text is authoritative floor).
+            water_caps[0]["water_oz"] = _clean_qty(max(existing, float(text_oz)))
+            if not water_caps[0].get("items"):
+                water_caps[0]["items"] = text_items
+            water_caps[0]["is_intake"] = True
+        else:
+            expanded.append({
+                "is_intake": True,
+                "capture_type": "water",
+                "meal_slot": "drink",
+                "water_oz": text_oz,
+                "items": text_items,
+                "notes": "",
+            })
+
+    # Drop empty non-water leftovers
+    return [c for c in expanded if _capture_is_meaningful(c)]
+
+
 def _validate_item(raw) -> dict | None:
+    if isinstance(raw, str):
+        label = strip_wikilinks(raw).strip()
+        if not label:
+            return None
+        raw = {"label": label, "quantity": 1, "unit": "serving", "kind": "food"}
     if not isinstance(raw, dict):
         return None
-    label = str(raw.get("label") or "").strip()
+    label = str(
+        raw.get("label")
+        or raw.get("name")
+        or raw.get("food")
+        or raw.get("item")
+        or ""
+    ).strip()
+    label = strip_wikilinks(label)
     if not label:
         return None
     quantity = _as_number(raw.get("quantity"))
+    # Live models often omit quantity for "I had a cinnamon roll" — default to 1.
     if quantity is None or quantity <= 0:
-        return None
+        quantity = 1.0
     unresolved = bool(raw.get("unresolved")) or normalize_label(label) in {"unresolved", "this", "that", "it"}
     if unresolved:
         identity = "unresolved"
@@ -816,7 +1091,7 @@ def _validate_item(raw) -> dict | None:
     unit = normalize_unit(str(raw.get("unit") or "serving")) or "serving"
     serving_basis = str(raw.get("serving_basis") or "").strip().lower()
     if serving_basis not in SERVING_BASES:
-        serving_basis = "approximate"
+        serving_basis = "default_serving" if quantity == 1.0 and raw.get("quantity") in (None, "") else "approximate"
     needs_lookup = identity == "branded"
     estimates = _null_estimates()
     if identity == "generic":
@@ -1230,6 +1505,26 @@ def item_labels(items: list[dict]) -> list[str]:
     return labels
 
 
+def _wellness_filename_slug(capture_type: str, meal_slot: str, labels: list[str], water_oz) -> str:
+    """Build a human slug without duplicating the capture_type (no 'meal meal')."""
+    if capture_type == "water":
+        if water_oz is not None:
+            return f"{_clean_qty(float(water_oz))}oz"
+        return "water"
+    parts: list[str] = []
+    if meal_slot and meal_slot not in {"unknown", "drink"}:
+        parts.append(meal_slot)
+    if labels:
+        parts.append(labels[0])
+    elif not parts:
+        parts.append(capture_type)
+    slug = re.sub(r'[<>:"/\\|?*]', "-", " ".join(parts)).strip("-").strip()
+    # Avoid "meal meal" when the only label accidentally equals the type.
+    if slug.lower() == capture_type.lower():
+        return slug
+    return slug or capture_type
+
+
 def write_wellness_note(
     wellness_dir: Path,
     *,
@@ -1246,11 +1541,9 @@ def write_wellness_note(
     """Write a structured wellness note under wellness_dir for vault indexing."""
     wellness_dir.mkdir(parents=True, exist_ok=True)
     labels = item_labels(items)
-    label_slug = re.sub(r'[<>:"/\\|?*]', "-", " ".join(labels[:3])).strip("-").strip()
-    if not label_slug:
-        label_slug = capture_type
+    slug = _wellness_filename_slug(capture_type, meal_slot, labels, water_oz)
     key_prefix = (span_id or "")[:8] or "note"
-    note_path = wellness_dir / f"{source_date} {capture_type} {label_slug} {key_prefix}.md"
+    note_path = wellness_dir / f"{source_date} {capture_type} {slug} {key_prefix}.md"
     created = f"{source_date}T{spoken_at}:00" if spoken_at else source_date
     water_line = "null" if water_oz is None else str(_clean_qty(float(water_oz)))
     fm_lines = [
@@ -1267,7 +1560,12 @@ def write_wellness_note(
         f"span_key: {span_id[:16]}",
         "---",
     ]
-    title = f"{capture_type.replace('_', ' ').title()}: {', '.join(labels) if labels else 'capture'}"
+    if capture_type == "water" and water_oz is not None:
+        title = f"Water: {_clean_qty(float(water_oz))} oz"
+    elif meal_slot and meal_slot not in {"unknown", "drink"} and labels:
+        title = f"{meal_slot.title()}: {', '.join(labels)}"
+    else:
+        title = f"{capture_type.replace('_', ' ').title()}: {', '.join(labels) if labels else 'capture'}"
     body_lines = ["", f"# {title}", ""]
     if water_oz is not None:
         body_lines.extend([f"water_oz:: {water_line}", ""])
@@ -1302,18 +1600,29 @@ def _process_callout(
     journal_dir: Path | None,
     model: str | None,
     wellness_dir: Path | None = None,
-) -> tuple[bool, bool, dict | None]:
-    """Return (wrote_intake, wrote_wellness, row). Raises if the extract model fails."""
+) -> tuple[int, int, dict | None]:
+    """Return (intake_rows_written, wellness_notes_written, summary_row)."""
     user = build_extract_user(callout["spoken_at"], callout["raw_text"], memory)
-    parsed = validate_extract(call_nutrition_model(NUTRITION_LEDGER_PROMPT, user, model=model))
-    if parsed["is_intake"]:
-        apply_memory_priors(parsed["items"], memory)
-        for item in parsed["items"]:
-            resolve_branded_item(
-                item, cache, memory, journal_dir, dry_run=dry_run, model=model,
-            )
+    raw_payload = call_nutrition_model(NUTRITION_LEDGER_PROMPT, user, model=model)
+    captures = validate_captures(raw_payload, callout["raw_text"])
+    for cap in captures:
+        if cap.get("is_intake") and cap.get("capture_type") != "water":
+            apply_memory_priors(cap["items"], memory)
+            for item in cap["items"]:
+                resolve_branded_item(
+                    item, cache, memory, journal_dir, dry_run=dry_run, model=model,
+                )
     key = span_key(source_path, callout["spoken_at"], callout["raw_text"])
-    capture_type = parsed["capture_type"]
+    intake_items: list[dict] = []
+    for cap in captures:
+        if cap.get("is_intake"):
+            intake_items.extend(cap.get("items") or [])
+    any_intake = any(cap.get("is_intake") for cap in captures)
+    # Summary row keeps a flattened items list for the day calorie digest, plus captures[].
+    primary = captures[0] if captures else {
+        "is_intake": False, "capture_type": "none", "meal_slot": "unknown",
+        "water_oz": None, "items": [], "notes": "",
+    }
     row = {
         "idempotency_key": key,
         "logged_at": _now_iso(),
@@ -1321,53 +1630,66 @@ def _process_callout(
         "source_date": source_date,
         "spoken_at": callout["spoken_at"],
         "raw_text": callout["raw_text"],
-        "is_intake": parsed["is_intake"],
-        "capture_type": capture_type,
-        "meal_slot": parsed["meal_slot"],
-        "water_oz": parsed["water_oz"],
-        "items": parsed["items"],
-        "notes": parsed["notes"],
+        "is_intake": any_intake,
+        "capture_type": primary.get("capture_type"),
+        "meal_slot": primary.get("meal_slot"),
+        "water_oz": next((c.get("water_oz") for c in captures if c.get("capture_type") == "water"), None),
+        "items": intake_items,
+        "captures": captures,
+        "notes": primary.get("notes") or "",
     }
-    wrote_wellness = capture_type in WELLNESS_CAPTURE_TYPES
+    wellness_count = sum(1 for c in captures if c.get("capture_type") in WELLNESS_CAPTURE_TYPES)
     if dry_run:
         print(json.dumps(row, ensure_ascii=False, indent=2))
-        return parsed["is_intake"], wrote_wellness, row
-    if parsed["is_intake"]:
+        return (1 if any_intake else 0), wellness_count, row
+
+    intake_written = 0
+    if any_intake:
         _append_jsonl(ledger_path(state_dir), row)
         update_memory_from_row(memory, row)
         save_memory(state_dir, memory)
         save_cache(state_dir, cache)
-    wellness_path = ""
-    if wrote_wellness and wellness_dir is not None:
-        try:
-            note_path = write_wellness_note(
-                wellness_dir,
-                capture_type=capture_type,
-                source_date=source_date,
-                spoken_at=callout["spoken_at"],
-                items=parsed["items"],
-                water_oz=parsed["water_oz"],
-                raw_text=callout["raw_text"],
-                span_id=key,
-                meal_slot=parsed["meal_slot"],
-                notes=parsed["notes"],
-            )
-            wellness_path = str(note_path)
-        except Exception as exc:
-            _log(f"wellness write failed: {exc}")
-            wrote_wellness = False
-    elif wrote_wellness and wellness_dir is None:
+        intake_written = 1
+
+    wellness_paths: list[str] = []
+    notes_written = 0
+    if wellness_dir is not None:
+        for index, cap in enumerate(captures):
+            if cap.get("capture_type") not in WELLNESS_CAPTURE_TYPES:
+                continue
+            try:
+                note_path = write_wellness_note(
+                    wellness_dir,
+                    capture_type=cap["capture_type"],
+                    source_date=source_date,
+                    spoken_at=callout["spoken_at"],
+                    items=cap.get("items") or [],
+                    water_oz=cap.get("water_oz"),
+                    raw_text=callout["raw_text"],
+                    span_id=f"{key}:{index}",
+                    meal_slot=str(cap.get("meal_slot") or "unknown"),
+                    notes=str(cap.get("notes") or ""),
+                )
+                wellness_paths.append(str(note_path))
+                notes_written += 1
+            except Exception as exc:
+                _log(f"wellness write failed: {exc}")
+    elif wellness_count:
         _log("wellness capture skipped: no wellness_dir")
-        wrote_wellness = False
+
     append_processed(state_dir, {
         "idempotency_key": key,
-        "is_intake": parsed["is_intake"],
-        "capture_type": capture_type,
+        "is_intake": any_intake,
+        "capture_type": ",".join(
+            sorted({str(c.get("capture_type")) for c in captures})
+        ) or "none",
         "source_path": str(source_path),
         "spoken_at": callout["spoken_at"],
-        "wellness_note": wellness_path,
+        "wellness_note": wellness_paths[0] if len(wellness_paths) == 1 else "",
+        "wellness_notes": wellness_paths,
+        "capture_count": len(captures),
     })
-    return parsed["is_intake"], wrote_wellness, row
+    return intake_written, notes_written, row
 
 
 def retry_error_lookups(
@@ -1445,7 +1767,7 @@ def run_nutrition_stage(
         if key in processed:
             continue
         try:
-            wrote_intake, wrote_wellness, _row = _process_callout(
+            intake_n, wellness_n, _row = _process_callout(
                 callout,
                 source_path=source_path,
                 source_date=source_date,
@@ -1460,10 +1782,8 @@ def run_nutrition_stage(
         except Exception as exc:
             _log(f"extract failed for {callout['spoken_at']}: {exc}")
             continue
-        if wrote_intake:
-            logged += 1
-        if wrote_wellness:
-            wellness_notes += 1
+        logged += int(intake_n)
+        wellness_notes += int(wellness_n)
         if not dry_run:
             processed.add(key)
     return {"intake_logged": logged, "wellness_notes": wellness_notes}

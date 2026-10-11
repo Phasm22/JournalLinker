@@ -791,3 +791,307 @@ class TestWellnessCapture(unittest.TestCase):
         self.assertIn("type: meal", notes[0].read_text(encoding="utf-8"))
         # Confirm nothing landed under a cortex tree.
         self.assertFalse((self.journal / "cortex").exists())
+        self.assertNotIn("meal meal", notes[0].name)
+
+
+LIVE_VLOG = (
+    "Today, for breakfast, I had a cinnamon roll and a cold brew. "
+    "For lunch, I had a bison burger and truffle fries. "
+    "I drank one water bottle. Also, a liter. "
+    "Add a Snickers bar, too. And some chicken biryani."
+)
+
+LIVE_VLOG_WIKILINKED = (
+    "Today, for breakfast, I had a [[cinnamon roll]] and a [[cold brew]]. "
+    "For lunch, I had a [[bison burger]] and [[truffle fries]]. "
+    "I drank one water bottle. Also, a liter. "
+    "Add a [[Snickers]] bar, too. And some [[chicken biryani]]."
+)
+
+# Realistic multi-capture model output for the live vlog utterance.
+LIVE_VLOG_CAPTURES = {
+    "captures": [
+        {
+            "capture_type": "meal",
+            "meal_slot": "breakfast",
+            "is_intake": True,
+            "water_oz": None,
+            "items": [
+                {
+                    "label": "cinnamon roll",
+                    "kind": "food",
+                    "identity": "generic",
+                    "quantity": 1,
+                    "unit": "serving",
+                    "serving_basis": "default_serving",
+                    "calories_est": 400,
+                },
+                {
+                    "label": "cold brew",
+                    "kind": "drink",
+                    "identity": "generic",
+                    "quantity": 1,
+                    "unit": "serving",
+                    "serving_basis": "default_serving",
+                    "calories_est": 5,
+                },
+            ],
+        },
+        {
+            "capture_type": "meal",
+            "meal_slot": "lunch",
+            "is_intake": True,
+            "water_oz": None,
+            "items": [
+                {
+                    "label": "bison burger",
+                    "kind": "food",
+                    "identity": "generic",
+                    "quantity": 1,
+                    "unit": "serving",
+                    "serving_basis": "default_serving",
+                    "calories_est": 600,
+                },
+                {
+                    "label": "truffle fries",
+                    "kind": "food",
+                    "identity": "generic",
+                    "quantity": 1,
+                    "unit": "serving",
+                    "serving_basis": "default_serving",
+                    "calories_est": 450,
+                },
+            ],
+        },
+        {
+            "capture_type": "meal",
+            "meal_slot": "unknown",
+            "is_intake": True,
+            "water_oz": None,
+            "items": [
+                {
+                    "label": "Snickers",
+                    "kind": "food",
+                    "identity": "branded",
+                    "quantity": 1,
+                    "unit": "bar",
+                    "serving_basis": "default_serving",
+                    "needs_lookup": True,
+                },
+                {
+                    "label": "chicken biryani",
+                    "kind": "food",
+                    "identity": "generic",
+                    "quantity": 1,
+                    "unit": "serving",
+                    "serving_basis": "approximate",
+                    "calories_est": 550,
+                },
+            ],
+        },
+        {
+            "capture_type": "water",
+            "meal_slot": "drink",
+            "is_intake": True,
+            "water_oz": 33.8,
+            "items": [{
+                "label": "water",
+                "kind": "drink",
+                "identity": "generic",
+                "quantity": 1,
+                "unit": "bottle",
+                "serving_basis": "stated",
+            }],
+        },
+    ],
+}
+
+
+class TestLiveVlogRegression(unittest.TestCase):
+    """Regression for the 2026-10-10 23:55 multi-meal voice callout."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state = Path(self.tmp.name) / "state"
+        self.state.mkdir()
+        self.journal = Path(self.tmp.name) / "journal"
+        self.journal.mkdir()
+        self.wellness = self.journal / "wellness"
+        self.note = self.journal / "2026-10-10.md"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _note_text(self, body: str) -> str:
+        return f"# 2026-10-10\n\n> [!voice] 23:55\n> {body}\n"
+
+    def test_empty_items_meal_is_not_meaningful(self):
+        # Live failure shape: capture_type meal with items [] (or items that
+        # lacked quantity and used to be dropped). Must not write a junk note.
+        parsed = nl.validate_extract({
+            "is_intake": True,
+            "capture_type": "meal",
+            "meal_slot": "unknown",
+            "items": [],
+        })
+        self.assertEqual(parsed["capture_type"], "none")
+        self.assertFalse(nl._capture_is_meaningful(parsed))
+
+    def test_missing_quantity_defaults_to_one(self):
+        parsed = nl.validate_extract({
+            "is_intake": True,
+            "capture_type": "meal",
+            "meal_slot": "breakfast",
+            "items": [{"label": "cinnamon roll", "kind": "food", "identity": "generic"}],
+        })
+        self.assertEqual(parsed["capture_type"], "meal")
+        self.assertEqual(parsed["items"][0]["quantity"], 1)
+        self.assertEqual(parsed["items"][0]["label"], "cinnamon roll")
+
+    def test_label_aliases_and_wikilink_in_item_fields(self):
+        parsed = nl.validate_extract({
+            "is_intake": True,
+            "capture_type": "meal",
+            "items": [
+                {"name": "[[cinnamon roll]]", "kind": "food"},
+                {"food": "bison burger", "quantity": 1},
+            ],
+        })
+        labels = [i["label"] for i in parsed["items"]]
+        self.assertEqual(labels, ["cinnamon roll", "bison burger"])
+
+    def test_water_bottle_uses_configurable_ml(self):
+        with mock.patch.dict(os.environ, {"INTENT_WATER_BOTTLE_ML": "1000"}):
+            oz, items = nl.extract_water_from_text(
+                "I drank one water bottle. Also, a liter."
+            )
+        self.assertIsNotNone(oz)
+        self.assertAlmostEqual(float(oz), 1000 / nl.ML_PER_FL_OZ, places=1)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["unit"], "bottle")
+
+    def test_filled_up_bottle_counts_as_one_bottle(self):
+        with mock.patch.dict(os.environ, {"INTENT_WATER_BOTTLE_ML": "1000"}):
+            oz, items = nl.extract_water_from_text("filled up my water bottle")
+        self.assertAlmostEqual(float(oz), 1000 / nl.ML_PER_FL_OZ, places=1)
+        self.assertEqual(items[0]["unit"], "bottle")
+
+    def test_live_vlog_writes_breakfast_lunch_snack_and_water(self):
+        text = self._note_text(LIVE_VLOG)
+        with mock.patch.object(nl, "call_nutrition_model", return_value=LIVE_VLOG_CAPTURES), \
+                mock.patch.object(nl, "lookup_product", return_value={
+                    "status": "miss", "query": "", "matched_name": "",
+                    "serving_description": "", "source_urls": [], "per_serving": None,
+                }), \
+                mock.patch.dict(os.environ, {"INTENT_WATER_BOTTLE_ML": "1000"}):
+            result = nl.run_nutrition_stage(
+                text, self.note, "2026-10-10", self.state,
+                journal_dir=self.journal,
+            )
+        self.assertEqual(result["intake_logged"], 1)
+        self.assertEqual(result["wellness_notes"], 4)
+        notes = sorted(self.wellness.glob("*.md"), key=lambda p: p.name)
+        self.assertEqual(len(notes), 4)
+        names = [p.name for p in notes]
+        self.assertTrue(any("breakfast" in n and "meal" in n for n in names))
+        self.assertTrue(any("lunch" in n and "meal" in n for n in names))
+        self.assertTrue(any("water" in n for n in names))
+        self.assertFalse(any("meal meal" in n for n in names))
+
+        by_type: dict[str, list[str]] = {}
+        for path in notes:
+            body = path.read_text(encoding="utf-8")
+            if "type: water" in body:
+                by_type.setdefault("water", []).append(body)
+                self.assertRegex(body, r"water_oz: 33\.8")
+            elif "meal_slot: breakfast" in body:
+                by_type.setdefault("breakfast", []).append(body)
+                self.assertIn("cinnamon roll", body)
+                self.assertIn("cold brew", body)
+            elif "meal_slot: lunch" in body:
+                by_type.setdefault("lunch", []).append(body)
+                self.assertIn("bison burger", body)
+                self.assertIn("truffle fries", body)
+            else:
+                by_type.setdefault("other", []).append(body)
+                self.assertTrue("Snickers" in body or "biryani" in body)
+        self.assertEqual(len(by_type.get("breakfast", [])), 1)
+        self.assertEqual(len(by_type.get("lunch", [])), 1)
+        self.assertEqual(len(by_type.get("water", [])), 1)
+        self.assertEqual(len(by_type.get("other", [])), 1)
+
+    def test_live_vlog_with_wikilinks_strips_before_extract(self):
+        text = self._note_text(LIVE_VLOG_WIKILINKED)
+        callouts = nl.extract_voice_callouts(text)
+        self.assertEqual(len(callouts), 1)
+        self.assertNotIn("[[", callouts[0]["raw_text"])
+        self.assertIn("cinnamon roll", callouts[0]["raw_text"])
+        self.assertIn("Snickers", callouts[0]["raw_text"])
+
+        with mock.patch.object(nl, "call_nutrition_model", return_value=LIVE_VLOG_CAPTURES) as model, \
+                mock.patch.object(nl, "lookup_product", return_value={
+                    "status": "miss", "query": "", "matched_name": "",
+                    "serving_description": "", "source_urls": [], "per_serving": None,
+                }):
+            result = nl.run_nutrition_stage(
+                text, self.note, "2026-10-10", self.state,
+                journal_dir=self.journal,
+            )
+        self.assertEqual(result["wellness_notes"], 4)
+        # Model sees plain text, not wikilinks.
+        user_msg = model.call_args.args[1]
+        self.assertNotIn("[[", user_msg)
+        self.assertIn("cinnamon roll", user_msg)
+
+    def test_bad_model_empty_meal_still_gets_water_from_text(self):
+        # Mimic the live bug: model returns meal + empty items. Water must still
+        # be recovered from the utterance; empty meal must not write a note.
+        text = self._note_text(LIVE_VLOG)
+        bad = {
+            "is_intake": True,
+            "capture_type": "meal",
+            "meal_slot": "unknown",
+            "water_oz": None,
+            "items": [],
+            "notes": "",
+        }
+        with mock.patch.object(nl, "call_nutrition_model", return_value=bad), \
+                mock.patch.dict(os.environ, {"INTENT_WATER_BOTTLE_ML": "1000"}):
+            result = nl.run_nutrition_stage(
+                text, self.note, "2026-10-10", self.state,
+                journal_dir=self.journal,
+            )
+        self.assertEqual(result["wellness_notes"], 1)
+        notes = list(self.wellness.glob("*.md"))
+        self.assertEqual(len(notes), 1)
+        body = notes[0].read_text(encoding="utf-8")
+        self.assertIn("type: water", body)
+        self.assertRegex(body, r"water_oz: 33\.8")
+        self.assertNotIn("meal meal", notes[0].name)
+
+    def test_second_run_dedupes_after_success(self):
+        text = self._note_text(LIVE_VLOG)
+        with mock.patch.object(nl, "call_nutrition_model", return_value=LIVE_VLOG_CAPTURES) as model, \
+                mock.patch.object(nl, "lookup_product", return_value={
+                    "status": "miss", "query": "", "matched_name": "",
+                    "serving_description": "", "source_urls": [], "per_serving": None,
+                }):
+            first = nl.run_nutrition_stage(
+                text, self.note, "2026-10-10", self.state, journal_dir=self.journal,
+            )
+            second = nl.run_nutrition_stage(
+                text, self.note, "2026-10-10", self.state, journal_dir=self.journal,
+            )
+        self.assertEqual(first["wellness_notes"], 4)
+        self.assertEqual(second["intake_logged"], 0)
+        self.assertEqual(second["wellness_notes"], 0)
+        self.assertEqual(model.call_count, 1)
+        self.assertEqual(len(list(self.wellness.glob("*.md"))), 4)
+
+    def test_filename_uses_slot_not_duplicated_type(self):
+        slug = nl._wellness_filename_slug("meal", "breakfast", ["cinnamon roll"], None)
+        self.assertEqual(slug, "breakfast cinnamon roll")
+        empty = nl._wellness_filename_slug("meal", "unknown", [], None)
+        self.assertEqual(empty, "meal")
+        water = nl._wellness_filename_slug("water", "drink", [], 33.814)
+        self.assertIn("oz", water)

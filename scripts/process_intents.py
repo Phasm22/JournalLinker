@@ -39,6 +39,9 @@ Env vars (from .env or environment):
     INTENT_CORTEX_DIR            Obsidian cortex write target (default: <journal_dir>/cortex)
     INTENT_WELLNESS_DIR          Voice wellness note target
                                  (default: <journal_dir>/wellness; not under cortex/)
+    INTENT_WATER_BOTTLE_ML       Default water-bottle size in ml when the speaker
+                                 says "a water bottle" / "filled up my bottle"
+                                 (default: 1000)
     INTENT_STATE_DIR             local state directory
                                  (default: ~/.local/state/journal-linker/intents)
     INTENT_CLAUDE_IN_FLIGHT_TTL  seconds before in-flight entry is treated as stale
