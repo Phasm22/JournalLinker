@@ -117,8 +117,8 @@ NUTRITION_LEDGER_PROMPT = (
     "  is_intake: bool\n"
     "  water_oz: number|null  (fluid ounces; only for capture_type=water)\n"
     "  notes: string\n"
-    "  items: [{{label, kind, identity, quantity, unit, serving_basis, unresolved, needs_lookup, "
-    "calories_est, protein_g_est, carbs_g_est, fat_g_est, assumption}}]\n"
+    "  items: [{label, kind, identity, quantity, unit, serving_basis, unresolved, needs_lookup, "
+    "calories_est, protein_g_est, carbs_g_est, fat_g_est, assumption}]\n"
     "\n"
     "Splitting rules:\n"
     "- If they say \"for breakfast …\" and \"for lunch …\", emit two meal captures with those meal_slots.\n"
@@ -179,6 +179,45 @@ CORRECTION_PROMPT = (
     "Respond with one JSON object and no other text.\n"
     '{"corrections":[{"label":"Bev","quantity":2,"unit":"can","resolved_name":"","reason":"speaker said two, not one"}]}\n'
 )
+
+# Prompt constants that take substitutions (name -> required {name} placeholders).
+# JSON example braces are literal; never pass these through str.format().
+_PROMPT_FIELD_SPECS: dict[str, tuple[str, tuple[str, ...]]] = {
+    "NUTRITION_LEDGER_PROMPT": (NUTRITION_LEDGER_PROMPT, ()),
+    "NUTRITION_LOOKUP_PROMPT": (NUTRITION_LOOKUP_PROMPT, ("label",)),
+    "CORRECTION_PROMPT": (CORRECTION_PROMPT, ()),
+}
+
+
+def render_prompt(template: str, **fields: object) -> str:
+    """Substitute {name} placeholders without interpreting other braces (JSON-safe).
+
+    str.format() treats every {...} as a field, so prompts that embed JSON
+    schemas (e.g. {"status":...}) raise KeyError. Only replace the named
+    placeholders we pass in.
+    """
+    result = template
+    for key, value in fields.items():
+        token = "{" + key + "}"
+        if token not in result:
+            raise KeyError(f"prompt missing placeholder {{{key}}}")
+        result = result.replace(token, str(value))
+    return result
+
+
+def render_all_prompt_templates(**fields: object) -> dict[str, str]:
+    """Render every nutrition prompt through render_prompt (the real path).
+
+    Default field values cover required placeholders so tests can call this
+    with no args. Override via kwargs (e.g. label=\"Snickers\").
+    """
+    defaults = {"label": "Example Brand"}
+    defaults.update(fields)
+    rendered: dict[str, str] = {}
+    for name, (template, required) in _PROMPT_FIELD_SPECS.items():
+        kwargs = {key: defaults[key] for key in required}
+        rendered[name] = render_prompt(template, **kwargs)
+    return rendered
 
 
 def _log(msg: str) -> None:
@@ -1471,7 +1510,7 @@ def _normalize_lookup_payload(data: dict, urls: list[str], query: str) -> dict:
 def lookup_product(label: str, *, extra_context: str = "", model: str | None = None) -> dict:
     """One web_search call for a product label. Never sends the journal note."""
     query = f"{label} nutrition facts"
-    user = NUTRITION_LOOKUP_PROMPT.format(label=label)
+    user = render_prompt(NUTRITION_LOOKUP_PROMPT, label=label)
     if extra_context.strip():
         user += "\nContext:\n" + extra_context.strip()
         query = f"{label} nutrition facts\n{extra_context.strip()}"
@@ -1921,7 +1960,7 @@ def run_nutrition_stage(
 ) -> dict:
     """Parse new voice callouts. Failures stay inside this function.
 
-    Returns counts: {"intake_logged": int, "wellness_notes": int}.
+    Returns counts: {"intake_logged": int, "wellness_notes": int, "nutrition_failed": int}.
     """
     journal_dir = journal_dir or Path(source_path).parent
     if wellness_dir is None:
@@ -1929,6 +1968,7 @@ def run_nutrition_stage(
     chosen_model = os.getenv("INTENT_NUTRITION_MODEL", "").strip() or model or nutrition_model()
     logged = 0
     wellness_notes = 0
+    nutrition_failed = 0
     if not dry_run:
         try:
             retry_error_lookups(state_dir, journal_dir, model=chosen_model)
@@ -1938,7 +1978,7 @@ def run_nutrition_stage(
         callouts = extract_voice_callouts(note_text)
     except Exception as exc:
         _log(f"callout parse failed: {exc}")
-        return {"intake_logged": 0, "wellness_notes": 0}
+        return {"intake_logged": 0, "wellness_notes": 0, "nutrition_failed": 1}
     processed = load_processed_keys(state_dir)
     memory = load_memory(state_dir)
     cache = load_cache(state_dir)
@@ -1961,12 +2001,17 @@ def run_nutrition_stage(
             )
         except Exception as exc:
             _log(f"extract failed for {callout['spoken_at']}: {exc}")
+            nutrition_failed += 1
             continue
         logged += int(intake_n)
         wellness_notes += int(wellness_n)
         if not dry_run:
             processed.add(key)
-    return {"intake_logged": logged, "wellness_notes": wellness_notes}
+    return {
+        "intake_logged": logged,
+        "wellness_notes": wellness_notes,
+        "nutrition_failed": nutrition_failed,
+    }
 
 
 # ---------------------------------------------------------------------------

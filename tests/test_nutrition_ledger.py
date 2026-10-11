@@ -219,6 +219,7 @@ class TestStage(unittest.TestCase):
             result = nl.run_nutrition_stage(text, self.note, "2026-10-02", self.state)
         self.assertEqual(result["intake_logged"], 0)
         self.assertEqual(result["wellness_notes"], 0)
+        self.assertEqual(result["nutrition_failed"], 1)
         self.assertFalse(nl.processed_path(self.state).exists())
         self.assertFalse(nl.ledger_path(self.state).exists())
 
@@ -616,10 +617,88 @@ class TestPipelineHook(unittest.TestCase):
         saved = json.loads(payload.read_text(encoding="utf-8"))
         self.assertEqual(saved["nutrition_logged"], 1)
         self.assertEqual(saved["wellness_notes"], 1)
+        self.assertEqual(saved["nutrition_failed"], 0)
         self.assertEqual(pi.RunSummary().nutrition_logged, 0)
         wellness_notes = list((root / "wellness").glob("*.md"))
         self.assertEqual(len(wellness_notes), 1)
         self.assertFalse((root / "cortex" / "wellness").exists())
+
+    def test_nutrition_failed_surfaces_in_job_payload(self):
+        pi = _load_process_intents()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        note = root / "2026-10-10.md"
+        note.write_text("> [!voice] 23:55\n> I had a Snickers\n", encoding="utf-8")
+        state = root / "state"
+        state.mkdir()
+        payload = root / "payload.json"
+        payload_env = os.environ.get("JOURNAL_LINKER_JOB_PAYLOAD_FILE")
+        os.environ["JOURNAL_LINKER_JOB_PAYLOAD_FILE"] = str(payload)
+        try:
+            with mock.patch.object(nl, "call_nutrition_model", side_effect=RuntimeError('"status"')), \
+                    mock.patch.object(pi, "call_gate", return_value=[]):
+                code = pi.run_intent_pipeline(
+                    note,
+                    gate_model="test-gate",
+                    gate_style="qwen25",
+                    routing_model="test-route",
+                    cortex_dir=root / "cortex",
+                    state_dir=state,
+                    enrichment_mode="off",
+                    in_flight_ttl=30,
+                    dry_run=False,
+                    verbose=False,
+                )
+        finally:
+            if payload_env is None:
+                os.environ.pop("JOURNAL_LINKER_JOB_PAYLOAD_FILE", None)
+            else:
+                os.environ["JOURNAL_LINKER_JOB_PAYLOAD_FILE"] = payload_env
+        self.assertEqual(code, 0)
+        saved = json.loads(payload.read_text(encoding="utf-8"))
+        self.assertEqual(saved["nutrition_logged"], 0)
+        self.assertEqual(saved["wellness_notes"], 0)
+        self.assertEqual(saved["nutrition_failed"], 1)
+
+
+class TestPromptTemplates(unittest.TestCase):
+    def test_render_all_prompt_templates_survives_json_braces(self):
+        """Every prompt must render via render_prompt (not str.format).
+
+        Regression for live KeyError('\"status\"') when NUTRITION_LOOKUP_PROMPT
+        embedded a JSON schema and was passed through .format(label=...).
+        """
+        rendered = nl.render_all_prompt_templates(label="Snickers")
+        self.assertEqual(set(rendered), set(nl._PROMPT_FIELD_SPECS))
+        lookup = rendered["NUTRITION_LOOKUP_PROMPT"]
+        self.assertIn("Snickers", lookup)
+        self.assertIn('"status"', lookup)
+        self.assertIn('"ok|ambiguous|miss"', lookup)
+        # Literal JSON braces must remain single (not doubled by escaping).
+        self.assertIn('{"status":', lookup)
+        self.assertNotIn('{{"status"', lookup)
+        ledger = rendered["NUTRITION_LEDGER_PROMPT"]
+        self.assertIn('{"captures"', ledger)
+        self.assertIn("{label, kind, identity", ledger)
+        self.assertNotIn("{{label, kind", ledger)
+        correction = rendered["CORRECTION_PROMPT"]
+        self.assertIn('"corrections"', correction)
+        self.assertIn('{"corrections":', correction)
+
+    def test_lookup_product_builds_prompt_without_keyerror(self):
+        """lookup_product must not crash on JSON braces before the API call."""
+        env = {k: v for k, v in os.environ.items() if k != "OPENAI_API_KEY"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            result = nl.lookup_product("Snickers")
+        self.assertEqual(result["status"], "error")
+        self.assertIn("OPENAI_API_KEY", result.get("error") or "")
+
+    def test_str_format_still_fails_on_raw_lookup_prompt(self):
+        """Document why we avoid str.format: raw template still has JSON braces."""
+        with self.assertRaises(KeyError) as ctx:
+            nl.NUTRITION_LOOKUP_PROMPT.format(label="Snickers")
+        self.assertIn("status", str(ctx.exception))
 
 
 class TestWellnessCapture(unittest.TestCase):
