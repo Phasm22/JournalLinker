@@ -108,7 +108,7 @@ Unset behavior preserves legacy pipelines; set flags in `~/.config/journal-linke
 | `INTENT_PUSHOVER_URGENCIES` | *(unset → `immediate`, `today`, `soon`)* | Comma-separated subset of `immediate,today,soon,low` that may trigger a Pushover message. Example: `immediate,today` skips Pushover when the router sets `urgency=soon`. |
 
 
-Other useful intent variables (see the script docstring in-repo): `INTENT_GATE_MODEL`, `INTENT_ROUTING_MODEL`, `INTENT_STATE_DIR`, `INTENT_FEEDBACK_DELAY_TODAY`, `INTENT_FEEDBACK_DELAY_SOON`, `INTENT_CORTEX_DIR`, `INTENT_WELLNESS_DIR`, `OPENAI_API_KEY`, and the same `SCRIBE_PUSHOVER_*` keys as daily reflection.
+Other useful intent variables (see the script docstring in-repo): `INTENT_GATE_MODEL`, `INTENT_ROUTING_MODEL`, `INTENT_STATE_DIR`, `INTENT_FEEDBACK_DELAY_TODAY`, `INTENT_FEEDBACK_DELAY_SOON`, `INTENT_CORTEX_DIR`, `INTENT_WELLNESS_DIR`, `INTENT_WATER_BOTTLE_ML`, `OPENAI_API_KEY`, and the same `SCRIBE_PUSHOVER_*` keys as daily reflection.
 
 ### Telegram design contract + reactions + reply learning
 
