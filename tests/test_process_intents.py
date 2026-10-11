@@ -37,12 +37,37 @@ class TestGatePromptTemplates(unittest.TestCase):
         self.assertIn("category", prompt)
         self.assertIn("intent_class", prompt)
         self.assertIn("already handled", prompt)
+        self.assertIn("wellness stage", prompt)
+        self.assertIn("add X to today's log", prompt)
 
     def test_qwen25_prompt_uses_chatml(self):
         prompt = pi.build_gate_prompt("I need to call the doctor.", "qwen25")
         self.assertIn("<|im_start|>", prompt)
         self.assertIn("intents", prompt)
         self.assertIn("another system already handles", prompt)
+        self.assertIn("wellness stage", prompt)
+
+    def test_food_logging_intents_are_filtered(self):
+        kept = pi.filter_food_logging_intents([
+            {"intent_raw": "Add a protein bar to today's log", "category": "task", "intent_class": "task_intent"},
+            {"intent_raw": "Drink more water", "category": "reminder", "intent_class": "task_intent"},
+            {"intent_raw": "pick up eggs tomorrow", "category": "reminder", "intent_class": "task_intent"},
+            {"intent_raw": "grab basmati rice", "category": "task", "intent_class": "purchase_intent"},
+        ], "Need to pick up eggs tomorrow. Grab basmati rice.")
+        raws = [i["intent_raw"] for i in kept]
+        self.assertNotIn("Add a protein bar to today's log", raws)
+        self.assertNotIn("Drink more water", raws)
+        self.assertIn("pick up eggs tomorrow", raws)
+        self.assertIn("grab basmati rice", raws)
+
+    def test_gate_unparseable_output_is_empty_not_error(self):
+        self.assertEqual(pi._parse_gate_model_text(""), [])
+        self.assertEqual(pi._parse_gate_model_text("[]"), [])
+        self.assertEqual(pi._parse_gate_model_text("Sorry, nothing actionable."), [])
+        self.assertEqual(
+            pi._parse_gate_model_text('{"intents":[{"intent_raw":"buy eggs","category":"task","intent_class":"purchase_intent"}]}'),
+            [{"intent_raw": "buy eggs", "category": "task", "intent_class": "purchase_intent"}],
+        )
 
     def test_resolve_gate_style_auto_phi4(self):
         style = pi.resolve_gate_style("phi4:14b")
