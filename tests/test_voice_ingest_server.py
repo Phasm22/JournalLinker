@@ -163,11 +163,23 @@ class TestHttpEndpoint(unittest.TestCase):
         self.assertFalse((self.drop / "2026-09-30_09-26-57.m4a").exists())
 
     def test_oversize_rejected(self):
-        big = b"x" * ((1 << 20) + 1)
-        status, _ = self.post(big, {
-            "Content-Type": "audio/x-m4a", "X-Filename": "2026-09-30_09-26-57.m4a", "X-MD5": hashlib.md5(big).hexdigest(),
-        })
-        self.assertEqual(status, 413)
+        # The server rejects on Content-Length alone without reading the body, so
+        # send headers only: streaming 1 MiB into the closed socket races into
+        # BrokenPipeError on macOS (smaller socket buffers than Linux).
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.putrequest("POST", "/ingest")
+        for key, value in {
+            "Content-Type": "audio/x-m4a",
+            "X-Filename": "2026-09-30_09-26-57.m4a",
+            "X-MD5": hashlib.md5(b"x").hexdigest(),
+            "Content-Length": str((1 << 20) + 1),
+        }.items():
+            conn.putheader(key, value)
+        conn.endheaders()
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+        self.assertEqual(resp.status, 413)
 
     def _upload(self, name: str) -> tuple[int, str]:
         ctype, body = multipart(AUDIO)

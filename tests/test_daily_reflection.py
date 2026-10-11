@@ -1,4 +1,5 @@
 import contextlib
+import functools
 import importlib.util
 import io
 import json
@@ -444,6 +445,16 @@ class TestDailyReflection(unittest.TestCase):
                     daily_reflection,
                     "compute_target_send_time",
                     return_value=datetime(2026, 4, 9, 17, 0, 0),
+                ),
+                # Pin the clock inside the 16:00-21:00 window; otherwise main()
+                # uses datetime.now() and skips with "window closed" after 21:00.
+                mock.patch.object(
+                    daily_reflection,
+                    "run_daily_reflection",
+                    side_effect=functools.partial(
+                        daily_reflection.run_daily_reflection,
+                        now=datetime(2026, 4, 9, 18, 0, 0),
+                    ),
                 ),
                 mock.patch(
                     "sys.argv",
