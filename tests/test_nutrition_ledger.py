@@ -1188,7 +1188,8 @@ class TestLiveVlogRegression(unittest.TestCase):
 
     def test_bad_model_empty_meal_still_gets_water_from_text(self):
         # Mimic the live bug: model returns meal + empty items. Water must still
-        # be recovered from the utterance; empty meal must not write a note.
+        # be recovered from the utterance; continuation foods (Snickers) may also
+        # be injected from text when the model omitted them.
         text = self._note_text(LIVE_VLOG)
         bad = {
             "is_intake": True,
@@ -1204,13 +1205,13 @@ class TestLiveVlogRegression(unittest.TestCase):
                 text, self.note, "2026-10-10", self.state,
                 journal_dir=self.journal,
             )
-        self.assertEqual(result["wellness_notes"], 1)
+        self.assertGreaterEqual(result["wellness_notes"], 1)
         notes = list(self.wellness.glob("*.md"))
-        self.assertEqual(len(notes), 1)
-        body = notes[0].read_text(encoding="utf-8")
-        self.assertIn("type: water", body)
-        self.assertRegex(body, r"water_oz: 33\.8")
-        self.assertNotIn("meal meal", notes[0].name)
+        bodies = [p.read_text(encoding="utf-8") for p in notes]
+        self.assertTrue(any("type: water" in b for b in bodies))
+        water_body = next(b for b in bodies if "type: water" in b)
+        self.assertRegex(water_body, r"water_oz: 33\.8")
+        self.assertFalse(any("meal meal" in p.name for p in notes))
 
     def test_second_run_dedupes_after_success(self):
         text = self._note_text(LIVE_VLOG)
@@ -1350,6 +1351,102 @@ class TestLiveVlogRegression(unittest.TestCase):
             captures = nl.validate_captures(payload, text)
         self.assertEqual(len(captures), 1)
         self.assertAlmostEqual(float(captures[0]["water_oz"]), 2 * bottle, places=1)
+
+    def test_duplicate_water_caps_are_not_summed(self):
+        """Live PR#8 failure: model+text or two full water caps produced 2x totals."""
+        text = "I drank half a water bottle this morning and then another full one at work."
+        bottle = 1000 / nl.ML_PER_FL_OZ
+        want = 1.5 * bottle
+        payload = {
+            "captures": [
+                {
+                    "capture_type": "water", "is_intake": True, "water_oz": want,
+                    "items": [
+                        {"label": "water", "kind": "drink", "quantity": 0.5, "unit": "bottle"},
+                        {"label": "water", "kind": "drink", "quantity": 1, "unit": "bottle"},
+                    ],
+                },
+                {
+                    "capture_type": "water", "is_intake": True, "water_oz": want,
+                    "items": [
+                        {"label": "water", "kind": "drink", "quantity": 0.5, "unit": "bottle"},
+                        {"label": "water", "kind": "drink", "quantity": 1, "unit": "bottle"},
+                    ],
+                },
+            ],
+        }
+        with mock.patch.dict(os.environ, {"INTENT_WATER_BOTTLE_ML": "1000"}):
+            captures = nl.validate_captures(payload, text)
+        water = [c for c in captures if c["capture_type"] == "water"]
+        self.assertEqual(len(water), 1)
+        self.assertAlmostEqual(float(water[0]["water_oz"]), want, places=1)
+
+    def test_model_doubled_water_oz_falls_back_to_text(self):
+        text = "Drank a glass of water when I woke up and finished my water bottle at the gym."
+        bottle = 1000 / nl.ML_PER_FL_OZ
+        want = 8 + bottle
+        payload = {
+            "captures": [{
+                "capture_type": "water", "is_intake": True, "water_oz": 2 * want,
+                "items": [
+                    {"label": "water", "kind": "drink", "quantity": 1, "unit": "glass"},
+                    {"label": "water", "kind": "drink", "quantity": 1, "unit": "bottle"},
+                ],
+            }],
+        }
+        with mock.patch.dict(os.environ, {"INTENT_WATER_BOTTLE_ML": "1000"}):
+            captures = nl.validate_captures(payload, text)
+        self.assertAlmostEqual(float(captures[0]["water_oz"]), want, places=1)
+
+    def test_live_v01_missing_snickers_is_injected(self):
+        text = (
+            "Today, for breakfast, I had a cinnamon roll and a cold brew. For lunch, I had a bison "
+            "burger and truffle fries. I drank one water bottle. Also, a liter. Add a Snickers bar, "
+            "too. And some chicken biryani."
+        )
+        payload = {
+            "captures": [
+                {"capture_type": "meal", "meal_slot": "breakfast", "is_intake": True,
+                 "items": [{"label": "cinnamon roll", "quantity": 1}, {"label": "cold brew", "quantity": 1, "kind": "drink"}]},
+                {"capture_type": "meal", "meal_slot": "lunch", "is_intake": True,
+                 "items": [{"label": "bison burger", "quantity": 1}, {"label": "truffle fries", "quantity": 1}]},
+                {"capture_type": "meal", "meal_slot": "snack", "is_intake": True,
+                 "items": [{"label": "chicken biryani", "quantity": 1}]},
+                {"capture_type": "water", "is_intake": True, "water_oz": 33.814,
+                 "items": [{"label": "water", "quantity": 1, "unit": "bottle", "kind": "drink"}]},
+            ],
+        }
+        with mock.patch.dict(os.environ, {"INTENT_WATER_BOTTLE_ML": "1000"}):
+            captures = nl.validate_captures(payload, text)
+        labels = " ".join(i["label"] for c in captures for i in c.get("items") or [])
+        self.assertIn("Snickers", labels)
+        self.assertIn("biryani", labels.lower())
+
+    def test_could_go_for_wings_splits_from_want_to_eat(self):
+        text = "I had oatmeal for breakfast. I want pizza tonight, could go for some wings too."
+        payload = {
+            "captures": [
+                {"capture_type": "meal", "meal_slot": "breakfast", "is_intake": True,
+                 "items": [{"label": "oatmeal", "quantity": 1}]},
+                {"capture_type": "want_to_eat", "is_intake": False,
+                 "items": [{"label": "pizza", "quantity": 1}, {"label": "wings", "quantity": 1}],
+                 "notes": "pizza and wings for tonight"},
+            ],
+        }
+        captures = nl.validate_captures(payload, text)
+        by_type = {c["capture_type"]: c for c in captures}
+        self.assertIn("want_to_eat", by_type)
+        self.assertIn("craving", by_type)
+        self.assertEqual([i["label"] for i in by_type["want_to_eat"]["items"]], ["pizza"])
+        self.assertEqual([i["label"] for i in by_type["craving"]["items"]], ["wings"])
+
+    def test_empty_preference_recovered_from_text(self):
+        text = "I don't really like mushrooms, I'm more of an olive person."
+        captures = nl.validate_captures({"captures": []}, text)
+        self.assertEqual(len(captures), 1)
+        self.assertEqual(captures[0]["capture_type"], "preference")
+        labels = " ".join(i["label"] for i in captures[0]["items"]).lower()
+        self.assertIn("mushroom", labels)
 
     def test_restatement_still_collapses_model_double_count(self):
         text = "Finished my water bottle. It's a liter."

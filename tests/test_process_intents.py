@@ -60,6 +60,15 @@ class TestGatePromptTemplates(unittest.TestCase):
         self.assertIn("pick up eggs tomorrow", raws)
         self.assertIn("grab basmati rice", raws)
 
+    def test_gate_unparseable_output_is_empty_not_error(self):
+        self.assertEqual(pi._parse_gate_model_text(""), [])
+        self.assertEqual(pi._parse_gate_model_text("[]"), [])
+        self.assertEqual(pi._parse_gate_model_text("Sorry, nothing actionable."), [])
+        self.assertEqual(
+            pi._parse_gate_model_text('{"intents":[{"intent_raw":"buy eggs","category":"task","intent_class":"purchase_intent"}]}'),
+            [{"intent_raw": "buy eggs", "category": "task", "intent_class": "purchase_intent"}],
+        )
+
     def test_resolve_gate_style_auto_phi4(self):
         style = pi.resolve_gate_style("phi4:14b")
         self.assertEqual(style, "phi4")

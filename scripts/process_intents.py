@@ -467,6 +467,33 @@ def filter_food_logging_intents(intents: list[dict], source_text: str = "") -> l
     return kept
 
 
+def _parse_gate_model_text(raw_content: str) -> list[dict]:
+    """Parse gate model text; empty / non-JSON replies become no intents (not errors)."""
+    cleaned = _strip_think(raw_content or "").strip()
+    if not cleaned:
+        return []
+    # Bare empty array is a valid "nothing actionable" reply.
+    if cleaned in {"[]", "{}", '{"intents":[]}', '{"intents": []}'}:
+        return []
+    try:
+        gate_output = _extract_json_obj(cleaned)
+    except ValueError:
+        # Some models emit a top-level list of intent objects.
+        decoder = json.JSONDecoder()
+        for i, ch in enumerate(cleaned):
+            if ch != "[":
+                continue
+            try:
+                obj, _ = decoder.raw_decode(cleaned[i:])
+                if isinstance(obj, list):
+                    return _parse_gate_output({"intents": obj})
+            except json.JSONDecodeError:
+                continue
+        _log("gate", f"unparseable gate output (treating as no intents): {cleaned[:160]!r}")
+        return []
+    return _parse_gate_output(gate_output)
+
+
 def call_gate(note_text: str, model: str, style: str, num_ctx: int = 4096) -> list[dict]:
     """Run the gate model via Ollama. Returns a list of {intent_raw, category} dicts."""
     try:
@@ -481,18 +508,26 @@ def call_gate(note_text: str, model: str, style: str, num_ctx: int = 4096) -> li
     if not chunks:
         chunks = [note_text[:2000].strip()]
     merged: list[dict] = []
+    hard_errors: list[BaseException] = []
     for idx, excerpt in enumerate(chunks):
         prompt = build_gate_prompt(excerpt, style)
         _log("gate", f"calling model={model} style={style} chunk={idx + 1}/{len(chunks)}")
-        response = ollama.chat(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            options={"temperature": 0.0, "num_ctx": num_ctx},
-            keep_alive=KEEP_ALIVE,
-        )
-        raw_content = response["message"]["content"]
-        gate_output = _extract_json_obj(raw_content)
-        merged.extend(_parse_gate_output(gate_output))
+        try:
+            response = ollama.chat(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                options={"temperature": 0.0, "num_ctx": num_ctx},
+                keep_alive=KEEP_ALIVE,
+            )
+            raw_content = response["message"]["content"]
+            # Unparseable model prose → no intents for this chunk (not a hard failure).
+            merged.extend(_parse_gate_model_text(raw_content))
+        except Exception as exc:
+            hard_errors.append(exc)
+            _log("gate", f"chunk {idx + 1} failed: {exc}")
+    if hard_errors and not merged:
+        # Ollama down / transport errors must still surface as gate-transient.
+        raise hard_errors[0]
     return filter_food_logging_intents(_dedupe_intents(merged), note_text)
 
 

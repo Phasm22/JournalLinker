@@ -14,6 +14,8 @@ Run from a journalLinker checkout:
   .venv/bin/python scripts/food_vlog_harness.py --mode mock
   .venv/bin/python scripts/food_vlog_harness.py --mode live
   .venv/bin/python scripts/food_vlog_harness.py --mode live --json --skip-gate
+  .venv/bin/python scripts/food_vlog_harness.py --mode live --record
+      # dumps raw replies to tests/fixtures/food_vlog_live_replies.json
 """
 
 from __future__ import annotations
@@ -229,16 +231,27 @@ def run_e2e(variants: list[dict]) -> dict:
     }
 
 
-def run_live(variants: list[dict], skip_gate: bool) -> dict:
+def run_live(
+    variants: list[dict],
+    skip_gate: bool,
+    *,
+    record_path: Path | None = None,
+) -> dict:
     import process_intents as pi  # noqa: E402
 
     gate_model = os.getenv("INTENT_GATE_MODEL", pi.DEFAULT_GATE_MODEL)
     model = os.getenv("INTENT_NUTRITION_MODEL", "").strip() or nl.nutrition_model()
     results = []
+    recorded: dict[str, object] = {
+        "model": model,
+        "gate_model": gate_model,
+        "variants": {},
+    }
     for v in variants:
         raw = _raw_text(v)
         row: dict = {"id": v["id"]}
         t0 = time.time()
+        recovery_payload = None
         try:
             # Live extract only — never write ledger/notes or call web lookup.
             payload = nl.call_nutrition_model(
@@ -248,16 +261,17 @@ def run_live(variants: list[dict], skip_gate: bool) -> dict:
             )
             captures = nl.validate_captures(json.loads(json.dumps(payload)), raw)
             if nl.needs_food_recovery(captures, raw):
-                recovery = nl.call_nutrition_model(
+                recovery_payload = nl.call_nutrition_model(
                     nl.NUTRITION_RECOVERY_PROMPT,
                     nl.build_extract_user("21:00", raw, nl.empty_memory()),
                     model=model,
                 )
-                recovered = nl.validate_captures(json.loads(json.dumps(recovery)), raw)
+                recovered = nl.validate_captures(json.loads(json.dumps(recovery_payload)), raw)
                 if any(c.get("capture_type") != "water" and c.get("items") for c in recovered):
                     captures = recovered
             row.update(raw_model=payload, fails=score(v, captures), got=summarize(captures))
         except Exception as exc:  # report, keep going
+            payload = None
             row.update(fails=[f"extract error: {exc}"], got=[])
         row["extract_s"] = round(time.time() - t0, 1)
         if not skip_gate:
@@ -269,9 +283,28 @@ def run_live(variants: list[dict], skip_gate: bool) -> dict:
                 row["gate_verdict"] = score_gate(v, intents)
             except Exception as exc:
                 row["gate"], row["gate_verdict"] = [f"error: {exc}"], "ERROR"
+                row["gate_error"] = str(exc)
+        if record_path is not None:
+            recorded["variants"][v["id"]] = {
+                "text": v["text"],
+                "raw_model": row.get("raw_model"),
+                "recovery_model": recovery_payload,
+                "fails": row.get("fails"),
+                "got": row.get("got"),
+                "gate": row.get("gate"),
+                "gate_verdict": row.get("gate_verdict"),
+                "gate_error": row.get("gate_error"),
+            }
         results.append(row)
         status = "PASS" if not row["fails"] else "FAIL"
-        print(f"{v['id']}: {status} {row.get('gate_verdict', '')}", file=sys.stderr, flush=True)
+        gate_bit = row.get("gate_verdict", "")
+        if row.get("gate_error"):
+            gate_bit = f"ERROR:{row['gate_error'][:80]}"
+        print(f"{v['id']}: {status} {gate_bit}", file=sys.stderr, flush=True)
+    if record_path is not None:
+        record_path.parent.mkdir(parents=True, exist_ok=True)
+        record_path.write_text(json.dumps(recorded, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        print(f"wrote raw live replies to {record_path}", file=sys.stderr)
     return {"model": model, "gate_model": gate_model, "variants": results}
 
 
@@ -281,9 +314,20 @@ def main() -> int:
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--skip-gate", action="store_true")
     ap.add_argument("--cases", type=Path, default=CASES_PATH)
+    ap.add_argument(
+        "--record",
+        type=Path,
+        nargs="?",
+        const=REPO / "tests" / "fixtures" / "food_vlog_live_replies.json",
+        default=None,
+        help="Live mode: dump raw model replies (default path if flag given with no value)",
+    )
     args = ap.parse_args()
     variants = load_cases(args.cases)
-    out = run_mock(variants) if args.mode == "mock" else run_live(variants, args.skip_gate)
+    if args.mode == "mock":
+        out = run_mock(variants)
+    else:
+        out = run_live(variants, args.skip_gate, record_path=args.record)
     if args.json:
         print(json.dumps(out, indent=1, ensure_ascii=False))
         return 0
@@ -294,9 +338,17 @@ def main() -> int:
         total += 1
         if r["fails"]:
             fails += 1
-        print(f"{r['id']:<4} {r.get('flavor', 'live'):<9} {status}  {'; '.join(r['fails'])}")
+        extra = " ".join(r["fails"])
+        if r.get("gate_error"):
+            extra = (extra + " | gate: " + r["gate_error"]).strip(" |")
+        elif r.get("gate_verdict") in {"ERROR", "LEAK", "MISS"}:
+            extra = (extra + f" | gate={r['gate_verdict']}").strip(" |")
+        print(f"{r['id']:<4} {r.get('flavor', 'live'):<9} {status}  {extra}")
         for line in r["got"]:
             print(f"      {line}")
+        if r.get("gate") and r.get("gate_verdict") not in {None, "ok", "info"}:
+            for g in r["gate"]:
+                print(f"      gate: {g}")
     if "e2e" in out:
         print("e2e:", json.dumps(out["e2e"]))
     passed = total - fails

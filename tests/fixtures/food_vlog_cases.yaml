@@ -125,7 +125,6 @@ variants:
     - capture_type: meal
       meal_slot: breakfast
       is_intake: true
-      water_oz: null
       items:
       - label: cinnamon roll
         kind: food
@@ -145,7 +144,6 @@ variants:
     - capture_type: meal
       meal_slot: lunch
       is_intake: true
-      water_oz: null
       items:
       - label: bison burger
         kind: food
@@ -162,23 +160,9 @@ variants:
         serving_basis: default_serving
         needs_lookup: false
       notes: ''
-    - capture_type: craving
+    - capture_type: meal
       meal_slot: snack
-      is_intake: false
-      water_oz: null
-      items:
-      - label: Snickers bar
-        kind: food
-        identity: branded
-        quantity: 1
-        unit: bar
-        serving_basis: default_serving
-        needs_lookup: true
-      notes: ''
-    - capture_type: craving
-      meal_slot: unknown
-      is_intake: false
-      water_oz: null
+      is_intake: true
       items:
       - label: chicken biryani
         kind: food
@@ -191,7 +175,7 @@ variants:
     - capture_type: water
       meal_slot: drink
       is_intake: true
-      water_oz: 67.628
+      water_oz: 33.81405650328842
       items:
       - label: water
         kind: drink
@@ -200,15 +184,9 @@ variants:
         unit: bottle
         serving_basis: default_serving
         needs_lookup: false
-      - label: water
-        kind: drink
-        identity: generic
-        quantity: 1
-        unit: l
-        serving_basis: default_serving
-        needs_lookup: false
       notes: ''
-  failure_mode: 'the original live bug: bottle+liter summed, continuations as cravings'
+  failure_mode: 'the original live bug: bottle+liter summed, continuations as cravings | live PR#8 shape'
+  live_mistaken: true
 - id: v02
   category: recap, 3 meals + glasses
   text: Okay so quick update, it's like nine pm. For breakfast I just had two eggs and toast, uh, lunch was a Chipotle bowl,
@@ -414,8 +392,48 @@ variants:
         serving_basis: stated
         needs_lookup: false
       notes: ''
-  mistaken: null
-  failure_mode: ''
+  mistaken:
+    captures:
+    - capture_type: water
+      is_intake: true
+      water_oz: 50.72108475493263
+      items:
+      - label: water
+        kind: drink
+        identity: generic
+        quantity: 0.5
+        unit: bottle
+        serving_basis: stated
+        needs_lookup: false
+      - label: water
+        kind: drink
+        identity: generic
+        quantity: 1
+        unit: bottle
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+    - capture_type: water
+      is_intake: true
+      water_oz: 50.72108475493263
+      items:
+      - label: water
+        kind: drink
+        identity: generic
+        quantity: 0.5
+        unit: bottle
+        serving_basis: stated
+        needs_lookup: false
+      - label: water
+        kind: drink
+        identity: generic
+        quantity: 1
+        unit: bottle
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+  failure_mode: ' | live PR#8 shape'
+  live_mistaken: true
 - id: v05
   category: oz + ml bottle
   text: Drank 16 ounces of water after my run, and then a 500 ml bottle at lunch.
@@ -445,8 +463,48 @@ variants:
         serving_basis: stated
         needs_lookup: false
       notes: ''
-  mistaken: null
-  failure_mode: ''
+  mistaken:
+    captures:
+    - capture_type: meal
+      is_intake: true
+      meal_slot: unknown
+      items:
+      - label: water
+        kind: drink
+        quantity: 16
+        unit: oz
+        identity: generic
+        serving_basis: stated
+        needs_lookup: false
+      - label: water
+        kind: drink
+        quantity: 500
+        unit: ml
+        identity: generic
+        serving_basis: stated
+        needs_lookup: false
+      notes: ''
+    - capture_type: water
+      is_intake: true
+      water_oz: 32.907028251644206
+      items:
+      - label: water
+        kind: drink
+        quantity: 16
+        unit: oz
+        identity: generic
+        serving_basis: stated
+        needs_lookup: false
+      - label: water
+        kind: drink
+        quantity: 500
+        unit: ml
+        identity: generic
+        serving_basis: stated
+        needs_lookup: false
+      notes: ''
+  failure_mode: ' | live PR#8 shape'
+  live_mistaken: true
 - id: v06
   category: liter then bottle (separate)
   text: I had a liter of water at the gym and a water bottle at home.
@@ -476,8 +534,48 @@ variants:
         serving_basis: default_serving
         needs_lookup: false
       notes: ''
-  mistaken: null
-  failure_mode: ''
+  mistaken:
+    captures:
+    - capture_type: water
+      is_intake: true
+      water_oz: 67.62811300657684
+      items:
+      - label: water
+        kind: drink
+        identity: generic
+        quantity: 1
+        unit: l
+        serving_basis: default_serving
+        needs_lookup: false
+      - label: water
+        kind: drink
+        identity: generic
+        quantity: 1
+        unit: bottle
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+    - capture_type: water
+      is_intake: true
+      water_oz: 67.62811300657684
+      items:
+      - label: water
+        kind: drink
+        identity: generic
+        quantity: 1
+        unit: l
+        serving_basis: default_serving
+        needs_lookup: false
+      - label: water
+        kind: drink
+        identity: generic
+        quantity: 1
+        unit: bottle
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+  failure_mode: ' | live PR#8 shape'
+  live_mistaken: true
 - id: v07
   category: bottle restated as liter
   text: Finished my water bottle. It's a liter.
@@ -621,8 +719,29 @@ variants:
         serving_basis: default_serving
         needs_lookup: false
       notes: ''
-  mistaken: null
-  failure_mode: ''
+  mistaken:
+    captures:
+    - capture_type: water
+      is_intake: true
+      water_oz: 83.62811300657684
+      items:
+      - label: water
+        kind: drink
+        identity: generic
+        quantity: 1
+        unit: glass
+        serving_basis: default_serving
+        needs_lookup: false
+      - label: water
+        kind: drink
+        identity: generic
+        quantity: 1
+        unit: bottle
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+  failure_mode: ' | live PR#8 shape'
+  live_mistaken: true
 - id: v11
   category: sparkling vs plain
   text: Had a sparkling water and a LaCroix with lunch, and a big glass of water before bed.
@@ -962,8 +1081,41 @@ variants:
         serving_basis: default_serving
         needs_lookup: false
       notes: ''
-  mistaken: null
-  failure_mode: ''
+  mistaken:
+    captures:
+    - capture_type: meal
+      meal_slot: breakfast
+      is_intake: true
+      items:
+      - label: oatmeal
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: oatmeal for breakfast
+    - capture_type: want_to_eat
+      meal_slot: unknown
+      is_intake: false
+      items:
+      - label: pizza
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      - label: wings
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: pizza and wings for tonight
+  failure_mode: ' | live PR#8 shape'
+  live_mistaken: true
 - id: v16
   category: '''add X to my log'' with no I-had'
   text: Add a protein bar to today's log.
@@ -1267,8 +1419,10 @@ variants:
         serving_basis: default_serving
         needs_lookup: false
       notes: ''
-  mistaken: null
-  failure_mode: ''
+  mistaken:
+    captures: []
+  failure_mode: ' | live PR#8 shape'
+  live_mistaken: true
 - id: v20
   category: groceries bought, not eaten
   text: Went to Costco, bought a huge bag of rice and frozen dumplings. Need to pick up eggs tomorrow.
