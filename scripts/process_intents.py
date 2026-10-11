@@ -7,8 +7,9 @@ to Pushover / Obsidian cortex/ / JSON digest queue.
 
 Also runs a voice wellness/nutrition stage (see nutrition_ledger.py) that extracts
 meal|water|craving|want_to_cook|preference captures from `> [!voice]` callouts into
-cortex/wellness/ notes with filterable YAML frontmatter (plus the calorie JSONL ledger
-for intake).
+<journal_dir>/wellness/ notes with filterable YAML frontmatter (plus the calorie JSONL
+ledger for intake). Wellness stays outside cortex/ so llmLibrarian and AnythingLLM
+vault sync both index it.
 
 Usage:
     python3 scripts/process_intents.py --file /path/to/2026-04-16.md
@@ -36,6 +37,8 @@ Env vars (from .env or environment):
                                  OpenAI model for branded nutrition lookup
                                  (default: gpt-4o-mini)
     INTENT_CORTEX_DIR            Obsidian cortex write target (default: <journal_dir>/cortex)
+    INTENT_WELLNESS_DIR          Voice wellness note target
+                                 (default: <journal_dir>/wellness; not under cortex/)
     INTENT_STATE_DIR             local state directory
                                  (default: ~/.local/state/journal-linker/intents)
     INTENT_CLAUDE_IN_FLIGHT_TTL  seconds before in-flight entry is treated as stale
@@ -2578,6 +2581,16 @@ def _intent_exit_code(delivery_result: dict, dry_run: bool) -> tuple[str, int]:
     return "succeeded", EXIT_SUCCESS
 
 
+def resolve_wellness_dir(journal_dir: Path | None = None) -> Path | None:
+    """Wellness notes root: $INTENT_WELLNESS_DIR or <journal_dir>/wellness."""
+    raw = os.getenv("INTENT_WELLNESS_DIR", "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    if journal_dir is not None:
+        return Path(journal_dir).expanduser() / "wellness"
+    return None
+
+
 def _run_nutrition_stage(
     note_text: str,
     source_path: Path,
@@ -2586,7 +2599,7 @@ def _run_nutrition_stage(
     *,
     dry_run: bool,
     model: str,
-    cortex_dir: Path | None = None,
+    wellness_dir: Path | None = None,
 ) -> dict:
     """Log voice intake + wellness captures. Never changes the intent exit code."""
     empty = {"intake_logged": 0, "wellness_notes": 0}
@@ -2595,15 +2608,16 @@ def _run_nutrition_stage(
         if str(scripts_dir) not in sys.path:
             sys.path.insert(0, str(scripts_dir))
         import nutrition_ledger
+        journal_dir = source_path.parent
         result = nutrition_ledger.run_nutrition_stage(
             note_text,
             source_path,
             source_date,
             state_dir,
             dry_run=dry_run,
-            journal_dir=source_path.parent,
+            journal_dir=journal_dir,
             model=model,
-            cortex_dir=cortex_dir,
+            wellness_dir=wellness_dir or resolve_wellness_dir(journal_dir),
         )
         if isinstance(result, dict):
             return {
@@ -2631,6 +2645,7 @@ def run_intent_pipeline(
     verbose: bool,
     existing_idempotency_key: str | None = None,
     emit_payload: bool = True,
+    wellness_dir: Path | None = None,
 ) -> int:
     """Run the full intent pipeline for one note. Returns an exit code."""
     summary = RunSummary(source_file=source_path.name)
@@ -2669,9 +2684,12 @@ def run_intent_pipeline(
     journal_timestamp = infer_journal_timestamp(source_path)
     source_date = journal_timestamp[:10]  # YYYY-MM-DD
 
+    if wellness_dir is None:
+        wellness_dir = resolve_wellness_dir(source_path.parent)
+
     nutrition_counts = _run_nutrition_stage(
         note_text, source_path, source_date, state_dir,
-        dry_run=dry_run, model=gate_model, cortex_dir=cortex_dir,
+        dry_run=dry_run, model=gate_model, wellness_dir=wellness_dir,
     )
     summary.nutrition_logged = nutrition_counts["intake_logged"]
     summary.wellness_notes = nutrition_counts["wellness_notes"]
@@ -3002,6 +3020,7 @@ def run_retry(
     in_flight_ttl: int,
     dry_run: bool,
     verbose: bool,
+    wellness_dir: Path | None = None,
 ) -> int:
     """Replay pending transient failures from the retry queue."""
     entries = load_retry_queue(state_dir)
@@ -3040,6 +3059,7 @@ def run_retry(
             verbose=verbose,
             existing_idempotency_key=key,
             emit_payload=False,
+            wellness_dir=wellness_dir,
         )
         if exit_code == EXIT_SUCCESS:
             summary.retry_queue_out += 1
@@ -3268,6 +3288,14 @@ def parse_cli() -> argparse.Namespace:
         help="Obsidian cortex write target (default: $INTENT_CORTEX_DIR or <journal_dir>/cortex).",
     )
     parser.add_argument(
+        "--wellness-dir",
+        default=os.getenv("INTENT_WELLNESS_DIR"),
+        help=(
+            "Voice wellness note target "
+            "(default: $INTENT_WELLNESS_DIR or <journal_dir>/wellness)."
+        ),
+    )
+    parser.add_argument(
         "--state-dir",
         default=os.getenv("INTENT_STATE_DIR"),
         help="Local state directory (default: $INTENT_STATE_DIR or ~/.local/state/journal-linker/intents).",
@@ -3325,6 +3353,13 @@ def main() -> int:
     else:
         cortex_dir = Path.home() / "cortex"
 
+    # Wellness dir (sibling of daily notes; never under cortex/)
+    if args.wellness_dir:
+        wellness_dir = Path(args.wellness_dir).expanduser()
+    else:
+        journal_for_wellness = Path(args.journal_dir).expanduser() if args.journal_dir else None
+        wellness_dir = resolve_wellness_dir(journal_for_wellness)
+
     pipeline_kwargs = dict(
         gate_model=gate_model,
         gate_style=gate_style,
@@ -3335,6 +3370,7 @@ def main() -> int:
         in_flight_ttl=in_flight_ttl,
         dry_run=args.dry_run,
         verbose=args.verbose,
+        wellness_dir=wellness_dir,
     )
 
     # Retry mode

@@ -3,6 +3,10 @@
 
 Reads `> [!voice] HH:MM` blocks, asks a local model what was eaten or drunk,
 looks up branded names on the web, and appends one JSONL row per intake.
+Also classifies wellness captures (meal|water|craving|want_to_cook|preference)
+and writes structured notes under <journal_dir>/wellness/ (override with
+INTENT_WELLNESS_DIR) — never under cortex/, which vault indexers skip.
+
 A separate `--summary` command sends one end-of-day Pushover and scores the
 previous journal day against nutrition_memory.json.
 
@@ -62,8 +66,9 @@ KEEP_ALIVE = "5m"
 MEAL_SLOTS = {"breakfast", "lunch", "dinner", "snack", "drink", "unknown"}
 IDENTITIES = {"generic", "branded", "unresolved"}
 KINDS = {"food", "drink"}
-# Voice wellness capture types written to cortex/wellness/ for downstream
-# filtering (AI chef, grocery lists). meal/water are intake; the rest are not.
+# Voice wellness capture types written to <journal_dir>/wellness/ (not cortex —
+# llmLibrarian and AnythingLLM vault sync both skip directories named cortex).
+# meal/water are intake; the rest are not.
 CAPTURE_TYPES = {"meal", "water", "craving", "want_to_cook", "preference", "none"}
 INTAKE_CAPTURE_TYPES = {"meal", "water"}
 WELLNESS_CAPTURE_TYPES = {"meal", "water", "craving", "want_to_cook", "preference"}
@@ -1185,8 +1190,23 @@ def resolve_branded_item(
 
 
 # ---------------------------------------------------------------------------
-# Cortex wellness notes (filterable by llmLibrarian / AI chef)
+# Wellness notes under <journal_dir>/wellness/ (filterable by vault indexers)
 # ---------------------------------------------------------------------------
+
+def resolve_wellness_dir(journal_dir: Path | None = None) -> Path | None:
+    """Return wellness write root: $INTENT_WELLNESS_DIR or <journal_dir>/wellness.
+
+    Kept under the journal dir (sibling of daily notes, not under cortex/) so
+    llmLibrarian and AnythingLLM vault sync both index it. Paths stay relative
+    to the vault root that syncs from the PC to the Mac.
+    """
+    raw = os.getenv("INTENT_WELLNESS_DIR", "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    if journal_dir is not None:
+        return Path(journal_dir).expanduser() / "wellness"
+    return None
+
 
 def _yaml_double_quoted(value: str) -> str:
     escaped = str(value or "").replace("\\", "\\\\").replace('"', '\\"')
@@ -1210,8 +1230,8 @@ def item_labels(items: list[dict]) -> list[str]:
     return labels
 
 
-def write_wellness_cortex_note(
-    cortex_dir: Path,
+def write_wellness_note(
+    wellness_dir: Path,
     *,
     capture_type: str,
     source_date: str,
@@ -1223,15 +1243,14 @@ def write_wellness_cortex_note(
     meal_slot: str = "unknown",
     notes: str = "",
 ) -> Path:
-    """Write a structured wellness note under cortex/wellness/ for vault indexing."""
-    subdir = cortex_dir / "wellness"
-    subdir.mkdir(parents=True, exist_ok=True)
+    """Write a structured wellness note under wellness_dir for vault indexing."""
+    wellness_dir.mkdir(parents=True, exist_ok=True)
     labels = item_labels(items)
     label_slug = re.sub(r'[<>:"/\\|?*]', "-", " ".join(labels[:3])).strip("-").strip()
     if not label_slug:
         label_slug = capture_type
     key_prefix = (span_id or "")[:8] or "note"
-    note_path = subdir / f"{source_date} {capture_type} {label_slug} {key_prefix}.md"
+    note_path = wellness_dir / f"{source_date} {capture_type} {label_slug} {key_prefix}.md"
     created = f"{source_date}T{spoken_at}:00" if spoken_at else source_date
     water_line = "null" if water_oz is None else str(_clean_qty(float(water_oz)))
     fm_lines = [
@@ -1282,7 +1301,7 @@ def _process_callout(
     dry_run: bool,
     journal_dir: Path | None,
     model: str | None,
-    cortex_dir: Path | None = None,
+    wellness_dir: Path | None = None,
 ) -> tuple[bool, bool, dict | None]:
     """Return (wrote_intake, wrote_wellness, row). Raises if the extract model fails."""
     user = build_extract_user(callout["spoken_at"], callout["raw_text"], memory)
@@ -1319,10 +1338,10 @@ def _process_callout(
         save_memory(state_dir, memory)
         save_cache(state_dir, cache)
     wellness_path = ""
-    if wrote_wellness and cortex_dir is not None:
+    if wrote_wellness and wellness_dir is not None:
         try:
-            note_path = write_wellness_cortex_note(
-                cortex_dir,
+            note_path = write_wellness_note(
+                wellness_dir,
                 capture_type=capture_type,
                 source_date=source_date,
                 spoken_at=callout["spoken_at"],
@@ -1335,10 +1354,10 @@ def _process_callout(
             )
             wellness_path = str(note_path)
         except Exception as exc:
-            _log(f"wellness cortex write failed: {exc}")
+            _log(f"wellness write failed: {exc}")
             wrote_wellness = False
-    elif wrote_wellness and cortex_dir is None:
-        _log("wellness capture skipped: no cortex_dir")
+    elif wrote_wellness and wellness_dir is None:
+        _log("wellness capture skipped: no wellness_dir")
         wrote_wellness = False
     append_processed(state_dir, {
         "idempotency_key": key,
@@ -1396,13 +1415,15 @@ def run_nutrition_stage(
     dry_run: bool = False,
     journal_dir: Path | None = None,
     model: str | None = None,
-    cortex_dir: Path | None = None,
+    wellness_dir: Path | None = None,
 ) -> dict:
     """Parse new voice callouts. Failures stay inside this function.
 
     Returns counts: {"intake_logged": int, "wellness_notes": int}.
     """
     journal_dir = journal_dir or Path(source_path).parent
+    if wellness_dir is None:
+        wellness_dir = resolve_wellness_dir(journal_dir)
     chosen_model = os.getenv("INTENT_NUTRITION_MODEL", "").strip() or model or nutrition_model()
     logged = 0
     wellness_notes = 0
@@ -1434,7 +1455,7 @@ def run_nutrition_stage(
                 dry_run=dry_run,
                 journal_dir=journal_dir,
                 model=chosen_model,
-                cortex_dir=cortex_dir,
+                wellness_dir=wellness_dir,
             )
         except Exception as exc:
             _log(f"extract failed for {callout['spoken_at']}: {exc}")

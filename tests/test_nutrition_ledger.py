@@ -129,13 +129,13 @@ class TestStage(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def _run(self, text, payload, lookup=None, cortex_dir=None):
+    def _run(self, text, payload, lookup=None, wellness_dir=None):
         with mock.patch.object(nl, "call_nutrition_model", return_value=payload) as model, \
                 mock.patch.object(nl, "lookup_product", side_effect=lookup) as web:
             result = nl.run_nutrition_stage(
                 text, self.note, "2026-10-02", self.state,
                 journal_dir=self.journal,
-                cortex_dir=cortex_dir,
+                wellness_dir=wellness_dir,
             )
         return result, model, web
 
@@ -604,7 +604,7 @@ class TestPipelineHook(unittest.TestCase):
                     state_dir=state,
                     enrichment_mode="off",
                     in_flight_ttl=30,
-                    dry_run=True,
+                    dry_run=False,
                     verbose=False,
                 )
         finally:
@@ -617,6 +617,9 @@ class TestPipelineHook(unittest.TestCase):
         self.assertEqual(saved["nutrition_logged"], 1)
         self.assertEqual(saved["wellness_notes"], 1)
         self.assertEqual(pi.RunSummary().nutrition_logged, 0)
+        wellness_notes = list((root / "wellness").glob("*.md"))
+        self.assertEqual(len(wellness_notes), 1)
+        self.assertFalse((root / "cortex" / "wellness").exists())
 
 
 class TestWellnessCapture(unittest.TestCase):
@@ -626,11 +629,20 @@ class TestWellnessCapture(unittest.TestCase):
         self.state.mkdir()
         self.journal = Path(self.tmp.name) / "journal"
         self.journal.mkdir()
-        self.cortex = Path(self.tmp.name) / "cortex"
+        self.wellness = self.journal / "wellness"
         self.note = self.journal / "2026-10-02.md"
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def test_resolve_wellness_dir_defaults_under_journal(self):
+        path = nl.resolve_wellness_dir(self.journal)
+        self.assertEqual(path, self.journal / "wellness")
+
+    def test_resolve_wellness_dir_env_override(self):
+        override = Path(self.tmp.name) / "custom-wellness"
+        with mock.patch.dict(os.environ, {"INTENT_WELLNESS_DIR": str(override)}):
+            self.assertEqual(nl.resolve_wellness_dir(self.journal), override)
 
     def test_validate_craving_keeps_items_without_intake(self):
         parsed = nl.validate_extract({
@@ -681,7 +693,7 @@ class TestWellnessCapture(unittest.TestCase):
         })
         self.assertEqual(parsed["capture_type"], "meal")
 
-    def test_craving_writes_cortex_note_not_calorie_ledger(self):
+    def test_craving_writes_journal_wellness_note_not_calorie_ledger(self):
         text = "> [!voice] 15:00\n> I'm craving pizza\n"
         payload = {
             "is_intake": False,
@@ -699,13 +711,16 @@ class TestWellnessCapture(unittest.TestCase):
         with mock.patch.object(nl, "call_nutrition_model", return_value=payload):
             result = nl.run_nutrition_stage(
                 text, self.note, "2026-10-02", self.state,
-                journal_dir=self.journal, cortex_dir=self.cortex,
+                journal_dir=self.journal,
             )
         self.assertEqual(result["intake_logged"], 0)
         self.assertEqual(result["wellness_notes"], 1)
         self.assertFalse(nl.ledger_path(self.state).exists())
-        notes = list((self.cortex / "wellness").glob("*.md"))
+        # Must be <journal>/wellness/, never under cortex/ (indexers skip cortex).
+        notes = list(self.wellness.glob("*.md"))
         self.assertEqual(len(notes), 1)
+        self.assertEqual(notes[0].parent, self.wellness)
+        self.assertNotIn("cortex", notes[0].parts)
         content = notes[0].read_text(encoding="utf-8")
         self.assertIn("type: craving", content)
         self.assertIn('items: ["pizza"]', content)
@@ -737,10 +752,10 @@ class TestWellnessCapture(unittest.TestCase):
                 with mock.patch.object(nl, "call_nutrition_model", return_value=payload):
                     result = nl.run_nutrition_stage(
                         text, self.note, "2026-10-02", state,
-                        journal_dir=self.journal, cortex_dir=self.cortex,
+                        journal_dir=self.journal,
                     )
                 self.assertEqual(result["wellness_notes"], 1)
-                matches = list((self.cortex / "wellness").glob(f"* {capture_type} *.md"))
+                matches = list(self.wellness.glob(f"* {capture_type} *.md"))
                 self.assertTrue(matches)
                 body = matches[-1].read_text(encoding="utf-8")
                 self.assertIn(f"type: {capture_type}", body)
@@ -765,11 +780,14 @@ class TestWellnessCapture(unittest.TestCase):
         with mock.patch.object(nl, "call_nutrition_model", return_value=payload):
             result = nl.run_nutrition_stage(
                 text, self.note, "2026-10-02", self.state,
-                journal_dir=self.journal, cortex_dir=self.cortex,
+                journal_dir=self.journal,
             )
         self.assertEqual(result["intake_logged"], 1)
         self.assertEqual(result["wellness_notes"], 1)
         self.assertEqual(len(nl.load_ledger_rows(self.state)), 1)
-        notes = list((self.cortex / "wellness").glob("*.md"))
+        notes = list(self.wellness.glob("*.md"))
         self.assertEqual(len(notes), 1)
+        self.assertEqual(notes[0].parent.name, "wellness")
         self.assertIn("type: meal", notes[0].read_text(encoding="utf-8"))
+        # Confirm nothing landed under a cortex tree.
+        self.assertFalse((self.journal / "cortex").exists())
