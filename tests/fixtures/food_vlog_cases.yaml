@@ -1,0 +1,1767 @@
+version: 1
+bottle_ml: 1000
+description: Food-vlog variants for nutrition validate_captures + optional live Ollama.
+variants:
+- id: v01
+  category: replay 23:55
+  text: Today, for breakfast, I had a cinnamon roll and a cold brew. For lunch, I had a bison burger and truffle fries. I
+    drank one water bottle. Also, a liter. Add a Snickers bar, too. And some chicken biryani.
+  expect:
+    intake:
+    - keyword: cinnamon roll
+      slots:
+      - breakfast
+      qty: 1
+    - keyword: cold brew
+      slots:
+      - breakfast
+      qty: 1
+    - keyword: bison burger
+      slots:
+      - lunch
+      qty: 1
+    - keyword: truffle fries
+      slots:
+      - lunch
+      qty: 1
+    - keyword: snickers
+      slots:
+      - snack
+      - unknown
+      - lunch
+      - dinner
+      - breakfast
+      - drink
+      qty: 1
+    - keyword: biryani
+      slots:
+      - snack
+      - unknown
+      - lunch
+      - dinner
+      - breakfast
+      - drink
+      qty: 1
+    water_oz: 33.81405650328842
+    craving: []
+    gate: none
+  clean:
+    captures:
+    - capture_type: meal
+      meal_slot: breakfast
+      is_intake: true
+      water_oz: null
+      items:
+      - label: cinnamon roll
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      - label: cold brew
+        kind: drink
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+    - capture_type: meal
+      meal_slot: lunch
+      is_intake: true
+      water_oz: null
+      items:
+      - label: bison burger
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      - label: truffle fries
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+    - capture_type: meal
+      meal_slot: snack
+      is_intake: true
+      water_oz: null
+      items:
+      - label: Snickers bar
+        kind: food
+        identity: branded
+        quantity: 1
+        unit: bar
+        serving_basis: default_serving
+        needs_lookup: true
+      - label: chicken biryani
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+    - capture_type: water
+      meal_slot: drink
+      is_intake: true
+      water_oz: 33.81405650328842
+      items:
+      - label: water
+        kind: drink
+        identity: generic
+        quantity: 1
+        unit: bottle
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+  mistaken:
+    captures:
+    - capture_type: meal
+      meal_slot: breakfast
+      is_intake: true
+      water_oz: null
+      items:
+      - label: cinnamon roll
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      - label: cold brew
+        kind: drink
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+    - capture_type: meal
+      meal_slot: lunch
+      is_intake: true
+      water_oz: null
+      items:
+      - label: bison burger
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      - label: truffle fries
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+    - capture_type: craving
+      meal_slot: snack
+      is_intake: false
+      water_oz: null
+      items:
+      - label: Snickers bar
+        kind: food
+        identity: branded
+        quantity: 1
+        unit: bar
+        serving_basis: default_serving
+        needs_lookup: true
+      notes: ''
+    - capture_type: craving
+      meal_slot: unknown
+      is_intake: false
+      water_oz: null
+      items:
+      - label: chicken biryani
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+    - capture_type: water
+      meal_slot: drink
+      is_intake: true
+      water_oz: 67.628
+      items:
+      - label: water
+        kind: drink
+        identity: generic
+        quantity: 1
+        unit: bottle
+        serving_basis: default_serving
+        needs_lookup: false
+      - label: water
+        kind: drink
+        identity: generic
+        quantity: 1
+        unit: l
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+  failure_mode: 'the original live bug: bottle+liter summed, continuations as cravings'
+- id: v02
+  category: recap, 3 meals + glasses
+  text: Okay so quick update, it's like nine pm. For breakfast I just had two eggs and toast, uh, lunch was a Chipotle bowl,
+    and dinner, I made spaghetti. I also drank like three glasses of water throughout the day.
+  expect:
+    intake:
+    - keyword: egg
+      slots:
+      - breakfast
+      qty: 2
+    - keyword: toast
+      slots:
+      - breakfast
+      qty: null
+    - keyword: chipotle
+      slots:
+      - lunch
+      qty: 1
+    - keyword: spaghetti
+      slots:
+      - dinner
+      qty: 1
+    water_oz: 24.0
+    gate: none
+  clean:
+    captures:
+    - capture_type: meal
+      meal_slot: breakfast
+      is_intake: true
+      water_oz: null
+      items:
+      - label: eggs
+        kind: food
+        identity: generic
+        quantity: 2
+        unit: piece
+        serving_basis: stated
+        needs_lookup: false
+      - label: toast
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+    - capture_type: meal
+      meal_slot: lunch
+      is_intake: true
+      water_oz: null
+      items:
+      - label: Chipotle bowl
+        kind: food
+        identity: branded
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: true
+      notes: ''
+    - capture_type: meal
+      meal_slot: dinner
+      is_intake: true
+      water_oz: null
+      items:
+      - label: spaghetti
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+    - capture_type: water
+      meal_slot: drink
+      is_intake: true
+      water_oz: 24
+      items:
+      - label: water
+        kind: drink
+        identity: generic
+        quantity: 3
+        unit: glass
+        serving_basis: stated
+        needs_lookup: false
+      notes: ''
+  mistaken:
+    captures:
+    - capture_type: meal
+      meal_slot: unknown
+      is_intake: true
+      water_oz: null
+      items:
+      - label: eggs
+        kind: food
+        identity: generic
+        quantity: 2
+        unit: piece
+        serving_basis: stated
+        needs_lookup: false
+        meal_slot: breakfast
+      - label: toast
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+        meal_slot: breakfast
+      - label: Chipotle bowl
+        kind: food
+        identity: branded
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: true
+        meal_slot: lunch
+      - label: spaghetti
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+        meal_slot: dinner
+      - label: water
+        kind: drink
+        identity: generic
+        quantity: 3
+        unit: glass
+        serving_basis: stated
+        needs_lookup: false
+      notes: ''
+  failure_mode: single capture with per-item slots and water folded into the meal
+- id: v03
+  category: pre-gym + refills
+  text: Morning vlog. Had a protein shake and a banana before the gym. Filled up my water bottle twice.
+  expect:
+    intake:
+    - keyword: protein shake
+      slots: null
+      qty: 1
+    - keyword: banana
+      slots: null
+      qty: 1
+    water_oz: 67.62811300657684
+    gate: none
+  clean:
+    captures:
+    - capture_type: meal
+      meal_slot: breakfast
+      is_intake: true
+      water_oz: null
+      items:
+      - label: protein shake
+        kind: drink
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      - label: banana
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+    - capture_type: water
+      meal_slot: drink
+      is_intake: true
+      water_oz: 67.62811300657684
+      items:
+      - label: water
+        kind: drink
+        identity: generic
+        quantity: 2
+        unit: bottle
+        serving_basis: stated
+        needs_lookup: false
+      notes: ''
+  mistaken: null
+  failure_mode: ''
+- id: v04
+  category: half + full bottle
+  text: I drank half a water bottle this morning and then another full one at work.
+  expect:
+    intake: []
+    water_oz: 50.72108475493263
+    gate: none
+  clean:
+    captures:
+    - capture_type: water
+      meal_slot: drink
+      is_intake: true
+      water_oz: 50.72108475493263
+      items:
+      - label: water
+        kind: drink
+        identity: generic
+        quantity: 1.5
+        unit: bottle
+        serving_basis: stated
+        needs_lookup: false
+      notes: ''
+  mistaken: null
+  failure_mode: ''
+- id: v05
+  category: oz + ml bottle
+  text: Drank 16 ounces of water after my run, and then a 500 ml bottle at lunch.
+  expect:
+    intake: []
+    water_oz: 32.907028251644206
+    gate: none
+  clean:
+    captures:
+    - capture_type: water
+      meal_slot: drink
+      is_intake: true
+      water_oz: 32.907028251644206
+      items:
+      - label: water
+        kind: drink
+        identity: generic
+        quantity: 16
+        unit: oz
+        serving_basis: stated
+        needs_lookup: false
+      - label: water
+        kind: drink
+        identity: generic
+        quantity: 500
+        unit: ml
+        serving_basis: stated
+        needs_lookup: false
+      notes: ''
+  mistaken: null
+  failure_mode: ''
+- id: v06
+  category: liter then bottle (separate)
+  text: I had a liter of water at the gym and a water bottle at home.
+  expect:
+    intake: []
+    water_oz: 67.62811300657684
+    gate: none
+  clean:
+    captures:
+    - capture_type: water
+      meal_slot: drink
+      is_intake: true
+      water_oz: 67.62811300657684
+      items:
+      - label: water
+        kind: drink
+        identity: generic
+        quantity: 1
+        unit: l
+        serving_basis: default_serving
+        needs_lookup: false
+      - label: water
+        kind: drink
+        identity: generic
+        quantity: 1
+        unit: bottle
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+  mistaken: null
+  failure_mode: ''
+- id: v07
+  category: bottle restated as liter
+  text: Finished my water bottle. It's a liter.
+  expect:
+    intake: []
+    water_oz: 33.81405650328842
+    gate: none
+  clean:
+    captures:
+    - capture_type: water
+      meal_slot: drink
+      is_intake: true
+      water_oz: 33.81405650328842
+      items:
+      - label: water
+        kind: drink
+        identity: generic
+        quantity: 1
+        unit: bottle
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+  mistaken:
+    captures:
+    - capture_type: water
+      meal_slot: drink
+      is_intake: true
+      water_oz: 67.62811300657684
+      items:
+      - label: water
+        kind: drink
+        identity: generic
+        quantity: 1
+        unit: bottle
+        serving_basis: default_serving
+        needs_lookup: false
+      - label: water
+        kind: drink
+        identity: generic
+        quantity: 1
+        unit: l
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+  failure_mode: model sums the restatement
+- id: v08
+  category: two bottles = two liters
+  text: Two water bottles today, that's like two liters.
+  expect:
+    intake: []
+    water_oz: 67.62811300657684
+    gate: none
+  clean:
+    captures:
+    - capture_type: water
+      meal_slot: drink
+      is_intake: true
+      water_oz: 67.62811300657684
+      items:
+      - label: water
+        kind: drink
+        identity: generic
+        quantity: 2
+        unit: bottle
+        serving_basis: stated
+        needs_lookup: false
+      notes: ''
+  mistaken:
+    captures:
+    - capture_type: water
+      meal_slot: drink
+      is_intake: true
+      water_oz: 135.25622601315368
+      items:
+      - label: water
+        kind: drink
+        identity: generic
+        quantity: 2
+        unit: bottle
+        serving_basis: stated
+        needs_lookup: false
+      - label: water
+        kind: drink
+        identity: generic
+        quantity: 2
+        unit: l
+        serving_basis: stated
+        needs_lookup: false
+      notes: ''
+  failure_mode: model sums the restatement
+- id: v09
+  category: single glass
+  text: Didn't drink much water today, maybe one glass.
+  expect:
+    intake: []
+    water_oz: 8.0
+    gate: none
+  clean:
+    captures:
+    - capture_type: water
+      meal_slot: drink
+      is_intake: true
+      water_oz: 8
+      items:
+      - label: water
+        kind: drink
+        identity: generic
+        quantity: 1
+        unit: glass
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+  mistaken: null
+  failure_mode: ''
+- id: v10
+  category: glass + bottle mixed
+  text: Drank a glass of water when I woke up and finished my water bottle at the gym.
+  expect:
+    intake: []
+    water_oz: 41.81405650328842
+    gate: none
+  clean:
+    captures:
+    - capture_type: water
+      meal_slot: drink
+      is_intake: true
+      water_oz: 41.81405650328842
+      items:
+      - label: water
+        kind: drink
+        identity: generic
+        quantity: 1
+        unit: glass
+        serving_basis: default_serving
+        needs_lookup: false
+      - label: water
+        kind: drink
+        identity: generic
+        quantity: 1
+        unit: bottle
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+  mistaken: null
+  failure_mode: ''
+- id: v11
+  category: sparkling vs plain
+  text: Had a sparkling water and a LaCroix with lunch, and a big glass of water before bed.
+  expect:
+    intake:
+    - keyword: lacroix
+      slots: null
+      qty: 1
+    water_oz: 8.0
+    gate: none
+  clean:
+    captures:
+    - capture_type: meal
+      meal_slot: lunch
+      is_intake: true
+      water_oz: null
+      items:
+      - label: sparkling water
+        kind: drink
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      - label: LaCroix
+        kind: drink
+        identity: branded
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: true
+      notes: ''
+    - capture_type: water
+      meal_slot: drink
+      is_intake: true
+      water_oz: 8
+      items:
+      - label: water
+        kind: drink
+        identity: generic
+        quantity: 1
+        unit: glass
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+  mistaken: null
+  failure_mode: ''
+- id: v12
+  category: plus / too continuation
+  text: For dinner I had chicken tacos. Plus some chips and guac. Oh and a Coke too.
+  expect:
+    intake:
+    - keyword: taco
+      slots:
+      - dinner
+      qty: null
+    - keyword: chips
+      slots: null
+      qty: null
+    - keyword: guac
+      slots: null
+      qty: null
+    - keyword: coke
+      slots: null
+      qty: 1
+    craving: []
+    water_oz: null
+    gate: none
+  clean:
+    captures:
+    - capture_type: meal
+      meal_slot: dinner
+      is_intake: true
+      water_oz: null
+      items:
+      - label: chicken tacos
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      - label: chips
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      - label: guacamole
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      - label: Coke
+        kind: drink
+        identity: branded
+        quantity: 1
+        unit: can
+        serving_basis: default_serving
+        needs_lookup: true
+      notes: ''
+  mistaken:
+    captures:
+    - capture_type: meal
+      meal_slot: dinner
+      is_intake: true
+      water_oz: null
+      items:
+      - label: chicken tacos
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+    - capture_type: craving
+      meal_slot: snack
+      is_intake: false
+      water_oz: null
+      items:
+      - label: chips
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      - label: guacamole
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+    - capture_type: craving
+      meal_slot: unknown
+      is_intake: false
+      water_oz: null
+      items:
+      - label: Coke
+        kind: drink
+        identity: branded
+        quantity: 1
+        unit: can
+        serving_basis: default_serving
+        needs_lookup: true
+      notes: ''
+  failure_mode: continuations labeled craving
+- id: v13
+  category: real craving after a meal
+  text: I had a salad for lunch but honestly I'm craving a Snickers bar so bad right now.
+  expect:
+    intake:
+    - keyword: salad
+      slots:
+      - lunch
+      qty: 1
+    not_intake:
+    - snickers
+    craving:
+    - snickers
+    gate: none
+  clean:
+    captures:
+    - capture_type: meal
+      meal_slot: lunch
+      is_intake: true
+      water_oz: null
+      items:
+      - label: salad
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+    - capture_type: craving
+      meal_slot: snack
+      is_intake: false
+      water_oz: null
+      items:
+      - label: Snickers bar
+        kind: food
+        identity: branded
+        quantity: 1
+        unit: bar
+        serving_basis: default_serving
+        needs_lookup: true
+      notes: ''
+  mistaken:
+    captures:
+    - capture_type: meal
+      meal_slot: lunch
+      is_intake: true
+      items:
+      - label: salad
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      - label: Snickers bar
+        kind: food
+        identity: branded
+        quantity: 1
+        unit: bar
+        serving_basis: default_serving
+        needs_lookup: true
+      notes: ''
+  failure_mode: real craving folded into the meal as eaten
+- id: v14
+  category: craving cue far from the food
+  text: I had a salad for lunch. Man, I'm craving, like, after the absolutely brutal day I had at work, a Snickers bar.
+  expect:
+    intake:
+    - keyword: salad
+      slots:
+      - lunch
+      qty: 1
+    not_intake:
+    - snickers
+    craving:
+    - snickers
+    gate: none
+  clean:
+    captures:
+    - capture_type: meal
+      meal_slot: lunch
+      is_intake: true
+      water_oz: null
+      items:
+      - label: salad
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+    - capture_type: craving
+      meal_slot: snack
+      is_intake: false
+      water_oz: null
+      items:
+      - label: Snickers bar
+        kind: food
+        identity: branded
+        quantity: 1
+        unit: bar
+        serving_basis: default_serving
+        needs_lookup: true
+      notes: ''
+  mistaken:
+    captures:
+    - capture_type: meal
+      meal_slot: lunch
+      is_intake: true
+      items:
+      - label: salad
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      cravings:
+      - label: Snickers bar
+        kind: food
+        identity: branded
+        quantity: 1
+        unit: bar
+        serving_basis: default_serving
+        needs_lookup: true
+  failure_mode: cravings sibling key dropped
+- id: v15
+  category: could go for / want
+  text: I had oatmeal for breakfast. I want pizza tonight, could go for some wings too.
+  expect:
+    intake:
+    - keyword: oatmeal
+      slots:
+      - breakfast
+      qty: 1
+    not_intake:
+    - pizza
+    - wings
+    want_to_eat:
+    - pizza
+    craving:
+    - wings
+    gate: null
+  clean:
+    captures:
+    - capture_type: meal
+      meal_slot: breakfast
+      is_intake: true
+      water_oz: null
+      items:
+      - label: oatmeal
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+    - capture_type: want_to_eat
+      meal_slot: dinner
+      is_intake: false
+      water_oz: null
+      items:
+      - label: pizza
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+    - capture_type: craving
+      meal_slot: dinner
+      is_intake: false
+      water_oz: null
+      items:
+      - label: wings
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+  mistaken: null
+  failure_mode: ''
+- id: v16
+  category: '''add X to my log'' with no I-had'
+  text: Add a protein bar to today's log.
+  expect:
+    intake:
+    - keyword: protein bar
+      slots: null
+      qty: 1
+    craving: []
+    gate: null
+  clean:
+    captures:
+    - capture_type: meal
+      meal_slot: snack
+      is_intake: true
+      water_oz: null
+      items:
+      - label: protein bar
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: bar
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+  mistaken:
+    captures:
+    - capture_type: none
+      is_intake: false
+      meal_slot: unknown
+      items:
+      - label: protein bar
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: bar
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+  failure_mode: none with items discarded
+- id: v17
+  category: reordered replay, 'added'
+  text: Water-wise I did one water bottle, also, a liter. Breakfast was a cinnamon roll with cold brew, lunch a bison burger
+    and truffle fries, and I added a Snickers bar plus chicken biryani later.
+  expect:
+    intake:
+    - keyword: cinnamon roll
+      slots:
+      - breakfast
+      qty: 1
+    - keyword: cold brew
+      slots:
+      - breakfast
+      qty: 1
+    - keyword: bison burger
+      slots:
+      - lunch
+      qty: 1
+    - keyword: truffle fries
+      slots:
+      - lunch
+      qty: 1
+    - keyword: snickers
+      slots:
+      - snack
+      - unknown
+      - lunch
+      - dinner
+      - breakfast
+      - drink
+      qty: 1
+    - keyword: biryani
+      slots:
+      - snack
+      - unknown
+      - lunch
+      - dinner
+      - breakfast
+      - drink
+      qty: 1
+    water_oz: 33.81405650328842
+    craving: []
+    gate: none
+  clean:
+    captures:
+    - capture_type: water
+      meal_slot: drink
+      is_intake: true
+      water_oz: 33.81405650328842
+      items:
+      - label: water
+        kind: drink
+        identity: generic
+        quantity: 1
+        unit: bottle
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+    - capture_type: meal
+      meal_slot: breakfast
+      is_intake: true
+      water_oz: null
+      items:
+      - label: cinnamon roll
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      - label: cold brew
+        kind: drink
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+    - capture_type: meal
+      meal_slot: lunch
+      is_intake: true
+      water_oz: null
+      items:
+      - label: bison burger
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      - label: truffle fries
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+    - capture_type: meal
+      meal_slot: snack
+      is_intake: true
+      water_oz: null
+      items:
+      - label: Snickers bar
+        kind: food
+        identity: branded
+        quantity: 1
+        unit: bar
+        serving_basis: default_serving
+        needs_lookup: true
+      - label: chicken biryani
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+  mistaken:
+    captures:
+    - capture_type: water
+      meal_slot: drink
+      is_intake: true
+      water_oz: 67.628
+      items:
+      - label: water
+        kind: drink
+        identity: generic
+        quantity: 1
+        unit: bottle
+        serving_basis: default_serving
+        needs_lookup: false
+      - label: water
+        kind: drink
+        identity: generic
+        quantity: 1
+        unit: l
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+    - capture_type: craving
+      meal_slot: snack
+      is_intake: false
+      water_oz: null
+      items:
+      - label: Snickers bar
+        kind: food
+        identity: branded
+        quantity: 1
+        unit: bar
+        serving_basis: default_serving
+        needs_lookup: true
+      - label: chicken biryani
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+    - capture_type: meal
+      meal_slot: breakfast
+      is_intake: true
+      water_oz: null
+      items:
+      - label: cinnamon roll
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      - label: cold brew
+        kind: drink
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+    - capture_type: meal
+      meal_slot: lunch
+      is_intake: true
+      water_oz: null
+      items:
+      - label: bison burger
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      - label: truffle fries
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+  failure_mode: same bugs as v01, water first and craving before meal
+- id: v18
+  category: want to cook + shopping task
+  text: Thinking of making chicken biryani this weekend. Need to grab basmati rice.
+  expect:
+    intake: []
+    not_intake:
+    - biryani
+    - rice
+    want_to_cook:
+    - biryani
+    gate:
+    - rice
+  clean:
+    captures:
+    - capture_type: want_to_cook
+      meal_slot: dinner
+      is_intake: false
+      water_oz: null
+      items:
+      - label: chicken biryani
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+  mistaken: null
+  failure_mode: ''
+- id: v19
+  category: preference
+  text: I don't really like mushrooms, I'm more of an olive person.
+  expect:
+    intake: []
+    not_intake:
+    - mushroom
+    - olive
+    preference:
+    - mushroom
+    gate: none
+  clean:
+    captures:
+    - capture_type: preference
+      meal_slot: unknown
+      is_intake: false
+      water_oz: null
+      items:
+      - label: mushrooms
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      - label: olives
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+  mistaken: null
+  failure_mode: ''
+- id: v20
+  category: groceries bought, not eaten
+  text: Went to Costco, bought a huge bag of rice and frozen dumplings. Need to pick up eggs tomorrow.
+  expect:
+    intake: []
+    not_intake:
+    - rice
+    - dumpling
+    - egg
+    gate:
+    - egg
+  clean:
+    captures: []
+  mistaken:
+    captures:
+    - capture_type: meal
+      meal_slot: unknown
+      is_intake: true
+      water_oz: null
+      items:
+      - label: rice
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      - label: frozen dumplings
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+  failure_mode: purchases logged as eaten
+- id: v21
+  category: skipped meal
+  text: Skipped breakfast again. Lunch was just a turkey sandwich.
+  expect:
+    intake:
+    - keyword: turkey sandwich
+      slots:
+      - lunch
+      qty: 1
+    water_oz: null
+    gate: null
+  clean:
+    captures:
+    - capture_type: meal
+      meal_slot: lunch
+      is_intake: true
+      water_oz: null
+      items:
+      - label: turkey sandwich
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+  mistaken: null
+  failure_mode: ''
+- id: v22
+  category: resisted the donut
+  text: I almost had a donut at work but I didn't. Had an apple instead.
+  expect:
+    intake:
+    - keyword: apple
+      slots: null
+      qty: 1
+    not_intake:
+    - donut
+    gate: none
+  clean:
+    captures:
+    - capture_type: meal
+      meal_slot: snack
+      is_intake: true
+      water_oz: null
+      items:
+      - label: apple
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+  mistaken:
+    captures:
+    - capture_type: meal
+      meal_slot: snack
+      is_intake: true
+      water_oz: null
+      items:
+      - label: donut
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      - label: apple
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+  failure_mode: negated food logged as eaten
+- id: v23
+  category: future dinner
+  text: Tonight I'm gonna have leftover pad thai for dinner.
+  expect:
+    intake: []
+    not_intake:
+    - pad thai
+    want_to_eat:
+    - pad thai
+    gate: null
+  clean:
+    captures:
+    - capture_type: want_to_eat
+      meal_slot: dinner
+      is_intake: false
+      water_oz: null
+      items:
+      - label: pad thai
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+  mistaken:
+    captures:
+    - capture_type: meal
+      meal_slot: dinner
+      is_intake: true
+      water_oz: null
+      items:
+      - label: pad thai
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+  failure_mode: planned meal logged as eaten
+- id: v24
+  category: chatter-heavy vlog
+  text: Yo what's up guys, welcome back. So today was crazy, work was nonstop, and I basically lived off coffee. Like three
+    coffees. And I grabbed a Chick-fil-A sandwich around two. Anyway, gym was good, hit legs.
+  expect:
+    intake:
+    - keyword: coffee
+      slots: null
+      qty: 3
+    - keyword: chick-fil-a
+      slots: null
+      qty: 1
+    water_oz: null
+    gate: none
+  clean:
+    captures:
+    - capture_type: meal
+      meal_slot: drink
+      is_intake: true
+      water_oz: null
+      items:
+      - label: coffee
+        kind: drink
+        identity: generic
+        quantity: 3
+        unit: cup
+        serving_basis: stated
+        needs_lookup: false
+      notes: ''
+    - capture_type: meal
+      meal_slot: lunch
+      is_intake: true
+      water_oz: null
+      items:
+      - label: Chick-fil-A sandwich
+        kind: food
+        identity: branded
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: true
+      notes: ''
+  mistaken: null
+  failure_mode: ''
+- id: v25
+  category: wikilinked transcript
+  text: For breakfast I had [[greek yogurt]] with [[granola]], and for lunch [[pho]].
+  expect:
+    intake:
+    - keyword: greek yogurt
+      slots:
+      - breakfast
+      qty: 1
+    - keyword: granola
+      slots:
+      - breakfast
+      qty: 1
+    - keyword: pho
+      slots:
+      - lunch
+      qty: 1
+    gate: none
+  clean:
+    captures:
+    - capture_type: meal
+      meal_slot: breakfast
+      is_intake: true
+      water_oz: null
+      items:
+      - label: greek yogurt
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      - label: granola
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+    - capture_type: meal
+      meal_slot: lunch
+      is_intake: true
+      water_oz: null
+      items:
+      - label: pho
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: bowl
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+  mistaken: null
+  failure_mode: ''
+- id: v26
+  category: no food at all
+  text: Long day, finished the AFC controls config and talked to mom.
+  expect:
+    intake: []
+    water_oz: null
+    no_captures: true
+    gate: none
+  clean:
+    captures: []
+  mistaken: null
+  failure_mode: ''
+- id: v27
+  category: self-correction on count
+  text: I had two Bevs today. Wait no, it was three.
+  expect:
+    intake:
+    - keyword: bev
+      slots: null
+      qty: 3
+    gate: none
+  clean:
+    captures:
+    - capture_type: meal
+      meal_slot: drink
+      is_intake: true
+      water_oz: null
+      items:
+      - label: Bev
+        kind: drink
+        identity: branded
+        quantity: 3
+        unit: can
+        serving_basis: stated
+        needs_lookup: true
+      notes: ''
+  mistaken:
+    captures:
+    - capture_type: meal
+      meal_slot: drink
+      is_intake: true
+      water_oz: null
+      items:
+      - label: Bev
+        kind: drink
+        identity: branded
+        quantity: 2
+        unit: can
+        serving_basis: stated
+        needs_lookup: true
+      - label: Bev
+        kind: drink
+        identity: branded
+        quantity: 3
+        unit: can
+        serving_basis: stated
+        needs_lookup: true
+      notes: ''
+  failure_mode: both counts kept
+- id: v28
+  category: stated measures, not water
+  text: Ate 6 ounces of salmon and like a cup of rice for dinner.
+  expect:
+    intake:
+    - keyword: salmon
+      slots:
+      - dinner
+      qty: 6
+    - keyword: rice
+      slots:
+      - dinner
+      qty: 1
+    water_oz: null
+    gate: none
+  clean:
+    captures:
+    - capture_type: meal
+      meal_slot: dinner
+      is_intake: true
+      water_oz: null
+      items:
+      - label: salmon
+        kind: food
+        identity: generic
+        quantity: 6
+        unit: oz
+        serving_basis: stated
+        needs_lookup: false
+      - label: rice
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: cup
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+  mistaken: null
+  failure_mode: ''
+- id: v29
+  category: snack slot
+  text: Afternoon snack was a handful of almonds and a cheese stick.
+  expect:
+    intake:
+    - keyword: almond
+      slots:
+      - snack
+      qty: null
+    - keyword: cheese stick
+      slots:
+      - snack
+      qty: 1
+    gate: none
+  clean:
+    captures:
+    - capture_type: meal
+      meal_slot: snack
+      is_intake: true
+      water_oz: null
+      items:
+      - label: almonds
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      - label: cheese stick
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: piece
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+  mistaken: null
+  failure_mode: ''
+- id: v30
+  category: drinks only, non-water
+  text: Just coffee this morning, black, and a matcha latte in the afternoon.
+  expect:
+    intake:
+    - keyword: coffee
+      slots: null
+      qty: 1
+    - keyword: matcha
+      slots: null
+      qty: 1
+    water_oz: null
+    gate: none
+  clean:
+    captures:
+    - capture_type: meal
+      meal_slot: breakfast
+      is_intake: true
+      water_oz: null
+      items:
+      - label: coffee
+        kind: drink
+        identity: generic
+        quantity: 1
+        unit: cup
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+    - capture_type: meal
+      meal_slot: snack
+      is_intake: true
+      water_oz: null
+      items:
+      - label: matcha latte
+        kind: drink
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+  mistaken: null
+  failure_mode: ''
+- id: v31
+  category: alcohol + pizza
+  text: Went out with friends, had two beers and a slice of pizza.
+  expect:
+    intake:
+    - keyword: beer
+      slots: null
+      qty: 2
+    - keyword: pizza
+      slots: null
+      qty: 1
+    water_oz: null
+    gate: none
+  clean:
+    captures:
+    - capture_type: meal
+      meal_slot: dinner
+      is_intake: true
+      water_oz: null
+      items:
+      - label: beer
+        kind: drink
+        identity: generic
+        quantity: 2
+        unit: can
+        serving_basis: stated
+        needs_lookup: false
+      - label: pizza
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: slice
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: ''
+  mistaken: null
+  failure_mode: ''
+- id: v32
+  category: want apples grocery wish
+  text: "This week I want apples \u2014 something that'll keep me full between meals."
+  expect:
+    intake: []
+    not_intake:
+    - apple
+    want_to_eat:
+    - apple
+    gate: none
+  clean:
+    captures:
+    - capture_type: want_to_eat
+      meal_slot: unknown
+      is_intake: false
+      water_oz: null
+      items:
+      - label: apples
+        kind: food
+        identity: generic
+        quantity: 1
+        unit: serving
+        serving_basis: default_serving
+        needs_lookup: false
+      notes: something that'll keep me full between meals
+  mistaken: null
+  failure_mode: ''

@@ -272,13 +272,24 @@ def _infer_gate_style(model_name: str) -> str:
     return "phi4"
 
 
+_GATE_FOOD_EXCLUSION = (
+    "Food/water logging is handled by a separate wellness stage — do NOT extract intents for: "
+    "meals or snacks the author already ate or drank, water intake (\"one glass\", \"water bottle\"), "
+    "cravings, \"I want [food]\" wishes, \"add X to today's log\" / \"add X to my log\", "
+    "or invented reminders like \"drink more water\". "
+    "Only keep food-related intents when the author explicitly asks for a reminder/task "
+    "(e.g. \"remind me to pick up eggs\", \"need to grab basmati rice\")."
+)
+
+
 def _build_gate_prompt_phi4(text_excerpt: str) -> str:
     return (
         "You are a concise intent extractor. "
         "Read the following journal excerpt and extract ALL actionable intents: "
         "concrete tasks, commitments, reminders, or plans the author intends to act on. "
         "Do not extract items that the author says are already handled, already in another reminder system, "
-        "or mentioned only as praise/retrospective narration.\n\n"
+        "or mentioned only as praise/retrospective narration. "
+        f"{_GATE_FOOD_EXCLUSION}\n\n"
         "Excerpt:\n"
         "---\n"
         f"{text_excerpt}\n"
@@ -297,6 +308,7 @@ def _build_gate_prompt_qwen25(text_excerpt: str) -> str:
         "Extract ALL actionable intents (tasks, reminders, commitments, plans). "
         "Do not extract already-completed items, reminders the author says another system already handles, "
         "or retrospective praise/observations with no remaining action. "
+        f"{_GATE_FOOD_EXCLUSION} "
         "Also classify the downstream intent class. "
         "Output only a JSON object — no markdown fences, no extra text.\n"
         'Schema: {"intents": [{"intent_raw": string, "category": string, "intent_class": string}]}\n'
@@ -410,6 +422,51 @@ def _dedupe_intents(intents: list[dict]) -> list[dict]:
     return out[:max_n]
 
 
+_FOOD_LOG_INTENT_RE = re.compile(
+    r"\b("
+    r"drink\s+more\s+water|water\s+bottle|glass\s+of\s+water|"
+    r"add\s+.+\s+to\s+(?:my\s+|today'?s?\s+|the\s+)?log|"
+    r"log\s+(?:a\s+)?(?:protein\s+bar|meal|snack|water)|"
+    r"crav(?:e|es|ing)|"
+    r"(?:had|ate|drank)\s+"
+    r")\b",
+    re.I,
+)
+_EXPLICIT_REMINDER_RE = re.compile(
+    r"\b(remind\s+me|need\s+to\s+(?:grab|buy|pick\s+up|get)|pick\s+up|buy|order|schedule)\b",
+    re.I,
+)
+
+
+def is_food_logging_intent(intent_raw: str, source_text: str = "") -> bool:
+    """True when the gate invented a food/water log task (wellness handles these)."""
+    raw = str(intent_raw or "").strip()
+    if not raw:
+        return False
+    if _EXPLICIT_REMINDER_RE.search(raw) or _EXPLICIT_REMINDER_RE.search(source_text or ""):
+        # Keep purchase/reminder language even if food words appear.
+        if re.search(r"\b(buy|grab|pick\s+up|order|remind)\b", raw, re.I):
+            return False
+    if _FOOD_LOG_INTENT_RE.search(raw):
+        return True
+    # Pure water-habit inventions from short water utterances.
+    if re.search(r"\bwater\b", raw, re.I) and not _EXPLICIT_REMINDER_RE.search(raw):
+        if re.search(r"\b(drink|hydrate|bottle|glass)\b", raw, re.I):
+            return True
+    return False
+
+
+def filter_food_logging_intents(intents: list[dict], source_text: str = "") -> list[dict]:
+    """Drop gate intents that belong to the wellness/nutrition stage."""
+    kept: list[dict] = []
+    for item in intents:
+        if is_food_logging_intent(str(item.get("intent_raw") or ""), source_text):
+            _log("gate", f"dropped food-log intent: {item.get('intent_raw')}")
+            continue
+        kept.append(item)
+    return kept
+
+
 def call_gate(note_text: str, model: str, style: str, num_ctx: int = 4096) -> list[dict]:
     """Run the gate model via Ollama. Returns a list of {intent_raw, category} dicts."""
     try:
@@ -436,7 +493,7 @@ def call_gate(note_text: str, model: str, style: str, num_ctx: int = 4096) -> li
         raw_content = response["message"]["content"]
         gate_output = _extract_json_obj(raw_content)
         merged.extend(_parse_gate_output(gate_output))
-    return _dedupe_intents(merged)
+    return filter_food_logging_intents(_dedupe_intents(merged), note_text)
 
 
 _VALID_CATEGORIES = {"task", "reminder", "commitment", "plan", "none"}

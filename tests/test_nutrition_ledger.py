@@ -1317,3 +1317,173 @@ class TestLiveVlogRegression(unittest.TestCase):
         self.assertIsNotNone(oz)
         self.assertGreater(float(oz), 60.0)
         self.assertEqual(len(items), 2)
+
+    def test_water_twice_and_half_bottle_from_text(self):
+        with mock.patch.dict(os.environ, {"INTENT_WATER_BOTTLE_ML": "1000"}):
+            bottle = 1000 / nl.ML_PER_FL_OZ
+            twice, _ = nl.extract_water_from_text("Filled up my water bottle twice.")
+            half, _ = nl.extract_water_from_text(
+                "I drank half a water bottle this morning and then another full one at work."
+            )
+            mixed, _ = nl.extract_water_from_text(
+                "Drank a glass of water when I woke up and finished my water bottle at the gym."
+            )
+            sized, _ = nl.extract_water_from_text(
+                "Drank 16 ounces of water after my run, and then a 500 ml bottle at lunch."
+            )
+        self.assertAlmostEqual(float(twice), 2 * bottle, places=1)
+        self.assertAlmostEqual(float(half), 1.5 * bottle, places=1)
+        self.assertAlmostEqual(float(mixed), 8 + bottle, places=1)
+        self.assertAlmostEqual(float(sized), 16 + 500 / nl.ML_PER_FL_OZ, places=1)
+
+    def test_model_water_total_kept_when_regex_incomplete_but_not_restatement(self):
+        text = "Filled up my water bottle twice."
+        bottle = 1000 / nl.ML_PER_FL_OZ
+        payload = {
+            "captures": [{
+                "capture_type": "water", "is_intake": True, "meal_slot": "drink",
+                "water_oz": 2 * bottle,
+                "items": [{"label": "water", "kind": "drink", "quantity": 2, "unit": "bottle"}],
+            }],
+        }
+        with mock.patch.dict(os.environ, {"INTENT_WATER_BOTTLE_ML": "1000"}):
+            captures = nl.validate_captures(payload, text)
+        self.assertEqual(len(captures), 1)
+        self.assertAlmostEqual(float(captures[0]["water_oz"]), 2 * bottle, places=1)
+
+    def test_restatement_still_collapses_model_double_count(self):
+        text = "Finished my water bottle. It's a liter."
+        bottle = 1000 / nl.ML_PER_FL_OZ
+        payload = {
+            "captures": [{
+                "capture_type": "water", "is_intake": True,
+                "water_oz": 2 * bottle,
+                "items": [
+                    {"label": "water", "kind": "drink", "quantity": 1, "unit": "bottle"},
+                    {"label": "water", "kind": "drink", "quantity": 1, "unit": "l"},
+                ],
+            }],
+        }
+        with mock.patch.dict(os.environ, {"INTENT_WATER_BOTTLE_ML": "1000"}):
+            captures = nl.validate_captures(payload, text)
+        self.assertAlmostEqual(float(captures[0]["water_oz"]), bottle, places=1)
+
+    def test_bare_item_shape_becomes_meal(self):
+        captures = nl.validate_captures(
+            {"label": "salad", "kind": "food", "quantity": 1, "meal_slot": "lunch"},
+            "I had a salad for lunch.",
+        )
+        self.assertEqual(len(captures), 1)
+        self.assertEqual(captures[0]["capture_type"], "meal")
+        self.assertEqual(captures[0]["items"][0]["label"], "salad")
+
+    def test_cravings_sibling_key_is_folded(self):
+        payload = {
+            "captures": [{
+                "capture_type": "meal", "meal_slot": "lunch", "is_intake": True,
+                "items": [{"label": "salad", "kind": "food", "quantity": 1}],
+                "cravings": [{"label": "Snickers bar", "kind": "food", "quantity": 1, "unit": "bar"}],
+            }],
+        }
+        text = "I had a salad for lunch. Man, I'm craving, like, after the absolutely brutal day I had at work, a Snickers bar."
+        captures = nl.validate_captures(payload, text)
+        types = {c["capture_type"] for c in captures}
+        self.assertIn("meal", types)
+        self.assertIn("craving", types)
+
+    def test_far_craving_cue_same_sentence_not_rewritten_to_meal(self):
+        text = (
+            "I had a salad for lunch. Man, I'm craving, like, after the absolutely brutal day "
+            "I had at work, a Snickers bar."
+        )
+        payload = {
+            "captures": [
+                {"capture_type": "meal", "meal_slot": "lunch", "is_intake": True,
+                 "items": [{"label": "salad", "quantity": 1, "kind": "food"}]},
+                {"capture_type": "craving", "meal_slot": "snack", "is_intake": False,
+                 "items": [{"label": "Snickers bar", "quantity": 1, "unit": "bar", "kind": "food"}]},
+            ],
+        }
+        captures = nl.validate_captures(payload, text)
+        craving = [c for c in captures if c["capture_type"] == "craving"]
+        self.assertEqual(len(craving), 1)
+        self.assertIn("Snickers", craving[0]["items"][0]["label"])
+
+    def test_none_with_items_log_add_promotes_to_meal(self):
+        text = "Add a protein bar to today's log."
+        payload = {
+            "captures": [{
+                "capture_type": "none", "is_intake": False,
+                "items": [{"label": "protein bar", "quantity": 1, "unit": "bar", "kind": "food"}],
+            }],
+        }
+        captures = nl.validate_captures(payload, text)
+        self.assertEqual(captures[0]["capture_type"], "meal")
+        self.assertTrue(captures[0]["is_intake"])
+
+    def test_future_plan_demoted_to_want_to_eat(self):
+        text = "Tonight I'm gonna have leftover pad thai for dinner."
+        payload = {
+            "captures": [{
+                "capture_type": "meal", "meal_slot": "dinner", "is_intake": True,
+                "items": [{"label": "pad thai", "quantity": 1, "kind": "food", "calories_est": 500}],
+            }],
+        }
+        captures = nl.validate_captures(payload, text)
+        self.assertEqual(captures[0]["capture_type"], "want_to_eat")
+        self.assertFalse(captures[0]["is_intake"])
+
+    def test_want_apples_is_want_to_eat_with_context(self):
+        text = "This week I want apples — something that'll keep me full between meals."
+        payload = {
+            "captures": [{
+                "capture_type": "want_to_cook", "is_intake": False,
+                "items": [{"label": "apples", "quantity": 1, "kind": "food"}],
+                "notes": "something that'll keep me full between meals",
+            }],
+        }
+        captures = nl.validate_captures(payload, text)
+        self.assertEqual(captures[0]["capture_type"], "want_to_eat")
+        self.assertIn("keep me full", captures[0]["notes"])
+
+    def test_self_correction_keeps_last_quantity(self):
+        text = "I had two Bevs today. Wait no, it was three."
+        payload = {
+            "captures": [{
+                "capture_type": "meal", "meal_slot": "drink", "is_intake": True,
+                "items": [
+                    {"label": "Bev", "quantity": 2, "unit": "can", "kind": "drink", "identity": "branded"},
+                    {"label": "Bev", "quantity": 3, "unit": "can", "kind": "drink", "identity": "branded"},
+                ],
+            }],
+        }
+        captures = nl.validate_captures(payload, text)
+        self.assertEqual(len(captures[0]["items"]), 1)
+        self.assertEqual(captures[0]["items"][0]["quantity"], 3)
+
+    def test_needs_food_recovery_for_water_only_multi_meal(self):
+        text = (
+            "Water-wise I did one water bottle, also, a liter. Breakfast was a cinnamon roll "
+            "with cold brew, lunch a bison burger."
+        )
+        captures = nl.validate_captures({
+            "capture_type": "water", "is_intake": True, "water_oz": 33.8,
+            "items": [{"label": "water", "quantity": 1, "unit": "bottle", "kind": "drink"}],
+        }, text)
+        self.assertTrue(nl.needs_food_recovery(captures, text))
+        self.assertFalse(nl.needs_food_recovery(captures, "I drank a glass of water."))
+
+
+class TestFoodVlogHarnessOffline(unittest.TestCase):
+    def test_mock_harness_all_variants_pass(self):
+        harness_path = Path(__file__).resolve().parents[1] / "scripts" / "food_vlog_harness.py"
+        spec = importlib.util.spec_from_file_location("food_vlog_harness", harness_path)
+        mod = importlib.util.module_from_spec(spec)
+        assert spec and spec.loader
+        spec.loader.exec_module(mod)
+        variants = mod.load_cases()
+        out = mod.run_mock(variants)
+        failures = [r for r in out["variants"] if r["fails"]]
+        self.assertEqual(failures, [], msg=json.dumps(failures, indent=2))
+        self.assertEqual(out["e2e"]["second"]["wellness_notes"], 0)
+        self.assertEqual(out["e2e"]["second"]["intake_logged"], 0)
