@@ -120,6 +120,7 @@ class RunSummary:
     commands_failed: int = 0
     commands_needs_confirmation: int = 0
     nutrition_logged: int = 0
+    wellness_notes: int = 0
 
     def to_payload(self) -> dict:
         return {k: v for k, v in asdict(self).items()}
@@ -1303,6 +1304,12 @@ def compute_feedback_timing(
 # Delivery: Obsidian cortex write
 # ---------------------------------------------------------------------------
 
+def _yaml_double_quoted(value: str) -> str:
+    """Serialize a string as a double-quoted YAML scalar (escape \\ and \")."""
+    escaped = str(value or "").replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
 def write_cortex_note(
     cortex_dir: Path,
     title: str,
@@ -1323,7 +1330,10 @@ def write_cortex_note(
     # Organize into per-category subdirectory
     subdir = cortex_dir / (category or "other")
     subdir.mkdir(parents=True, exist_ok=True)
-    note_path = subdir / f"{date_prefix} {safe_title}.md"
+    # Include a short idempotency prefix so two intents that share a title on
+    # the same day do not overwrite each other on disk.
+    key_prefix = (claude_idempotency_key or "")[:8] or "note"
+    note_path = subdir / f"{date_prefix} {safe_title} {key_prefix}.md"
 
     # Source as Obsidian wikilink from timestamp date
     source_link = f"[[{date_prefix}]]"
@@ -1331,7 +1341,7 @@ def write_cortex_note(
     # Build frontmatter lines
     fm_lines = [
         "---",
-        f'source: "{source_link}"',
+        f"source: {_yaml_double_quoted(source_link)}",
         f"category: {category}",
         f"intent_class: {intent_class}",
         f"action: {action}",
@@ -1342,7 +1352,7 @@ def write_cortex_note(
     if defer_to:
         fm_lines.append(f"defer_to: {defer_to}")
     if feedback_prompt:
-        fm_lines.append(f'feedback_prompt: "{feedback_prompt}"')
+        fm_lines.append(f"feedback_prompt: {_yaml_double_quoted(feedback_prompt)}")
     if consent_required:
         fm_lines.append("consent_required: true")
     fm_lines.append(f"intent_key: {claude_idempotency_key[:16]}")
@@ -2571,14 +2581,16 @@ def _run_nutrition_stage(
     *,
     dry_run: bool,
     model: str,
-) -> int:
-    """Log voice intake. Never changes the intent pipeline exit code."""
+    cortex_dir: Path | None = None,
+) -> dict:
+    """Log voice intake + wellness captures. Never changes the intent exit code."""
+    empty = {"intake_logged": 0, "wellness_notes": 0}
     try:
         scripts_dir = Path(__file__).resolve().parent
         if str(scripts_dir) not in sys.path:
             sys.path.insert(0, str(scripts_dir))
         import nutrition_ledger
-        return int(nutrition_ledger.run_nutrition_stage(
+        result = nutrition_ledger.run_nutrition_stage(
             note_text,
             source_path,
             source_date,
@@ -2586,10 +2598,18 @@ def _run_nutrition_stage(
             dry_run=dry_run,
             journal_dir=source_path.parent,
             model=model,
-        ))
+            cortex_dir=cortex_dir,
+        )
+        if isinstance(result, dict):
+            return {
+                "intake_logged": int(result.get("intake_logged") or 0),
+                "wellness_notes": int(result.get("wellness_notes") or 0),
+            }
+        # Older return shape (int) — treat as intake-only.
+        return {"intake_logged": int(result or 0), "wellness_notes": 0}
     except Exception as exc:
         _log("nutrition", f"stage failed: {exc}")
-        return 0
+        return empty
 
 
 def run_intent_pipeline(
@@ -2644,10 +2664,12 @@ def run_intent_pipeline(
     journal_timestamp = infer_journal_timestamp(source_path)
     source_date = journal_timestamp[:10]  # YYYY-MM-DD
 
-    summary.nutrition_logged = _run_nutrition_stage(
+    nutrition_counts = _run_nutrition_stage(
         note_text, source_path, source_date, state_dir,
-        dry_run=dry_run, model=gate_model,
+        dry_run=dry_run, model=gate_model, cortex_dir=cortex_dir,
     )
+    summary.nutrition_logged = nutrition_counts["intake_logged"]
+    summary.wellness_notes = nutrition_counts["wellness_notes"]
 
     # ── Command stage (wake-word directives) ───────────────────────────────
     # Runs before the gate; executes recognized routes (e.g. hot_seat 10-K
