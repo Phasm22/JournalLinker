@@ -371,11 +371,17 @@ def append_voice_block(
 
     if note_path.exists():
         existing = note_path.read_text(encoding="utf-8")
-        # Guard against duplicate: skip if this exact timestamp callout already exists.
-        # Handles the case where a prior run appended the block but Scribe then failed.
-        marker = f"> [!voice] {time_str}"
-        if marker in existing:
-            print(f"[voice] voice block for {time_str} already in {note_path.name}, skipping append", file=sys.stderr)
+        # Guard against duplicate retries: skip only when this exact callout
+        # (same timestamp AND same transcript body) is already present.
+        # Distinct utterances that share an HH:MM minute must both append —
+        # Tailscale uploads often land multiple clips in the same minute.
+        callout_body = callout.strip()
+        if callout_body and callout_body in existing:
+            print(
+                f"[voice] identical voice block for {time_str} already in "
+                f"{note_path.name}, skipping append",
+                file=sys.stderr,
+            )
             return note_path
         note_path.write_text(existing.rstrip("\n") + callout, encoding="utf-8")
     else:

@@ -1137,6 +1137,39 @@ class TestCortexNoteFormat(unittest.TestCase):
             # Should also be in the reminder/ subdir
             self.assertEqual(path.parent.name, "reminder")
 
+    def test_same_title_does_not_overwrite_distinct_keys(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cortex_dir = Path(tmpdir) / "cortex"
+            path_a = self._write(
+                cortex_dir=cortex_dir,
+                title="Call doctor",
+                body="first",
+                claude_idempotency_key="aaaaaaaaaaaaaaaa",
+            )
+            path_b = self._write(
+                cortex_dir=cortex_dir,
+                title="Call doctor",
+                body="second",
+                claude_idempotency_key="bbbbbbbbbbbbbbbb",
+            )
+            self.assertNotEqual(path_a, path_b)
+            self.assertTrue(path_a.exists())
+            self.assertTrue(path_b.exists())
+            self.assertIn("first", path_a.read_text())
+            self.assertIn("second", path_b.read_text())
+            self.assertIn("aaaaaaaa", path_a.name)
+            self.assertIn("bbbbbbbb", path_b.name)
+
+    def test_feedback_prompt_quotes_are_yaml_escaped(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cortex_dir = Path(tmpdir) / "cortex"
+            path = self._write(
+                cortex_dir=cortex_dir,
+                feedback_prompt='you get those "SPDs" sorted?',
+            )
+            content = path.read_text()
+            self.assertIn('feedback_prompt: "you get those \\"SPDs\\" sorted?"', content)
+
 
 # ---------------------------------------------------------------------------
 # llmLibrarian enrichment (mocked)

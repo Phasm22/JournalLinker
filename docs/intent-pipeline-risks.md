@@ -18,6 +18,10 @@ Journal timestamps prefer the **`YYYY-MM-DD`** stem of the note path; otherwise 
 
 Enrichment merges **local** cortex search with **optional** remote retrieval. It is best-effort: failures are logged and the pipeline continues; routing still runs on the envelope as built.
 
+## Wellness notes vs cortex
+
+Voice wellness captures (`meal` / `water` / `craving` / `want_to_cook` / `preference`) write under **`<journal_dir>/wellness/`** (or `$INTENT_WELLNESS_DIR`), not under `cortex/`. llmLibrarian excludes the vault `cortex/` segment, and the AnythingLLM vault sync skips any directory named `cortex`. Keep wellness as a sibling of daily notes so both indexers see it after PC→Mac vault sync.
+
 ## Validation vs residual risk
 
 **Enforced in code:** routing outputs must match allowed values for urgency, format, and action; titles are truncated to length limits. Gate output is filtered to known categories and intent classes; malformed list entries are dropped.

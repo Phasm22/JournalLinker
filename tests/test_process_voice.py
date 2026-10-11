@@ -443,3 +443,24 @@ class TestResolveTargetDate(unittest.TestCase):
 
     def test_before_night_cutoff_rolls_to_previous_day(self):
         self.assertEqual(pv.resolve_target_date(Path("2026-09-30_01-30-00.m4a")), ("2026-09-29", "01:30"))
+
+
+class TestAppendVoiceBlock(unittest.TestCase):
+    def test_same_minute_distinct_transcripts_both_append(self):
+        with tempfile.TemporaryDirectory() as td:
+            journal = Path(td)
+            pv.append_voice_block(journal, "2026-09-30", "09:26", "I drank water")
+            pv.append_voice_block(journal, "2026-09-30", "09:26", "I'm craving chips")
+            text = (journal / "2026-09-30.md").read_text(encoding="utf-8")
+            self.assertEqual(text.count("> [!voice] 09:26"), 2)
+            self.assertIn("I drank water", text)
+            self.assertIn("I'm craving chips", text)
+
+    def test_identical_callout_is_not_duplicated_on_retry(self):
+        with tempfile.TemporaryDirectory() as td:
+            journal = Path(td)
+            pv.append_voice_block(journal, "2026-09-30", "09:26", "I drank water")
+            pv.append_voice_block(journal, "2026-09-30", "09:26", "I drank water")
+            text = (journal / "2026-09-30.md").read_text(encoding="utf-8")
+            self.assertEqual(text.count("> [!voice] 09:26"), 1)
+            self.assertEqual(text.count("I drank water"), 1)

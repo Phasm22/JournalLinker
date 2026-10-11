@@ -3,6 +3,10 @@
 
 Reads `> [!voice] HH:MM` blocks, asks a local model what was eaten or drunk,
 looks up branded names on the web, and appends one JSONL row per intake.
+Also classifies wellness captures (meal|water|craving|want_to_cook|preference)
+and writes structured notes under <journal_dir>/wellness/ (override with
+INTENT_WELLNESS_DIR) — never under cortex/, which vault indexers skip.
+
 A separate `--summary` command sends one end-of-day Pushover and scores the
 previous journal day against nutrition_memory.json.
 
@@ -62,12 +66,31 @@ KEEP_ALIVE = "5m"
 MEAL_SLOTS = {"breakfast", "lunch", "dinner", "snack", "drink", "unknown"}
 IDENTITIES = {"generic", "branded", "unresolved"}
 KINDS = {"food", "drink"}
+# Voice wellness capture types written to <journal_dir>/wellness/ (not cortex —
+# llmLibrarian and AnythingLLM vault sync both skip directories named cortex).
+# meal/water are intake; the rest are not.
+CAPTURE_TYPES = {"meal", "water", "craving", "want_to_cook", "preference", "none"}
+INTAKE_CAPTURE_TYPES = {"meal", "water"}
+WELLNESS_CAPTURE_TYPES = {"meal", "water", "craving", "want_to_cook", "preference"}
 SERVING_BASES = {"stated", "default_serving", "approximate", "remembered"}
 LOOKUP_STATUSES = {"ok", "miss", "ambiguous", "error", "cached", "skipped"}
 COUNT_UNITS = {
     "serving", "glass", "cup", "bowl", "bottle", "can", "piece", "count",
     "plate", "slice", "container", "item", "drink", "carton", "pouch",
     "bar", "packet", "bag",
+}
+# Default fluid ounces when the speaker says "a glass/cup/bottle" of water.
+WATER_UNIT_OZ = {
+    "oz": 1.0,
+    "ounce": 1.0,
+    "ounces": 1.0,
+    "glass": 8.0,
+    "cup": 8.0,
+    "bottle": 16.0,
+    "can": 12.0,
+    "ml": 1.0 / 29.5735,
+    "serving": 8.0,
+    "drink": 8.0,
 }
 
 _VOICE_HEADER_RE = re.compile(r"^> \[!voice\]\s+(\d{1,2}:\d{2})\s*$")
@@ -77,14 +100,33 @@ _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 NUTRITION_LEDGER_PROMPT = (
     "You are a nutrition ledger clerk for one spoken journal utterance.\n"
     "Decide whether the speaker is reporting food or drink they are consuming or already consumed.\n"
-    "Then extract every such item. Reason about vague speech. Do not invent a stricter phrase than they used.\n"
+    "Also classify a wellness capture_type for downstream meal planning.\n"
+    "Then extract every relevant item. Reason about vague speech. Do not invent a stricter phrase than they used.\n"
     "\n"
-    "Log it when they report intake, including present tense (\"I'm drinking...\"), past tense (\"I had...\"), "
+    "capture_type (pick exactly one):\n"
+    "- meal: reported eating food (or a mixed meal/drink that is not plain water).\n"
+    "- water: reported drinking water (plain water only; not coffee, soda, milk, juice).\n"
+    "- craving: wants or craves a food/drink now without clearly consuming it "
+    "(\"I'm craving chips\", \"really want ice cream\").\n"
+    "- want_to_cook: wants to cook, make, or prepare a dish "
+    "(\"I want to cook salmon\", \"thinking of making chili this week\").\n"
+    "- preference: likes, dislikes, or is thinking about a food preference "
+    "(\"I love roasted broccoli\", \"not a fan of cilantro\", \"been thinking about miso soup\").\n"
+    "- none: none of the above.\n"
+    "\n"
+    "Log intake (is_intake true) when they report consuming food/drink, including present tense "
+    "(\"I'm drinking...\"), past tense (\"I had...\"), "
     "and bare fragments (\"two glasses of milk\", \"fourteen grams of chicken\").\n"
-    "Do not log plans, wishes, or advice (\"I should eat more protein\", \"I need to buy milk\").\n"
+    "For craving, want_to_cook, and preference: is_intake false. Still list the named foods in items "
+    "(quantity 1, unit serving, identity generic, estimates null) so a meal planner can read them.\n"
+    "Do not log generic advice with no named food (\"I should eat more protein\") as anything but none.\n"
     "Do not log other people's meals unless the speaker clearly ate or drank it too "
     "(\"we had pizza\" counts as one share for the speaker).\n"
-    "A mention of food that is only a story, with no intake, is not a log.\n"
+    "A mention of food that is only a story, with no intake and no craving/preference/cook signal, is none.\n"
+    "\n"
+    "water_oz: when capture_type is water, set water_oz to fluid ounces consumed "
+    "(stated oz wins; a glass/cup is 8; a bottle is 16 unless they said otherwise). "
+    "Otherwise water_oz null.\n"
     "\n"
     "Quantity rules, in order:\n"
     "- A stated count or measure wins: \"eleven carrots\" is 11 carrots; \"fourteen grams of chicken\" is 14 g; "
@@ -125,7 +167,9 @@ NUTRITION_LEDGER_PROMPT = (
     "makes it plain. Otherwise \"unknown\". A drink can be meal_slot \"drink\".\n"
     "\n"
     "Respond with one JSON object and no other text.\n"
-    "If this utterance is not intake, return {\"is_intake\": false, \"items\": [], \"notes\": \"\"}.\n"
+    "If nothing to capture, return "
+    '{"is_intake": false, "capture_type": "none", "water_oz": null, "items": [], "notes": ""}.\n'
+    "Always include capture_type and water_oz (null when not water).\n"
 )
 
 NUTRITION_LOOKUP_PROMPT = (
@@ -667,6 +711,48 @@ def _null_estimates() -> dict:
     }
 
 
+def _infer_capture_type(is_intake: bool, items: list[dict], raw_type: str) -> str:
+    """Normalize capture_type; fall back from items when the model omits it."""
+    capture_type = str(raw_type or "").strip().lower()
+    if capture_type in CAPTURE_TYPES and capture_type != "none":
+        return capture_type
+    if not is_intake or not items:
+        return capture_type if capture_type in CAPTURE_TYPES else "none"
+    # Intake without an explicit type: plain water -> water, else meal.
+    if all(
+        str(item.get("kind") or "") == "drink"
+        and normalize_label(str(item.get("label") or "")) in {"water", "plain water", "tap water"}
+        for item in items
+    ):
+        return "water"
+    return "meal"
+
+
+def derive_water_oz(items: list[dict], water_oz_raw) -> float | None:
+    """Prefer model water_oz; else derive from water-labeled drink items."""
+    direct = _as_number(water_oz_raw)
+    if direct is not None and direct > 0:
+        return _clean_qty(direct)
+    total = 0.0
+    found = False
+    for item in items:
+        label = normalize_label(str(item.get("label") or ""))
+        if label not in {"water", "plain water", "tap water"}:
+            continue
+        quantity = _as_number(item.get("quantity"))
+        if quantity is None or quantity <= 0:
+            continue
+        unit = normalize_unit(str(item.get("unit") or ""))
+        factor = WATER_UNIT_OZ.get(unit)
+        if factor is None:
+            continue
+        total += quantity * factor
+        found = True
+    if not found:
+        return None
+    return _clean_qty(total)
+
+
 def validate_extract(payload: dict) -> dict:
     """Type-check model JSON. Stated numbers are kept. Brand macros are cleared."""
     if not isinstance(payload, dict):
@@ -677,17 +763,31 @@ def validate_extract(payload: dict) -> dict:
         meal_slot = "unknown"
     notes = str(payload.get("notes") or "").strip()
     items_in = payload.get("items") if isinstance(payload.get("items"), list) else []
+    capture_hint = str(payload.get("capture_type") or "").strip().lower()
+    keep_items = is_intake or capture_hint in {"craving", "want_to_cook", "preference", "meal", "water"}
     items: list[dict] = []
-    if is_intake:
+    if keep_items:
         for raw in items_in:
             item = _validate_item(raw)
             if item is not None:
+                # Non-intake wellness rows never carry macro estimates.
+                if not is_intake and capture_hint in {"craving", "want_to_cook", "preference"}:
+                    item.update(_null_estimates())
+                    item["needs_lookup"] = False
+                    if item.get("identity") == "branded":
+                        item["identity"] = "generic"
                 items.append(item)
-    if not items:
+    if is_intake and not items:
         is_intake = False
+    capture_type = _infer_capture_type(is_intake, items, capture_hint)
+    if capture_type == "none" and not is_intake:
+        items = []
+    water_oz = derive_water_oz(items, payload.get("water_oz")) if capture_type == "water" else None
     return {
         "is_intake": is_intake,
+        "capture_type": capture_type,
         "meal_slot": meal_slot if is_intake else "unknown",
+        "water_oz": water_oz,
         "items": items,
         "notes": notes,
     }
@@ -1090,6 +1190,103 @@ def resolve_branded_item(
 
 
 # ---------------------------------------------------------------------------
+# Wellness notes under <journal_dir>/wellness/ (filterable by vault indexers)
+# ---------------------------------------------------------------------------
+
+def resolve_wellness_dir(journal_dir: Path | None = None) -> Path | None:
+    """Return wellness write root: $INTENT_WELLNESS_DIR or <journal_dir>/wellness.
+
+    Kept under the journal dir (sibling of daily notes, not under cortex/) so
+    llmLibrarian and AnythingLLM vault sync both index it. Paths stay relative
+    to the vault root that syncs from the PC to the Mac.
+    """
+    raw = os.getenv("INTENT_WELLNESS_DIR", "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    if journal_dir is not None:
+        return Path(journal_dir).expanduser() / "wellness"
+    return None
+
+
+def _yaml_double_quoted(value: str) -> str:
+    escaped = str(value or "").replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _yaml_str_list(values: list[str]) -> str:
+    if not values:
+        return "[]"
+    return "[" + ", ".join(_yaml_double_quoted(v) for v in values) + "]"
+
+
+def item_labels(items: list[dict]) -> list[str]:
+    labels: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        label = str(item.get("label") or "").strip()
+        if label and label not in labels:
+            labels.append(label)
+    return labels
+
+
+def write_wellness_note(
+    wellness_dir: Path,
+    *,
+    capture_type: str,
+    source_date: str,
+    spoken_at: str,
+    items: list[dict],
+    water_oz,
+    raw_text: str,
+    span_id: str,
+    meal_slot: str = "unknown",
+    notes: str = "",
+) -> Path:
+    """Write a structured wellness note under wellness_dir for vault indexing."""
+    wellness_dir.mkdir(parents=True, exist_ok=True)
+    labels = item_labels(items)
+    label_slug = re.sub(r'[<>:"/\\|?*]', "-", " ".join(labels[:3])).strip("-").strip()
+    if not label_slug:
+        label_slug = capture_type
+    key_prefix = (span_id or "")[:8] or "note"
+    note_path = wellness_dir / f"{source_date} {capture_type} {label_slug} {key_prefix}.md"
+    created = f"{source_date}T{spoken_at}:00" if spoken_at else source_date
+    water_line = "null" if water_oz is None else str(_clean_qty(float(water_oz)))
+    fm_lines = [
+        "---",
+        f"type: {capture_type}",
+        f"items: {_yaml_str_list(labels)}",
+        f"water_oz: {water_line}",
+        f"time: {_yaml_double_quoted(spoken_at)}",
+        f"source_date: {source_date}",
+        f"source: {_yaml_double_quoted(f'[[{source_date}]]')}",
+        f"meal_slot: {meal_slot or 'unknown'}",
+        f"tags: [wellness, {capture_type}]",
+        f"created: {created}",
+        f"span_key: {span_id[:16]}",
+        "---",
+    ]
+    title = f"{capture_type.replace('_', ' ').title()}: {', '.join(labels) if labels else 'capture'}"
+    body_lines = ["", f"# {title}", ""]
+    if water_oz is not None:
+        body_lines.extend([f"water_oz:: {water_line}", ""])
+    if labels:
+        body_lines.append("items:: " + ", ".join(labels))
+        body_lines.append("")
+    if notes:
+        body_lines.extend([notes, ""])
+    if raw_text.strip():
+        body_lines.append("> [!voice] Source")
+        for line in raw_text.strip().splitlines():
+            body_lines.append(f"> {line}")
+        body_lines.append("")
+    note_path.write_text("\n".join(fm_lines) + "\n" + "\n".join(body_lines), encoding="utf-8")
+    _log(f"wellness note {note_path}")
+    return note_path
+
+
+# ---------------------------------------------------------------------------
 # Stage
 # ---------------------------------------------------------------------------
 
@@ -1104,16 +1301,19 @@ def _process_callout(
     dry_run: bool,
     journal_dir: Path | None,
     model: str | None,
-) -> tuple[bool, dict | None]:
-    """Return (wrote_or_would_write_intake, row). Raises if the extract model fails."""
+    wellness_dir: Path | None = None,
+) -> tuple[bool, bool, dict | None]:
+    """Return (wrote_intake, wrote_wellness, row). Raises if the extract model fails."""
     user = build_extract_user(callout["spoken_at"], callout["raw_text"], memory)
     parsed = validate_extract(call_nutrition_model(NUTRITION_LEDGER_PROMPT, user, model=model))
-    apply_memory_priors(parsed["items"], memory)
-    for item in parsed["items"]:
-        resolve_branded_item(
-            item, cache, memory, journal_dir, dry_run=dry_run, model=model,
-        )
+    if parsed["is_intake"]:
+        apply_memory_priors(parsed["items"], memory)
+        for item in parsed["items"]:
+            resolve_branded_item(
+                item, cache, memory, journal_dir, dry_run=dry_run, model=model,
+            )
     key = span_key(source_path, callout["spoken_at"], callout["raw_text"])
+    capture_type = parsed["capture_type"]
     row = {
         "idempotency_key": key,
         "logged_at": _now_iso(),
@@ -1122,25 +1322,52 @@ def _process_callout(
         "spoken_at": callout["spoken_at"],
         "raw_text": callout["raw_text"],
         "is_intake": parsed["is_intake"],
+        "capture_type": capture_type,
         "meal_slot": parsed["meal_slot"],
+        "water_oz": parsed["water_oz"],
         "items": parsed["items"],
         "notes": parsed["notes"],
     }
+    wrote_wellness = capture_type in WELLNESS_CAPTURE_TYPES
     if dry_run:
         print(json.dumps(row, ensure_ascii=False, indent=2))
-        return parsed["is_intake"], row
+        return parsed["is_intake"], wrote_wellness, row
     if parsed["is_intake"]:
         _append_jsonl(ledger_path(state_dir), row)
         update_memory_from_row(memory, row)
         save_memory(state_dir, memory)
         save_cache(state_dir, cache)
+    wellness_path = ""
+    if wrote_wellness and wellness_dir is not None:
+        try:
+            note_path = write_wellness_note(
+                wellness_dir,
+                capture_type=capture_type,
+                source_date=source_date,
+                spoken_at=callout["spoken_at"],
+                items=parsed["items"],
+                water_oz=parsed["water_oz"],
+                raw_text=callout["raw_text"],
+                span_id=key,
+                meal_slot=parsed["meal_slot"],
+                notes=parsed["notes"],
+            )
+            wellness_path = str(note_path)
+        except Exception as exc:
+            _log(f"wellness write failed: {exc}")
+            wrote_wellness = False
+    elif wrote_wellness and wellness_dir is None:
+        _log("wellness capture skipped: no wellness_dir")
+        wrote_wellness = False
     append_processed(state_dir, {
         "idempotency_key": key,
         "is_intake": parsed["is_intake"],
+        "capture_type": capture_type,
         "source_path": str(source_path),
         "spoken_at": callout["spoken_at"],
+        "wellness_note": wellness_path,
     })
-    return parsed["is_intake"], row
+    return parsed["is_intake"], wrote_wellness, row
 
 
 def retry_error_lookups(
@@ -1188,14 +1415,18 @@ def run_nutrition_stage(
     dry_run: bool = False,
     journal_dir: Path | None = None,
     model: str | None = None,
-) -> int:
+    wellness_dir: Path | None = None,
+) -> dict:
     """Parse new voice callouts. Failures stay inside this function.
 
-    Returns the number of intake rows written, or that dry-run would write.
+    Returns counts: {"intake_logged": int, "wellness_notes": int}.
     """
     journal_dir = journal_dir or Path(source_path).parent
+    if wellness_dir is None:
+        wellness_dir = resolve_wellness_dir(journal_dir)
     chosen_model = os.getenv("INTENT_NUTRITION_MODEL", "").strip() or model or nutrition_model()
     logged = 0
+    wellness_notes = 0
     if not dry_run:
         try:
             retry_error_lookups(state_dir, journal_dir, model=chosen_model)
@@ -1205,7 +1436,7 @@ def run_nutrition_stage(
         callouts = extract_voice_callouts(note_text)
     except Exception as exc:
         _log(f"callout parse failed: {exc}")
-        return 0
+        return {"intake_logged": 0, "wellness_notes": 0}
     processed = load_processed_keys(state_dir)
     memory = load_memory(state_dir)
     cache = load_cache(state_dir)
@@ -1214,7 +1445,7 @@ def run_nutrition_stage(
         if key in processed:
             continue
         try:
-            wrote, _row = _process_callout(
+            wrote_intake, wrote_wellness, _row = _process_callout(
                 callout,
                 source_path=source_path,
                 source_date=source_date,
@@ -1224,15 +1455,18 @@ def run_nutrition_stage(
                 dry_run=dry_run,
                 journal_dir=journal_dir,
                 model=chosen_model,
+                wellness_dir=wellness_dir,
             )
         except Exception as exc:
             _log(f"extract failed for {callout['spoken_at']}: {exc}")
             continue
-        if wrote:
+        if wrote_intake:
             logged += 1
+        if wrote_wellness:
+            wellness_notes += 1
         if not dry_run:
             processed.add(key)
-    return logged
+    return {"intake_logged": logged, "wellness_notes": wellness_notes}
 
 
 # ---------------------------------------------------------------------------

@@ -129,14 +129,15 @@ class TestStage(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def _run(self, text, payload, lookup=None):
+    def _run(self, text, payload, lookup=None, wellness_dir=None):
         with mock.patch.object(nl, "call_nutrition_model", return_value=payload) as model, \
                 mock.patch.object(nl, "lookup_product", side_effect=lookup) as web:
-            count = nl.run_nutrition_stage(
+            result = nl.run_nutrition_stage(
                 text, self.note, "2026-10-02", self.state,
                 journal_dir=self.journal,
+                wellness_dir=wellness_dir,
             )
-        return count, model, web
+        return result, model, web
 
     def test_unresolved_drink_does_not_search(self):
         text = "> [!voice] 09:00\n> a glass of this\n"
@@ -154,8 +155,8 @@ class TestStage(unittest.TestCase):
                 "calories_est": 90,
             }],
         }
-        count, _model, web = self._run(text, payload)
-        self.assertEqual(count, 1)
+        result, _model, web = self._run(text, payload)
+        self.assertEqual(result["intake_logged"], 1)
         web.assert_not_called()
         rows = nl.load_ledger_rows(self.state)
         self.assertIsNone(rows[0]["items"][0]["calories_est"])
@@ -184,8 +185,9 @@ class TestStage(unittest.TestCase):
 
     def test_non_intake_marks_processed_without_a_ledger_row(self):
         text = "> [!voice] 09:00\n> I should eat more protein\n"
-        count, _model, web = self._run(text, {"is_intake": False, "items": []})
-        self.assertEqual(count, 0)
+        result, _model, web = self._run(text, {"is_intake": False, "capture_type": "none", "items": []})
+        self.assertEqual(result["intake_logged"], 0)
+        self.assertEqual(result["wellness_notes"], 0)
         web.assert_not_called()
         self.assertFalse(nl.ledger_path(self.state).exists())
         self.assertTrue(nl.processed_path(self.state).exists())
@@ -214,8 +216,9 @@ class TestStage(unittest.TestCase):
     def test_extract_failure_is_isolated(self):
         text = "> [!voice] 09:00\n> I had a banana\n"
         with mock.patch.object(nl, "call_nutrition_model", side_effect=RuntimeError("down")):
-            count = nl.run_nutrition_stage(text, self.note, "2026-10-02", self.state)
-        self.assertEqual(count, 0)
+            result = nl.run_nutrition_stage(text, self.note, "2026-10-02", self.state)
+        self.assertEqual(result["intake_logged"], 0)
+        self.assertEqual(result["wellness_notes"], 0)
         self.assertFalse(nl.processed_path(self.state).exists())
         self.assertFalse(nl.ledger_path(self.state).exists())
 
@@ -239,10 +242,10 @@ class TestStage(unittest.TestCase):
         with mock.patch.object(nl, "call_nutrition_model", return_value=payload), \
                 mock.patch.object(nl, "lookup_product") as web, \
                 mock.patch("sys.stdout", buf):
-            count = nl.run_nutrition_stage(
+            result = nl.run_nutrition_stage(
                 text, self.note, "2026-10-02", self.state, dry_run=True,
             )
-        self.assertEqual(count, 1)
+        self.assertEqual(result["intake_logged"], 1)
         web.assert_not_called()
         self.assertFalse(nl.ledger_path(self.state).exists())
         self.assertFalse(nl.processed_path(self.state).exists())
@@ -601,7 +604,7 @@ class TestPipelineHook(unittest.TestCase):
                     state_dir=state,
                     enrichment_mode="off",
                     in_flight_ttl=30,
-                    dry_run=True,
+                    dry_run=False,
                     verbose=False,
                 )
         finally:
@@ -612,4 +615,179 @@ class TestPipelineHook(unittest.TestCase):
         self.assertEqual(code, 0)
         saved = json.loads(payload.read_text(encoding="utf-8"))
         self.assertEqual(saved["nutrition_logged"], 1)
+        self.assertEqual(saved["wellness_notes"], 1)
         self.assertEqual(pi.RunSummary().nutrition_logged, 0)
+        wellness_notes = list((root / "wellness").glob("*.md"))
+        self.assertEqual(len(wellness_notes), 1)
+        self.assertFalse((root / "cortex" / "wellness").exists())
+
+
+class TestWellnessCapture(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state = Path(self.tmp.name) / "state"
+        self.state.mkdir()
+        self.journal = Path(self.tmp.name) / "journal"
+        self.journal.mkdir()
+        self.wellness = self.journal / "wellness"
+        self.note = self.journal / "2026-10-02.md"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_resolve_wellness_dir_defaults_under_journal(self):
+        path = nl.resolve_wellness_dir(self.journal)
+        self.assertEqual(path, self.journal / "wellness")
+
+    def test_resolve_wellness_dir_env_override(self):
+        override = Path(self.tmp.name) / "custom-wellness"
+        with mock.patch.dict(os.environ, {"INTENT_WELLNESS_DIR": str(override)}):
+            self.assertEqual(nl.resolve_wellness_dir(self.journal), override)
+
+    def test_validate_craving_keeps_items_without_intake(self):
+        parsed = nl.validate_extract({
+            "is_intake": False,
+            "capture_type": "craving",
+            "items": [{
+                "label": "pizza",
+                "kind": "food",
+                "identity": "generic",
+                "quantity": 1,
+                "unit": "serving",
+                "serving_basis": "approximate",
+                "calories_est": 300,
+            }],
+        })
+        self.assertFalse(parsed["is_intake"])
+        self.assertEqual(parsed["capture_type"], "craving")
+        self.assertEqual(parsed["items"][0]["label"], "pizza")
+        self.assertIsNone(parsed["items"][0]["calories_est"])
+
+    def test_validate_water_derives_oz_from_glasses(self):
+        parsed = nl.validate_extract({
+            "is_intake": True,
+            "capture_type": "water",
+            "items": [{
+                "label": "water",
+                "kind": "drink",
+                "identity": "generic",
+                "quantity": 2,
+                "unit": "glass",
+                "serving_basis": "stated",
+            }],
+        })
+        self.assertEqual(parsed["capture_type"], "water")
+        self.assertEqual(parsed["water_oz"], 16)
+
+    def test_infer_meal_when_capture_type_omitted(self):
+        parsed = nl.validate_extract({
+            "is_intake": True,
+            "items": [{
+                "label": "chicken",
+                "kind": "food",
+                "identity": "generic",
+                "quantity": 1,
+                "unit": "serving",
+                "serving_basis": "default_serving",
+            }],
+        })
+        self.assertEqual(parsed["capture_type"], "meal")
+
+    def test_craving_writes_journal_wellness_note_not_calorie_ledger(self):
+        text = "> [!voice] 15:00\n> I'm craving pizza\n"
+        payload = {
+            "is_intake": False,
+            "capture_type": "craving",
+            "water_oz": None,
+            "items": [{
+                "label": "pizza",
+                "kind": "food",
+                "identity": "generic",
+                "quantity": 1,
+                "unit": "serving",
+                "serving_basis": "approximate",
+            }],
+        }
+        with mock.patch.object(nl, "call_nutrition_model", return_value=payload):
+            result = nl.run_nutrition_stage(
+                text, self.note, "2026-10-02", self.state,
+                journal_dir=self.journal,
+            )
+        self.assertEqual(result["intake_logged"], 0)
+        self.assertEqual(result["wellness_notes"], 1)
+        self.assertFalse(nl.ledger_path(self.state).exists())
+        # Must be <journal>/wellness/, never under cortex/ (indexers skip cortex).
+        notes = list(self.wellness.glob("*.md"))
+        self.assertEqual(len(notes), 1)
+        self.assertEqual(notes[0].parent, self.wellness)
+        self.assertNotIn("cortex", notes[0].parts)
+        content = notes[0].read_text(encoding="utf-8")
+        self.assertIn("type: craving", content)
+        self.assertIn('items: ["pizza"]', content)
+        self.assertIn('time: "15:00"', content)
+        self.assertIn("water_oz: null", content)
+        self.assertIn("tags: [wellness, craving]", content)
+
+    def test_want_to_cook_and_preference_frontmatter(self):
+        for capture_type, spoken, label in (
+            ("want_to_cook", "I want to cook salmon", "salmon"),
+            ("preference", "I love roasted broccoli", "roasted broccoli"),
+        ):
+            with self.subTest(capture_type=capture_type):
+                text = f"> [!voice] 18:00\n> {spoken}\n"
+                payload = {
+                    "is_intake": False,
+                    "capture_type": capture_type,
+                    "items": [{
+                        "label": label,
+                        "kind": "food",
+                        "identity": "generic",
+                        "quantity": 1,
+                        "unit": "serving",
+                        "serving_basis": "approximate",
+                    }],
+                }
+                state = self.state / capture_type
+                state.mkdir()
+                with mock.patch.object(nl, "call_nutrition_model", return_value=payload):
+                    result = nl.run_nutrition_stage(
+                        text, self.note, "2026-10-02", state,
+                        journal_dir=self.journal,
+                    )
+                self.assertEqual(result["wellness_notes"], 1)
+                matches = list(self.wellness.glob(f"* {capture_type} *.md"))
+                self.assertTrue(matches)
+                body = matches[-1].read_text(encoding="utf-8")
+                self.assertIn(f"type: {capture_type}", body)
+                self.assertIn(label, body)
+
+    def test_meal_writes_ledger_and_wellness_note(self):
+        text = "> [!voice] 12:00\n> I had a banana\n"
+        payload = {
+            "is_intake": True,
+            "capture_type": "meal",
+            "meal_slot": "lunch",
+            "items": [{
+                "label": "banana",
+                "kind": "food",
+                "identity": "generic",
+                "quantity": 1,
+                "unit": "serving",
+                "serving_basis": "default_serving",
+                "calories_est": 105,
+            }],
+        }
+        with mock.patch.object(nl, "call_nutrition_model", return_value=payload):
+            result = nl.run_nutrition_stage(
+                text, self.note, "2026-10-02", self.state,
+                journal_dir=self.journal,
+            )
+        self.assertEqual(result["intake_logged"], 1)
+        self.assertEqual(result["wellness_notes"], 1)
+        self.assertEqual(len(nl.load_ledger_rows(self.state)), 1)
+        notes = list(self.wellness.glob("*.md"))
+        self.assertEqual(len(notes), 1)
+        self.assertEqual(notes[0].parent.name, "wellness")
+        self.assertIn("type: meal", notes[0].read_text(encoding="utf-8"))
+        # Confirm nothing landed under a cortex tree.
+        self.assertFalse((self.journal / "cortex").exists())

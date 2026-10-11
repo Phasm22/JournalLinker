@@ -76,7 +76,7 @@ SCRIBE_CTX="8192"             # optional
 
 ## Intent pipeline (`scripts/process_intents.py`)
 
-Separate from Scribe: reads a daily note, decides whether it contains actionable intents, routes each intent with a cloud LLM, then delivers to notification sinks, Obsidian cortex, and optional digests. Tunables and secrets are documented in the **module docstring** at the top of that file.
+Separate from Scribe: reads a daily note, decides whether it contains actionable intents, routes each intent with a cloud LLM, then delivers to notification sinks, Obsidian cortex, and optional digests. A parallel voice stage (`nutrition_ledger.py`) writes structured wellness notes under `<journal_dir>/wellness/` (not cortex — vault indexers skip cortex). Tunables and secrets are documented in the **module docstring** at the top of that file.
 
 **Exit codes** (stable for shell wrappers and automation):
 

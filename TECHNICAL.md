@@ -83,7 +83,7 @@ python3 daily_reflection.py --force-send
 
 ## Intent pipeline (`scripts/process_intents.py` in `JOURNAL_LINKER_REPO`)
 
-The intent watcher runs from the journalLinker checkout referenced by `JOURNAL_LINKER_REPO`. It gates journal text, calls the routing model, then delivers to Pushover, Obsidian cortex, optional digest queue file, and optional Telegram feedback queue.
+The intent watcher runs from the journalLinker checkout referenced by `JOURNAL_LINKER_REPO`. It gates journal text, calls the routing model, then delivers to Pushover, Obsidian cortex, optional digest queue file, and optional Telegram feedback queue. Voice wellness captures (meal/water/craving/want_to_cook/preference) write under `<SCRIBE_JOURNAL_DIR>/wellness/` (or `$INTENT_WELLNESS_DIR`), **not** under `cortex/` — llmLibrarian and AnythingLLM vault sync both skip cortex directories.
 
 **Digest and Telegram scheduling (capture-first):**
 
@@ -108,7 +108,7 @@ Unset behavior preserves legacy pipelines; set flags in `~/.config/journal-linke
 | `INTENT_PUSHOVER_URGENCIES` | *(unset → `immediate`, `today`, `soon`)* | Comma-separated subset of `immediate,today,soon,low` that may trigger a Pushover message. Example: `immediate,today` skips Pushover when the router sets `urgency=soon`. |
 
 
-Other useful intent variables (see the script docstring in-repo): `INTENT_GATE_MODEL`, `INTENT_ROUTING_MODEL`, `INTENT_STATE_DIR`, `INTENT_FEEDBACK_DELAY_TODAY`, `INTENT_FEEDBACK_DELAY_SOON`, `INTENT_CORTEX_DIR`, `OPENAI_API_KEY`, and the same `SCRIBE_PUSHOVER_*` keys as daily reflection.
+Other useful intent variables (see the script docstring in-repo): `INTENT_GATE_MODEL`, `INTENT_ROUTING_MODEL`, `INTENT_STATE_DIR`, `INTENT_FEEDBACK_DELAY_TODAY`, `INTENT_FEEDBACK_DELAY_SOON`, `INTENT_CORTEX_DIR`, `INTENT_WELLNESS_DIR`, `OPENAI_API_KEY`, and the same `SCRIBE_PUSHOVER_*` keys as daily reflection.
 
 ### Telegram design contract + reactions + reply learning
 
