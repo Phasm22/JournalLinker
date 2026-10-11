@@ -22,7 +22,7 @@ Enrichment merges **local** cortex search with **optional** remote retrieval. It
 
 Voice wellness captures (`meal` / `water` / `craving` / `want_to_cook` / `preference`) write under **`<journal_dir>/wellness/`** (or `$INTENT_WELLNESS_DIR`), not under `cortex/`. llmLibrarian excludes the vault `cortex/` segment, and the AnythingLLM vault sync skips any directory named `cortex`. Keep wellness as a sibling of daily notes so both indexers see it after PC→Mac vault sync.
 
-Multi-slot vlog utterances are split into several captures (breakfast / lunch / unknown snack / water). Plain water is never folded into a meal note. `INTENT_WATER_BOTTLE_ML` (default 1000) sizes "a water bottle" / "filled up my bottle". A bare trailing "also, a liter" after a bottle mention is treated as restating the 1 L bottle, not a second drink.
+Multi-slot vlog utterances are split into several captures (breakfast / lunch / unknown snack / water). Plain water is never folded into a meal note. `INTENT_WATER_BOTTLE_ML` (default 1000) sizes "a water bottle" / "filled up my bottle". A bare trailing "also, a liter" after a bottle mention is treated as restating the 1 L bottle, not a second drink — deterministic speech wins over a model sum. Continuation phrases ("add", "also", "and some", "too") after an "I had" list inherit `meal` intake; cravings require want/craving language.
 
 ## Validation vs residual risk
 
