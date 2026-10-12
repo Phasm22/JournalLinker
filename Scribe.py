@@ -1574,6 +1574,9 @@ def main() -> int:
         response = ollama.chat(
             model=MODEL,
             messages=[{"role": "user", "content": prompt}],
+            # Constrain decoding to JSON: on long entries (e.g. a 22-min voice
+            # transcript) llama3.1:8b otherwise answers with Python code.
+            format="json",
             options={"temperature": 0, "num_ctx": NUM_CTX},
             keep_alive=KEEP_ALIVE,
         )

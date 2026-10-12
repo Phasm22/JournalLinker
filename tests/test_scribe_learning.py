@@ -616,7 +616,7 @@ class TestScribeLearning(unittest.TestCase):
                 mock.patch.object(scribe, "get_input_text", return_value=("", "stdin_pipe_empty")),
                 mock.patch.object(scribe, "get_clipboard_text", return_value=""),
                 mock.patch.object(scribe, "MEMORY_STORE_FILE", learning_path),
-                mock.patch.object(scribe.ollama, "chat", return_value=model_response),
+                mock.patch.object(scribe.ollama, "chat", return_value=model_response) as chat,
                 mock.patch("sys.stdout", new_callable=io.StringIO) as stdout,
                 mock.patch("sys.stderr", new_callable=io.StringIO),
             ):
@@ -624,6 +624,7 @@ class TestScribeLearning(unittest.TestCase):
 
             self.assertEqual(exit_code, 0)
             self.assertIn("[[Mom]]", stdout.getvalue())
+            self.assertEqual(chat.call_args.kwargs.get("format"), "json")
 
     def test_main_prefers_journal_file_over_clipboard_on_tty(self):
         with tempfile.TemporaryDirectory() as d:
