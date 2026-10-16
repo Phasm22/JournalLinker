@@ -701,5 +701,38 @@ class TestAppendWordOfTheDay(unittest.TestCase):
             self.assertIn("- petrichor — 2026-07-07", content)
 
 
+
+class TestPushCommandNotificationPnotify(unittest.TestCase):
+    """The pnotify fallback distinguishes a real send from a credential-less skip."""
+
+    def setUp(self):
+        self._env = mock.patch.dict(os.environ, {}, clear=False)
+        self._env.start()
+        for var in ("SCRIBE_PUSHOVER_APP_TOKEN", "SCRIBE_PUSHOVER_USER_KEY",
+                    "PUSHOVER_TOKEN", "PUSHOVER_KEY",
+                    "PUSHOVER_APP_TOKEN", "PUSHOVER_USER_KEY"):
+            os.environ.pop(var, None)
+
+    def tearDown(self):
+        self._env.stop()
+
+    def _run(self, returncode, stderr=""):
+        proc = mock.Mock(returncode=returncode, stderr=stderr)
+        with mock.patch("shutil.which", return_value="/usr/bin/pnotify"), \
+                mock.patch("subprocess.run", return_value=proc) as run_mock, \
+                mock.patch.object(pi, "_log") as log_mock:
+            pi._push_command_notification("Title", "Body")
+        run_mock.assert_called_once()
+        return [c.args[1] for c in log_mock.call_args_list]
+
+    def test_exit_3_is_logged_as_skip_not_send(self):
+        logs = self._run(3, "pnotify: skipped (creds not set)")
+        self.assertTrue(any(m.startswith("pnotify skipped") for m in logs), logs)
+        self.assertNotIn("pnotify invoked", logs)
+
+    def test_exit_0_is_logged_as_send(self):
+        self.assertIn("pnotify invoked", self._run(0))
+
+
 if __name__ == "__main__":
     unittest.main()

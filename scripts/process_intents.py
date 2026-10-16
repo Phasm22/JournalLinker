@@ -1991,8 +1991,8 @@ def _push_command_notification(title: str, body: str, urgency: str = "today") ->
             timeout=20, check=False,
             capture_output=True, text=True,
         )
-        if proc.returncode == 0 and "skipped" in proc.stderr:
-            # pnotify exits 0 when its creds are missing; don't log that as a send.
+        if proc.returncode == 3:
+            # pnotify's "no credentials" exit code — not a send.
             _log("command", f"pnotify skipped: {proc.stderr.strip()[:120]}")
         elif proc.returncode == 0:
             _log("command", "pnotify invoked")

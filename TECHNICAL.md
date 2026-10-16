@@ -67,7 +67,9 @@ python3 Scribe.py --reset-learning
 
 ## Pushover credentials
 
-- Pushover credentials can be provided as either `SCRIBE_PUSHOVER_APP_TOKEN` / `SCRIBE_PUSHOVER_USER_KEY` or the aliases `PUSHOVER_TOKEN` / `PUSHOVER_KEY` and `PUSHOVER_APP_TOKEN` / `PUSHOVER_USER_KEY` (the names `~/bin/pnotify` uses).
+- Preferred: keep the keys only in the shared pnotify file `~/.config/pnotify/env` (mode 600, `PUSHOVER_APP_TOKEN=` / `PUSHOVER_USER_KEY=` lines; override the path with `PNOTIFY_ENV_FILE`). `journal_linker_env.py` loads it at bootstrap and `~/bin/pnotify` reads it directly, so systemd jobs, agents and interactive shells all see the same keys.
+- `pnotify` exits `3` when it has no credentials (a skip, not a send); the command path logs that as `pnotify skipped`.
+- Pushover credentials can also be provided as either `SCRIBE_PUSHOVER_APP_TOKEN` / `SCRIBE_PUSHOVER_USER_KEY` or the aliases `PUSHOVER_TOKEN` / `PUSHOVER_KEY` and `PUSHOVER_APP_TOKEN` / `PUSHOVER_USER_KEY` (the names `~/bin/pnotify` uses).
 
 ## Intent pipeline (`scripts/process_intents.py` in `JOURNAL_LINKER_REPO`)
 

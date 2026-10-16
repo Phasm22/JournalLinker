@@ -200,7 +200,7 @@ Port 8797 because 8790–8792 belong to Argus. Shortcut URL: `https://<host>.<ta
 | `SCRIBE_PUSHOVER_DEVICE`   | —                          | Optional device name to target a specific device                                |
 | `SCRIBE_PUSHOVER_PRIORITY` | `0`                        | Pushover priority                                                               |
 
-For compatibility, the Pushover senders also accept `PUSHOVER_TOKEN` / `PUSHOVER_KEY` and `PUSHOVER_APP_TOKEN` / `PUSHOVER_USER_KEY` (pnotify's names) as aliases for the app token and user key.
+Recommended: keep the keys only in `~/.config/pnotify/env` (see TECHNICAL.md → Pushover credentials). For compatibility, the Pushover senders also accept `PUSHOVER_TOKEN` / `PUSHOVER_KEY` and `PUSHOVER_APP_TOKEN` / `PUSHOVER_USER_KEY` (pnotify's names) as aliases for the app token and user key.
 
 
 ---
