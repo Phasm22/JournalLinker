@@ -15,7 +15,6 @@ DEFAULT_LOG_DAYS = 30
 DEFAULT_KEEP_NEWEST = 20
 GENERATED_LOG_PREFIXES = (
     "scribe-",
-    "daily-reflection-",
     "voice-",
     "voice-retry-",
     "intent-",

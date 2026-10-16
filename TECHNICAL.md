@@ -29,8 +29,6 @@ SCRIBE_EMBED_KEEP_ALIVE="5m"
 SCRIBE_EMBED_CACHE_MAX_ITEMS="512"
 SCRIBE_PUSHOVER_APP_TOKEN="your-app-token"
 SCRIBE_PUSHOVER_USER_KEY="your-user-key"
-SCRIBE_DAILY_REFLECTION_WINDOW_START="16:00"
-SCRIBE_DAILY_REFLECTION_WINDOW_END="21:00"
 ```
 
 ## Offline corpus sampling (no intent pipeline / no time)
@@ -67,19 +65,9 @@ python3 Scribe.py --reset-learning
 - `--active-date` and `--active-file` override how the current note is resolved.
 - `--reset-learning` clears `scribe_learning.json` before the run.
 
-## `daily_reflection.py` CLI
+## Pushover credentials
 
-```bash
-python3 daily_reflection.py --journal-dir "/path/to/journal"
-python3 daily_reflection.py --dry-run
-python3 daily_reflection.py --date 2026-04-08
-python3 daily_reflection.py --force-send
-```
-
-- `--date` overrides the reflected day; default is yesterday in local time.
-- `--dry-run` prints the Pushover payload without sending it.
-- `--force-send` bypasses the sent-state check for manual testing.
-- Pushover credentials can be provided as either `SCRIBE_PUSHOVER_APP_TOKEN` / `SCRIBE_PUSHOVER_USER_KEY` or the older aliases `PUSHOVER_TOKEN` / `PUSHOVER_KEY`.
+- Pushover credentials can be provided as either `SCRIBE_PUSHOVER_APP_TOKEN` / `SCRIBE_PUSHOVER_USER_KEY` or the aliases `PUSHOVER_TOKEN` / `PUSHOVER_KEY` and `PUSHOVER_APP_TOKEN` / `PUSHOVER_USER_KEY` (the names `~/bin/pnotify` uses).
 
 ## Intent pipeline (`scripts/process_intents.py` in `JOURNAL_LINKER_REPO`)
 
@@ -108,7 +96,7 @@ Unset behavior preserves legacy pipelines; set flags in `~/.config/journal-linke
 | `INTENT_PUSHOVER_URGENCIES` | *(unset → `immediate`, `today`, `soon`)* | Comma-separated subset of `immediate,today,soon,low` that may trigger a Pushover message. Example: `immediate,today` skips Pushover when the router sets `urgency=soon`. |
 
 
-Other useful intent variables (see the script docstring in-repo): `INTENT_GATE_MODEL`, `INTENT_ROUTING_MODEL`, `INTENT_STATE_DIR`, `INTENT_FEEDBACK_DELAY_TODAY`, `INTENT_FEEDBACK_DELAY_SOON`, `INTENT_CORTEX_DIR`, `INTENT_WELLNESS_DIR`, `INTENT_WATER_BOTTLE_ML`, `OPENAI_API_KEY`, and the same `SCRIBE_PUSHOVER_*` keys as daily reflection.
+Other useful intent variables (see the script docstring in-repo): `INTENT_GATE_MODEL`, `INTENT_ROUTING_MODEL`, `INTENT_STATE_DIR`, `INTENT_FEEDBACK_DELAY_TODAY`, `INTENT_FEEDBACK_DELAY_SOON`, `INTENT_CORTEX_DIR`, `INTENT_WELLNESS_DIR`, `INTENT_WATER_BOTTLE_ML`, `OPENAI_API_KEY`, and the `SCRIBE_PUSHOVER_*` keys (see Pushover credentials above).
 
 ### Telegram design contract + reactions + reply learning
 
@@ -181,7 +169,7 @@ Recommended indexing pattern:
 
 ## Supervised job telemetry
 
-Wrappers (`scripts/scheduled_run.sh`, `daily_reflection.sh`, `voice_*.sh`, `intent_*.sh`, `feedback_sender.sh`) source `scripts/job_log_lib.sh` and finalize via `python -m journal_linker_telemetry finalize`. Entrypoints write service-specific fields with `journal_linker_telemetry.maybe_write_job_payload()` when `JOURNAL_LINKER_JOB_PAYLOAD_FILE` is set. See [`SERVICE_INTAKE.md`](SERVICE_INTAKE.md) for the `JOURNAL_LINKER_EVENT=` schema.
+Wrappers (`scripts/scheduled_run.sh`, `voice_*.sh`, `intent_*.sh`, `feedback_sender.sh`) source `scripts/job_log_lib.sh` and finalize via `python -m journal_linker_telemetry finalize`. Entrypoints write service-specific fields with `journal_linker_telemetry.maybe_write_job_payload()` when `JOURNAL_LINKER_JOB_PAYLOAD_FILE` is set. See [`SERVICE_INTAKE.md`](SERVICE_INTAKE.md) for the `JOURNAL_LINKER_EVENT=` schema.
 
 **Linux log root:** `SCRIBE_JOB_LOG_DIR` (typical: `~/.local/state/journal-linker/`). Not `~/Library/Logs/JournalLinker/` (macOS) and not `~/.local/state/journal-linker/logs/` (legacy).
 
@@ -208,7 +196,6 @@ Restart is required: a process that opened the DB before migrate keeps the old s
 - It uses Ollama for candidate generation.
 - It ranks candidates with heuristics plus optional local embeddings.
 - It writes and reuses learning data in `scribe_learning.json`.
-- Daily reflection push reads only the previous day's note, computes a deterministic random send time within the configured local window, and sends to Pushover at most once per day.
 - The embedding cache lives in the same learning file so repeated runs can reuse vectors.
 
 ## Notes

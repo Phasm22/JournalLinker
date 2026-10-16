@@ -22,7 +22,7 @@ class TestJournalLinkerTelemetry(unittest.TestCase):
             buf = io.StringIO()
             with patch.object(sys, "stderr", buf):
                 telemetry.finalize_job_event(
-                    service="daily-reflection",
+                    service="scribe",
                     run_id="20260519-120000-1",
                     exit_code=0,
                     duration_sec=1.5,
@@ -33,7 +33,7 @@ class TestJournalLinkerTelemetry(unittest.TestCase):
             event = telemetry.parse_event_line(line)
             assert event is not None
             self.assertEqual(event["event"], "job.completed")
-            self.assertEqual(event["service"], "daily-reflection")
+            self.assertEqual(event["service"], "scribe")
             self.assertEqual(event["run_id"], "20260519-120000-1")
             self.assertEqual(event["exit_code"], 0)
             self.assertEqual(event["duration_sec"], 1.5)

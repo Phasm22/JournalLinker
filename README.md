@@ -8,9 +8,8 @@ One feedback loop, several moving parts:
 
 - **Scribe** — inserts `[[wikilinks]]` into daily notes using a local Ollama model, re-ranked by a reinforcement learning store that tracks what links actually stuck
 - **Echo** — transcribes iPhone voice recordings with Whisper, using that same learning store as vocabulary context so your project names and proper nouns land correctly
-- **Daily Reflection Push** — reads yesterday's entry, drafts a short reflection, and sends it once per day through Pushover
 
-Related automation (not always in *this* repo clone) can live under `JOURNAL_LINKER_REPO` on disk — e.g. intent routing and Telegram feedback — but Scribe, voice, and daily reflection are anchored here.
+Related automation (not always in *this* repo clone) can live under `JOURNAL_LINKER_REPO` on disk — e.g. intent routing and Telegram feedback — but Scribe and voice are anchored here.
 
 ---
 
@@ -39,7 +38,7 @@ On TJ's Linux desktop:
 | Component | Boot behavior | Start when needed |
 |-----------|---------------|-------------------|
 | Path units (voice/intent watchers) | **Enabled** — event-driven, near-zero idle cost | automatic on file drop |
-| Timers (scribe, reflection, retries) | **Enabled** — every 30 min | automatic; call `scripts/ensure_ollama.sh` before Ollama jobs |
+| Timers (scribe, retries) | **Enabled** — every 30 min | automatic; call `scripts/ensure_ollama.sh` before Ollama jobs |
 | Feedback sender (Telegram long-poll) | **Disabled** at boot | `pc-stacks up journal` |
 
 ```bash
@@ -94,8 +93,6 @@ Install [just](https://github.com/casey/just) (`brew install just`).
 | `just scribe-paste`     | macOS: clipboard → Scribe → stdout                                 |
 | `just scribe-writeback` | Read today's note from disk, insert wikilinks, write back in-place |
 | `just scribe-job`       | Same wrapper the launchd agent uses (timestamped logs)             |
-| `just daily-reflection` | Dry-run the day-behind Pushover reflection and print the notification |
-| `just daily-reflection-send` | Run the real Pushover delivery path manually                 |
 | `just intent-mcp-install` | Install the MCP client used for llmLibrarian intent enrichment |
 | `just test`             | Run pytest (Ollama mocked)                                         |
 | `just coverage`         | Run pytest under coverage and print missing lines                  |
@@ -159,13 +156,6 @@ iOS setup: **[docs/ios-setup.md](./docs/ios-setup.md)**
 - Uses `WatchPaths` as the trigger edge only — all logic lives in Python
 - Logs: `~/Library/Logs/JournalLinker/voice-*.log`, symlink `voice-latest.log`
 
-**Daily reflection push** (`com.journal-linker.daily-reflection`)
-
-- Plist: [launchd/DailyReflection.example.plist](./launchd/DailyReflection.example.plist)
-- Polls every 15 minutes; `daily_reflection.py` chooses one deterministic random send time between the configured local window bounds and sends once when that tick arrives
-- Sends a short day-behind reflection to Pushover; skips silently when yesterday's note is missing or too thin
-- Logs: `~/Library/Logs/JournalLinker/daily-reflection-*.log`, symlink `daily-reflection-latest.log`
-
 **Verify both agents:** `launchctl list | grep journal-linker`
 
 ---
@@ -209,10 +199,8 @@ Port 8797 because 8790–8792 belong to Argus. Shortcut URL: `https://<host>.<ta
 | `SCRIBE_PUSHOVER_USER_KEY` | —                          | Pushover recipient user key                                                     |
 | `SCRIBE_PUSHOVER_DEVICE`   | —                          | Optional device name to target a specific device                                |
 | `SCRIBE_PUSHOVER_PRIORITY` | `0`                        | Pushover priority                                                               |
-| `SCRIBE_DAILY_REFLECTION_WINDOW_START` | `16:00`      | Local start of the random reflection send window                                 |
-| `SCRIBE_DAILY_REFLECTION_WINDOW_END`   | `21:00`      | Local end of the random reflection send window                                   |
 
-For compatibility, `daily_reflection.py` also accepts `PUSHOVER_TOKEN` and `PUSHOVER_KEY` as aliases for the app token and user key.
+For compatibility, the Pushover senders also accept `PUSHOVER_TOKEN` / `PUSHOVER_KEY` and `PUSHOVER_APP_TOKEN` / `PUSHOVER_USER_KEY` (pnotify's names) as aliases for the app token and user key.
 
 
 ---
@@ -223,12 +211,10 @@ For compatibility, `daily_reflection.py` also accepts `PUSHOVER_TOKEN` and `PUSH
 | Path                       | Role                                                           |
 | -------------------------- | -------------------------------------------------------------- |
 | `Scribe.py`                | Wikilink pipeline + learning store                             |
-| `daily_reflection.py`      | Day-behind Pushover reflection generator + sender              |
 | `archivist.py`             | Standalone Ollama + clipboard utility                          |
 | `scripts/process_voice.py` | Echo: voice-to-journal bridge                                  |
 | `scripts/voice_watcher.sh` | launchd wrapper for Echo                                       |
 | `scripts/scheduled_run.sh` | launchd wrapper for Scribe                                     |
-| `scripts/daily_reflection.sh` | launchd/systemd wrapper for Pushover reflection polling    |
 | `launchd/`                 | Example plists (macOS)                                         |
 | `systemd/`                 | Example user units + `journal-linker.env.example` (Linux)      |
 | `docs/ios-setup.md`        | iOS Shortcut build guide (UTS#35 date format, troubleshooting) |

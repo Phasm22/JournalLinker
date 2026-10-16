@@ -32,7 +32,6 @@ This intake process determines whether a service is ready to be monitored. The g
 | `scribe` | `journal-linker-scribe.timer` / `com.journal-linker.scribe` | Calendar 03:17 local | Pass | 36 h |
 | `voice-watcher` | `journal-linker-voice-watcher.path` or `voice-poll.timer` / `com.journal-linker.voice` | PathChanged / 2 min poll | Pass | 24 h (if recordings expected) |
 | `voice-retry` | `journal-linker-voice-retry.timer` / `com.journal-linker.voice-retry` | Every 15 min (:09/:24/:39/:54) | Pass | 6 h (when transient backlog) |
-| `daily-reflection` | `journal-linker-daily-reflection.timer` / `com.journal-linker.daily-reflection` | Every 15 min (:02/:17/:32/:47) | Pass | 26 h (missed send day) |
 | `intent-watcher` | `journal-linker-intent-watcher.path` / `com.journal-linker.intent` | PathChanged on journal dir | Pass | N/A (event-driven) |
 | `intent-retry` | `journal-linker-intent-retry.timer` | Every 15 min (boot+active) | Pass | 2 h (stuck transient queue) |
 | `feedback-sender` | `journal-linker-feedback-sender.service` | Continuous (long-poll) | Pass | 5 min (daemon down) |
@@ -199,54 +198,6 @@ This intake process determines whether a service is ready to be monitored. The g
 
 ---
 
-## `daily-reflection` — day-behind Pushover reflection
-
-**Stage 1:** Pass.
-
-| Gate question | Answer |
-|---------------|--------|
-| Trigger? | **Schedule** — poller every 15 min; script picks one random send instant inside window |
-| Observable success? | One Pushover per reflected day; state file records send; log shows send or explicit skip |
-| Structured output? | **Yes** — wrapper log; optional `daily_reflection_state.json` |
-| Max silence? | **26 h** after end of send window without send or documented skip |
-
-### Stage 2 — Questionnaire
-
-**Identity**
-
-- **One sentence:** Once per day, sends a short Pushover reflection on yesterday's journal entry using Ollama + learning store context.
-- **Triggers:** `scripts/daily_reflection.sh` → `daily_reflection.py`; window default **16:00–21:00** local (`DAILY_REFLECTION_WINDOW_START/END`).
-
-**Execution**
-
-- **Frequency:** Poll every 15 min; **at most one send** per calendar day.
-- **Max duration:** **10 min** per tick (Ollama + HTTP).
-
-**Health**
-
-- **Success:** Pushover API 200; state updated; or **clean skip** (thin/missing yesterday note, outside window, already sent) with exit 0.
-- **Silent failure risk?** **Medium** — skip paths look healthy; missed window if poller never runs.
-- **Failure:** Exit 1 (send/API/model); exit 2 (config).
-
-**Alerting**
-
-- **Consecutive:** Alert on **2** failed send attempts on the chosen send day (not skip).
-- **Missed window:** **Alert** if no send and no logged skip by **26 h** after window end.
-- **Downstream:** User misses reflection notification only.
-
-**Logging**
-
-- **Where:** `daily-reflection-*.log`, `daily-reflection-latest.log`.
-- **Broken today:** Latest log, `daily_reflection_state.json`, Pushover creds, `just daily-reflection` dry-run.
-
-**Dashboard**
-
-- **At a glance:** Last send date; today's status (sent / skipped / pending window / failed).
-
-**Lock:** `$LOG_DIR/.daily-reflection.lock`
-
----
-
 ## `intent-watcher` — journal change → intent pipeline
 
 **Stage 1:** Pass.
@@ -403,9 +354,9 @@ Monitor separately; journalLinker degrades without them:
 
 | Dependency | Health check | Affects |
 |------------|----------------|---------|
-| Ollama | Model pull; API reachable | scribe, intent gate, daily-reflection, voice→Scribe |
+| Ollama | Model pull; API reachable | scribe, intent gate, voice→Scribe |
 | OpenAI API | Key valid | intent routing |
-| Pushover | `pnotify` / API | daily-reflection, intent delivery |
+| Pushover | `pnotify` / API | intent delivery, commands, nutrition summary |
 | llmLibrarian MCP | `just status` → `/healthz` | intent enrichment (graceful off) |
 | faster-whisper | `just voice-doctor` | voice pipeline |
 | Dropbox/iCloud sync | File fully local | voice-watcher placeholders |
@@ -449,7 +400,6 @@ Human-readable header/footer (`start`, `end`, `duration_sec`, `exit_code` text l
 | Service | Extra JSON fields |
 |---------|-------------------|
 | `scribe` | `active_file`, `write_back`, `links_added`, `ollama_sec` |
-| `daily-reflection` | `outcome` (`sent` \| `skipped` \| `failed` \| `dry_run`), `reason`, `reflection_date`, `target_send_at`, `sent` |
 | `voice`, `voice-retry` | `items_processed`, `items_failed`, `items_skipped_placeholder`, `items_skipped_already`, `items_pending_at_start` |
 | `intent-watcher`, `intent-retry` | `intents_gated`, `intents_delivered`, `intents_suppressed`, `intents_failed`, `retry_queue_in`, `retry_queue_out`, `worst_exit_code` |
 | `feedback-sender` (one-shot) | `updates_received`, `feedback_queue_pending`, `poll_offset` |

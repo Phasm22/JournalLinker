@@ -2887,8 +2887,8 @@ def _fit_summary_body(lines: list[str], footer: str) -> str:
 
 
 def publish_nutrition_summary(title: str, message: str) -> tuple[int, str]:
-    app_token = os.getenv("SCRIBE_PUSHOVER_APP_TOKEN", "").strip() or os.getenv("PUSHOVER_TOKEN", "").strip()
-    user_key = os.getenv("SCRIBE_PUSHOVER_USER_KEY", "").strip() or os.getenv("PUSHOVER_KEY", "").strip()
+    app_token = os.getenv("SCRIBE_PUSHOVER_APP_TOKEN", "").strip() or os.getenv("PUSHOVER_TOKEN", "").strip() or os.getenv("PUSHOVER_APP_TOKEN", "").strip()
+    user_key = os.getenv("SCRIBE_PUSHOVER_USER_KEY", "").strip() or os.getenv("PUSHOVER_KEY", "").strip() or os.getenv("PUSHOVER_USER_KEY", "").strip()
     if not app_token:
         raise ValueError("SCRIBE_PUSHOVER_APP_TOKEN is required for Pushover delivery.")
     if not user_key:

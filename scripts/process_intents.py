@@ -174,7 +174,7 @@ COMMAND_LEDGER_FILENAME = "intent_command_ledger.jsonl"
 VOICE_ANOMALY_LOG_FILENAME = "voice_anomalies.jsonl"
 CONSENT_FILENAME = "intent_consent.json"
 GENERATED_RUN_LOG_RE = re.compile(
-    r"^(?:intent|intent-retry|voice-retry|daily-reflection)-\d{8}-\d{6}-\d+\.log$"
+    r"^(?:intent|intent-retry|voice-retry)-\d{8}-\d{6}-\d+\.log$"
 )
 
 
@@ -1208,6 +1208,7 @@ def _get_pushover_token() -> str:
     return (
         os.getenv("SCRIBE_PUSHOVER_APP_TOKEN", "").strip()
         or os.getenv("PUSHOVER_TOKEN", "").strip()
+        or os.getenv("PUSHOVER_APP_TOKEN", "").strip()
     )
 
 
@@ -1215,6 +1216,7 @@ def _get_pushover_key() -> str:
     return (
         os.getenv("SCRIBE_PUSHOVER_USER_KEY", "").strip()
         or os.getenv("PUSHOVER_KEY", "").strip()
+        or os.getenv("PUSHOVER_USER_KEY", "").strip()
     )
 
 
@@ -1989,7 +1991,10 @@ def _push_command_notification(title: str, body: str, urgency: str = "today") ->
             timeout=20, check=False,
             capture_output=True, text=True,
         )
-        if proc.returncode == 0:
+        if proc.returncode == 0 and "skipped" in proc.stderr:
+            # pnotify exits 0 when its creds are missing; don't log that as a send.
+            _log("command", f"pnotify skipped: {proc.stderr.strip()[:120]}")
+        elif proc.returncode == 0:
             _log("command", "pnotify invoked")
         else:
             _log("command", f"pnotify rc={proc.returncode}: {proc.stderr.strip()[:120]}")

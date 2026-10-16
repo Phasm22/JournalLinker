@@ -33,14 +33,6 @@ scribe-job:
 launchagent-journal p:
     "{{root}}/scripts/patch_launchagent_journal.sh" "{{p}}"
 
-# Dry-run the daily Pushover reflection without sending
-daily-reflection *ARGS:
-    "{{py}}" "{{root}}/daily_reflection.py" --dry-run {{ARGS}}
-
-# Real daily Pushover reflection run (same core path as the scheduled job)
-daily-reflection-send *ARGS:
-    "{{py}}" "{{root}}/daily_reflection.py" {{ARGS}}
-
 # Print today's nutrition summary without sending Pushover
 nutrition-summary *ARGS:
     "{{py}}" "{{root}}/scripts/nutrition_ledger.py" --summary --dry-run {{ARGS}}
