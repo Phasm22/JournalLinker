@@ -5,6 +5,12 @@ Reads a daily note, gates actionable intent via a local Ollama model,
 packages context, calls an OpenAI model for structured routing output, then delivers
 to Pushover / Obsidian cortex/ / JSON digest queue.
 
+Also runs a voice wellness/nutrition stage (see nutrition_ledger.py) that extracts
+meal|water|craving|want_to_cook|preference captures from `> [!voice]` callouts into
+<journal_dir>/wellness/ notes with filterable YAML frontmatter (plus the calorie JSONL
+ledger for intake). Wellness stays outside cortex/ so llmLibrarian and AnythingLLM
+vault sync both index it.
+
 Usage:
     python3 scripts/process_intents.py --file /path/to/2026-04-16.md
     python3 scripts/process_intents.py --file note.md --dry-run
@@ -22,10 +28,20 @@ Exit codes (stable contract for shell wrappers):
 
 Env vars (from .env or environment):
     SCRIBE_JOURNAL_DIR           journal directory (required)
-    INTENT_GATE_MODEL            Ollama gate model (default: phi4:14b)
+    INTENT_GATE_MODEL            Ollama gate model (default: qwen2.5:14b)
     INTENT_GATE_STYLE            auto|phi4|qwen25 (default: auto)
     INTENT_ROUTING_MODEL         OpenAI model ID (default: gpt-4o-mini)
+    INTENT_NUTRITION_MODEL       Ollama model for voice nutrition extract
+                                 (default: INTENT_GATE_MODEL)
+    INTENT_NUTRITION_LOOKUP_MODEL
+                                 OpenAI model for branded nutrition lookup
+                                 (default: gpt-4o-mini)
     INTENT_CORTEX_DIR            Obsidian cortex write target (default: <journal_dir>/cortex)
+    INTENT_WELLNESS_DIR          Voice wellness note target
+                                 (default: <journal_dir>/wellness; not under cortex/)
+    INTENT_WATER_BOTTLE_ML       Default water-bottle size in ml when the speaker
+                                 says "a water bottle" / "filled up my bottle"
+                                 (default: 1000)
     INTENT_STATE_DIR             local state directory
                                  (default: ~/.local/state/journal-linker/intents)
     INTENT_CLAUDE_IN_FLIGHT_TTL  seconds before in-flight entry is treated as stale
@@ -114,6 +130,9 @@ class RunSummary:
     commands_executed: int = 0
     commands_failed: int = 0
     commands_needs_confirmation: int = 0
+    nutrition_logged: int = 0
+    wellness_notes: int = 0
+    nutrition_failed: int = 0
 
     def to_payload(self) -> dict:
         return {k: v for k, v in asdict(self).items()}
@@ -128,7 +147,7 @@ def _finalize_run(exit_code: int, summary: RunSummary) -> int:
     return exit_code
 
 
-DEFAULT_GATE_MODEL = "phi4:14b"
+DEFAULT_GATE_MODEL = "qwen2.5:14b"
 DEFAULT_GATE_STYLE = "auto"
 DEFAULT_ROUTING_MODEL = "gpt-4o-mini"
 DEFAULT_IN_FLIGHT_TTL = 300  # seconds
@@ -154,6 +173,9 @@ ACTION_QUEUE_FILENAME = "intent_action_queue.jsonl"
 COMMAND_LEDGER_FILENAME = "intent_command_ledger.jsonl"
 VOICE_ANOMALY_LOG_FILENAME = "voice_anomalies.jsonl"
 CONSENT_FILENAME = "intent_consent.json"
+GENERATED_RUN_LOG_RE = re.compile(
+    r"^(?:intent|intent-retry|voice-retry)-\d{8}-\d{6}-\d+\.log$"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -250,13 +272,24 @@ def _infer_gate_style(model_name: str) -> str:
     return "phi4"
 
 
+_GATE_FOOD_EXCLUSION = (
+    "Food/water logging is handled by a separate wellness stage — do NOT extract intents for: "
+    "meals or snacks the author already ate or drank, water intake (\"one glass\", \"water bottle\"), "
+    "cravings, \"I want [food]\" wishes, \"add X to today's log\" / \"add X to my log\", "
+    "or invented reminders like \"drink more water\". "
+    "Only keep food-related intents when the author explicitly asks for a reminder/task "
+    "(e.g. \"remind me to pick up eggs\", \"need to grab basmati rice\")."
+)
+
+
 def _build_gate_prompt_phi4(text_excerpt: str) -> str:
     return (
         "You are a concise intent extractor. "
         "Read the following journal excerpt and extract ALL actionable intents: "
         "concrete tasks, commitments, reminders, or plans the author intends to act on. "
         "Do not extract items that the author says are already handled, already in another reminder system, "
-        "or mentioned only as praise/retrospective narration.\n\n"
+        "or mentioned only as praise/retrospective narration. "
+        f"{_GATE_FOOD_EXCLUSION}\n\n"
         "Excerpt:\n"
         "---\n"
         f"{text_excerpt}\n"
@@ -275,6 +308,7 @@ def _build_gate_prompt_qwen25(text_excerpt: str) -> str:
         "Extract ALL actionable intents (tasks, reminders, commitments, plans). "
         "Do not extract already-completed items, reminders the author says another system already handles, "
         "or retrospective praise/observations with no remaining action. "
+        f"{_GATE_FOOD_EXCLUSION} "
         "Also classify the downstream intent class. "
         "Output only a JSON object — no markdown fences, no extra text.\n"
         'Schema: {"intents": [{"intent_raw": string, "category": string, "intent_class": string}]}\n'
@@ -388,6 +422,78 @@ def _dedupe_intents(intents: list[dict]) -> list[dict]:
     return out[:max_n]
 
 
+_FOOD_LOG_INTENT_RE = re.compile(
+    r"\b("
+    r"drink\s+more\s+water|water\s+bottle|glass\s+of\s+water|"
+    r"add\s+.+\s+to\s+(?:my\s+|today'?s?\s+|the\s+)?log|"
+    r"log\s+(?:a\s+)?(?:protein\s+bar|meal|snack|water)|"
+    r"crav(?:e|es|ing)|"
+    r"(?:had|ate|drank)\s+"
+    r")\b",
+    re.I,
+)
+_EXPLICIT_REMINDER_RE = re.compile(
+    r"\b(remind\s+me|need\s+to\s+(?:grab|buy|pick\s+up|get)|pick\s+up|buy|order|schedule)\b",
+    re.I,
+)
+
+
+def is_food_logging_intent(intent_raw: str, source_text: str = "") -> bool:
+    """True when the gate invented a food/water log task (wellness handles these)."""
+    raw = str(intent_raw or "").strip()
+    if not raw:
+        return False
+    if _EXPLICIT_REMINDER_RE.search(raw) or _EXPLICIT_REMINDER_RE.search(source_text or ""):
+        # Keep purchase/reminder language even if food words appear.
+        if re.search(r"\b(buy|grab|pick\s+up|order|remind)\b", raw, re.I):
+            return False
+    if _FOOD_LOG_INTENT_RE.search(raw):
+        return True
+    # Pure water-habit inventions from short water utterances.
+    if re.search(r"\bwater\b", raw, re.I) and not _EXPLICIT_REMINDER_RE.search(raw):
+        if re.search(r"\b(drink|hydrate|bottle|glass)\b", raw, re.I):
+            return True
+    return False
+
+
+def filter_food_logging_intents(intents: list[dict], source_text: str = "") -> list[dict]:
+    """Drop gate intents that belong to the wellness/nutrition stage."""
+    kept: list[dict] = []
+    for item in intents:
+        if is_food_logging_intent(str(item.get("intent_raw") or ""), source_text):
+            _log("gate", f"dropped food-log intent: {item.get('intent_raw')}")
+            continue
+        kept.append(item)
+    return kept
+
+
+def _parse_gate_model_text(raw_content: str) -> list[dict]:
+    """Parse gate model text; empty / non-JSON replies become no intents (not errors)."""
+    cleaned = _strip_think(raw_content or "").strip()
+    if not cleaned:
+        return []
+    # Bare empty array is a valid "nothing actionable" reply.
+    if cleaned in {"[]", "{}", '{"intents":[]}', '{"intents": []}'}:
+        return []
+    try:
+        gate_output = _extract_json_obj(cleaned)
+    except ValueError:
+        # Some models emit a top-level list of intent objects.
+        decoder = json.JSONDecoder()
+        for i, ch in enumerate(cleaned):
+            if ch != "[":
+                continue
+            try:
+                obj, _ = decoder.raw_decode(cleaned[i:])
+                if isinstance(obj, list):
+                    return _parse_gate_output({"intents": obj})
+            except json.JSONDecodeError:
+                continue
+        _log("gate", f"unparseable gate output (treating as no intents): {cleaned[:160]!r}")
+        return []
+    return _parse_gate_output(gate_output)
+
+
 def call_gate(note_text: str, model: str, style: str, num_ctx: int = 4096) -> list[dict]:
     """Run the gate model via Ollama. Returns a list of {intent_raw, category} dicts."""
     try:
@@ -402,19 +508,27 @@ def call_gate(note_text: str, model: str, style: str, num_ctx: int = 4096) -> li
     if not chunks:
         chunks = [note_text[:2000].strip()]
     merged: list[dict] = []
+    hard_errors: list[BaseException] = []
     for idx, excerpt in enumerate(chunks):
         prompt = build_gate_prompt(excerpt, style)
         _log("gate", f"calling model={model} style={style} chunk={idx + 1}/{len(chunks)}")
-        response = ollama.chat(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            options={"temperature": 0.0, "num_ctx": num_ctx},
-            keep_alive=KEEP_ALIVE,
-        )
-        raw_content = response["message"]["content"]
-        gate_output = _extract_json_obj(raw_content)
-        merged.extend(_parse_gate_output(gate_output))
-    return _dedupe_intents(merged)
+        try:
+            response = ollama.chat(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                options={"temperature": 0.0, "num_ctx": num_ctx},
+                keep_alive=KEEP_ALIVE,
+            )
+            raw_content = response["message"]["content"]
+            # Unparseable model prose → no intents for this chunk (not a hard failure).
+            merged.extend(_parse_gate_model_text(raw_content))
+        except Exception as exc:
+            hard_errors.append(exc)
+            _log("gate", f"chunk {idx + 1} failed: {exc}")
+    if hard_errors and not merged:
+        # Ollama down / transport errors must still surface as gate-transient.
+        raise hard_errors[0]
+    return filter_food_logging_intents(_dedupe_intents(merged), note_text)
 
 
 _VALID_CATEGORIES = {"task", "reminder", "commitment", "plan", "none"}
@@ -1094,6 +1208,7 @@ def _get_pushover_token() -> str:
     return (
         os.getenv("SCRIBE_PUSHOVER_APP_TOKEN", "").strip()
         or os.getenv("PUSHOVER_TOKEN", "").strip()
+        or os.getenv("PUSHOVER_APP_TOKEN", "").strip()
     )
 
 
@@ -1101,6 +1216,7 @@ def _get_pushover_key() -> str:
     return (
         os.getenv("SCRIBE_PUSHOVER_USER_KEY", "").strip()
         or os.getenv("PUSHOVER_KEY", "").strip()
+        or os.getenv("PUSHOVER_USER_KEY", "").strip()
     )
 
 
@@ -1294,6 +1410,12 @@ def compute_feedback_timing(
 # Delivery: Obsidian cortex write
 # ---------------------------------------------------------------------------
 
+def _yaml_double_quoted(value: str) -> str:
+    """Serialize a string as a double-quoted YAML scalar (escape \\ and \")."""
+    escaped = str(value or "").replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
 def write_cortex_note(
     cortex_dir: Path,
     title: str,
@@ -1314,7 +1436,10 @@ def write_cortex_note(
     # Organize into per-category subdirectory
     subdir = cortex_dir / (category or "other")
     subdir.mkdir(parents=True, exist_ok=True)
-    note_path = subdir / f"{date_prefix} {safe_title}.md"
+    # Include a short idempotency prefix so two intents that share a title on
+    # the same day do not overwrite each other on disk.
+    key_prefix = (claude_idempotency_key or "")[:8] or "note"
+    note_path = subdir / f"{date_prefix} {safe_title} {key_prefix}.md"
 
     # Source as Obsidian wikilink from timestamp date
     source_link = f"[[{date_prefix}]]"
@@ -1322,7 +1447,7 @@ def write_cortex_note(
     # Build frontmatter lines
     fm_lines = [
         "---",
-        f'source: "{source_link}"',
+        f"source: {_yaml_double_quoted(source_link)}",
         f"category: {category}",
         f"intent_class: {intent_class}",
         f"action: {action}",
@@ -1333,7 +1458,7 @@ def write_cortex_note(
     if defer_to:
         fm_lines.append(f"defer_to: {defer_to}")
     if feedback_prompt:
-        fm_lines.append(f'feedback_prompt: "{feedback_prompt}"')
+        fm_lines.append(f"feedback_prompt: {_yaml_double_quoted(feedback_prompt)}")
     if consent_required:
         fm_lines.append("consent_required: true")
     fm_lines.append(f"intent_key: {claude_idempotency_key[:16]}")
@@ -1763,6 +1888,78 @@ def _execute_watchlist_add(
     }
 
 
+def _tuff_words_note_path(cortex_dir: Path) -> Path:
+    return cortex_dir / "Tuff words.md"
+
+
+def append_word_of_the_day(cortex_dir: Path, word: str, source_date: str) -> Path:
+    """Append '<word> — <date>' as a bullet to the Tuff words Obsidian note,
+    creating it (with a header) if it doesn't exist yet.
+
+    Unlike add_to_watchlist(), this never dedupes by content — the same word
+    said on two different days is two legitimate entries. Idempotency for a
+    *single* utterance is handled upstream by the command ledger (same
+    command_idempotency_key -> skipped before this is ever called).
+    """
+    path = _tuff_words_note_path(cortex_dir)
+    cortex_dir.mkdir(parents=True, exist_ok=True)
+    lines: list[str] = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    if not lines:
+        lines = ["# Tuff words", ""]
+    lines.append(f"- {word} — {source_date}")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _log("command", f"wrote {path}")
+    return path
+
+
+def _execute_word_of_the_day(
+    cmd: dict, cortex_dir: Path, source_path: Path, source_date: str, idem: str, *, verbose: bool,
+) -> dict:
+    """Execute the word_of_the_day route: append the spoken word (+ date) to
+    the Tuff words Obsidian note. Write errors are caught and recorded in the
+    ledger/notification, never raised — same best-effort contract as every
+    other command route.
+    """
+    word = cmd.get("word", "").strip()
+    status = "failed"
+    error = ""
+    note_written = ""
+    try:
+        note_path = append_word_of_the_day(cortex_dir, word, source_date)
+        note_written = str(note_path)
+        status = "success"
+    except Exception as exc:
+        error = str(exc)
+        if verbose:
+            traceback.print_exc(file=sys.stderr)
+        _log("command", f"word_of_the_day write error: {exc}")
+
+    if status == "success":
+        _push_command_notification(
+            "Word of the day", f'Added "{word}" to Tuff words.', urgency="today",
+        )
+    else:
+        _push_command_notification(
+            f"Word of the day failed: {word}",
+            f"Could not add {word!r} to Tuff words: {error}",
+            urgency="today",
+        )
+
+    return {
+        "command_idempotency_key": idem,
+        "source_path": str(source_path),
+        "source_date": source_date,
+        "cmd_key": cmd.get("key", ""),
+        "route": "word_of_the_day",
+        "word": word,
+        "status": status,
+        "stage": "" if status == "success" else "write",
+        "error": error,
+        "cortex_note": note_written,
+        "executed_at": _now_iso(),
+    }
+
+
 def _push_command_notification(title: str, body: str, urgency: str = "today") -> None:
     """Best-effort phone ping for command results. Never raises.
 
@@ -1794,7 +1991,10 @@ def _push_command_notification(title: str, body: str, urgency: str = "today") ->
             timeout=20, check=False,
             capture_output=True, text=True,
         )
-        if proc.returncode == 0:
+        if proc.returncode == 3:
+            # pnotify's "no credentials" exit code — not a send.
+            _log("command", f"pnotify skipped: {proc.stderr.strip()[:120]}")
+        elif proc.returncode == 0:
             _log("command", "pnotify invoked")
         else:
             _log("command", f"pnotify rc={proc.returncode}: {proc.stderr.strip()[:120]}")
@@ -1903,6 +2103,11 @@ def run_command_stage(
         return EXIT_SUCCESS, note_text
 
     commands, anomalies = jc.find_commands_with_diagnostics(note_text)
+    # word_of_the_day has no wake word and no verb grammar (fixed-phrase
+    # anchor instead), so it's recognized separately and merged in here —
+    # strip_command_spans() below works uniformly off start/end regardless
+    # of which recognizer produced a command.
+    commands = commands + jc.find_word_of_day_commands(note_text)
     if anomalies:
         _log("command", f"found {len(anomalies)} voice anomaly(ies)")
         report_voice_anomalies(state_dir, anomalies)
@@ -1921,9 +2126,12 @@ def run_command_stage(
         company = cmd.get("company", "")
         route = cmd.get("route", "hot_seat_fetch")
         form = cmd.get("form", "10-K")
+        word = cmd.get("word", "")
         parse_conf = float(cmd.get("confidence", 1.0))
 
-        _log("command", f"route={route} form={form} company={company!r} confidence={parse_conf}")
+        _log("command",
+             f"route={route} form={form} company={company!r} word={word!r} "
+             f"confidence={parse_conf}")
 
         prior = ledger.get(idem)
         if prior and prior.get("status") == "success":
@@ -1949,6 +2157,19 @@ def run_command_stage(
         if route == "watchlist_add":
             record = _execute_watchlist_add(
                 cmd, cortex_dir, hsf, source_path, source_date, idem, verbose=verbose,
+            )
+            if record["status"] == "success":
+                summary.commands_executed += 1
+            else:
+                summary.commands_failed += 1
+                worst_exit = max(worst_exit, EXIT_DELIVERY_TRANSIENT)
+            append_command_ledger(state_dir, record)
+            ledger[idem] = record
+            continue
+
+        if route == "word_of_the_day":
+            record = _execute_word_of_the_day(
+                cmd, cortex_dir, source_path, source_date, idem, verbose=verbose,
             )
             if record["status"] == "success":
                 summary.commands_executed += 1
@@ -2461,6 +2682,57 @@ def _intent_exit_code(delivery_result: dict, dry_run: bool) -> tuple[str, int]:
     return "succeeded", EXIT_SUCCESS
 
 
+def resolve_wellness_dir(journal_dir: Path | None = None) -> Path | None:
+    """Wellness notes root: $INTENT_WELLNESS_DIR or <journal_dir>/wellness."""
+    raw = os.getenv("INTENT_WELLNESS_DIR", "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    if journal_dir is not None:
+        return Path(journal_dir).expanduser() / "wellness"
+    return None
+
+
+def _run_nutrition_stage(
+    note_text: str,
+    source_path: Path,
+    source_date: str,
+    state_dir: Path,
+    *,
+    dry_run: bool,
+    model: str,
+    wellness_dir: Path | None = None,
+) -> dict:
+    """Log voice intake + wellness captures. Never changes the intent exit code."""
+    empty = {"intake_logged": 0, "wellness_notes": 0, "nutrition_failed": 0}
+    try:
+        scripts_dir = Path(__file__).resolve().parent
+        if str(scripts_dir) not in sys.path:
+            sys.path.insert(0, str(scripts_dir))
+        import nutrition_ledger
+        journal_dir = source_path.parent
+        result = nutrition_ledger.run_nutrition_stage(
+            note_text,
+            source_path,
+            source_date,
+            state_dir,
+            dry_run=dry_run,
+            journal_dir=journal_dir,
+            model=model,
+            wellness_dir=wellness_dir or resolve_wellness_dir(journal_dir),
+        )
+        if isinstance(result, dict):
+            return {
+                "intake_logged": int(result.get("intake_logged") or 0),
+                "wellness_notes": int(result.get("wellness_notes") or 0),
+                "nutrition_failed": int(result.get("nutrition_failed") or 0),
+            }
+        # Older return shape (int) — treat as intake-only.
+        return {"intake_logged": int(result or 0), "wellness_notes": 0, "nutrition_failed": 0}
+    except Exception as exc:
+        _log("nutrition", f"stage failed: {exc}")
+        return {"intake_logged": 0, "wellness_notes": 0, "nutrition_failed": 1}
+
+
 def run_intent_pipeline(
     source_path: Path,
     *,
@@ -2475,6 +2747,7 @@ def run_intent_pipeline(
     verbose: bool,
     existing_idempotency_key: str | None = None,
     emit_payload: bool = True,
+    wellness_dir: Path | None = None,
 ) -> int:
     """Run the full intent pipeline for one note. Returns an exit code."""
     summary = RunSummary(source_file=source_path.name)
@@ -2512,6 +2785,17 @@ def run_intent_pipeline(
 
     journal_timestamp = infer_journal_timestamp(source_path)
     source_date = journal_timestamp[:10]  # YYYY-MM-DD
+
+    if wellness_dir is None:
+        wellness_dir = resolve_wellness_dir(source_path.parent)
+
+    nutrition_counts = _run_nutrition_stage(
+        note_text, source_path, source_date, state_dir,
+        dry_run=dry_run, model=gate_model, wellness_dir=wellness_dir,
+    )
+    summary.nutrition_logged = nutrition_counts["intake_logged"]
+    summary.wellness_notes = nutrition_counts["wellness_notes"]
+    summary.nutrition_failed = nutrition_counts.get("nutrition_failed", 0)
 
     # ── Command stage (wake-word directives) ───────────────────────────────
     # Runs before the gate; executes recognized routes (e.g. hot_seat 10-K
@@ -2839,6 +3123,7 @@ def run_retry(
     in_flight_ttl: int,
     dry_run: bool,
     verbose: bool,
+    wellness_dir: Path | None = None,
 ) -> int:
     """Replay pending transient failures from the retry queue."""
     entries = load_retry_queue(state_dir)
@@ -2877,6 +3162,7 @@ def run_retry(
             verbose=verbose,
             existing_idempotency_key=key,
             emit_payload=False,
+            wellness_dir=wellness_dir,
         )
         if exit_code == EXIT_SUCCESS:
             summary.retry_queue_out += 1
@@ -2926,21 +3212,105 @@ def cmd_prune_ledger(state_dir: Path, older_than_days: int) -> int:
         _log("ledger", f"pruned {removed} entries older than {older_than_days}d")
     else:
         _log("ledger", f"nothing to prune (all entries within {older_than_days}d)")
+    command_removed = _prune_jsonl_records(state_dir / COMMAND_LEDGER_FILENAME, cutoff)
+    history_removed = _prune_jsonl_records(state_dir / RUN_HISTORY_FILENAME, cutoff)
+    if command_removed:
+        _log("ledger", f"pruned {command_removed} command ledger entries older than {older_than_days}d")
+    if history_removed:
+        _log("ledger", f"pruned {history_removed} run history entries older than {older_than_days}d")
     return EXIT_SUCCESS
 
 
 def _entry_older_than(entry: dict, cutoff: datetime) -> bool:
-    for field in ("claude_in_flight_since",):
+    seen_timestamp = False
+    for field in (
+        "created_at",
+        "updated_at",
+        "executed_at",
+        "enqueued_at",
+        "attempted_at",
+        "journal_timestamp",
+        "claude_in_flight_since",
+    ):
         raw = entry.get(field, "")
         if raw:
             try:
                 dt = datetime.fromisoformat(raw)
                 if dt.tzinfo is None:
                     dt = dt.replace(tzinfo=timezone.utc)
-                return dt < cutoff
+                seen_timestamp = True
+                if dt >= cutoff:
+                    return False
             except Exception:
                 pass
-    return False
+    return seen_timestamp
+
+
+def _prune_jsonl_records(path: Path, cutoff: datetime) -> int:
+    if not path.exists():
+        return 0
+    kept: list[str] = []
+    removed = 0
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            record = json.loads(stripped)
+        except json.JSONDecodeError:
+            kept.append(line)
+            continue
+        if isinstance(record, dict) and _entry_older_than(record, cutoff):
+            removed += 1
+            continue
+        kept.append(json.dumps(record, ensure_ascii=False) if isinstance(record, dict) else line)
+    if removed:
+        tmp_fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+        try:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as fh:
+                for line in kept:
+                    fh.write(line + "\n")
+            os.replace(tmp_path, path)
+        finally:
+            try:
+                Path(tmp_path).unlink()
+            except FileNotFoundError:
+                pass
+    return removed
+
+
+def _generated_log_root(state_dir: Path) -> Path:
+    return state_dir.parent if state_dir.name == "intents" else state_dir
+
+
+def cmd_prune_generated_logs(state_dir: Path, older_than_days: int, *, dry_run: bool = False) -> int:
+    """Delete only known timestamped wrapper logs; never touch latest logs or journal content."""
+    log_root = _generated_log_root(state_dir)
+    if not log_root.exists():
+        _log("cleanup", f"log root not found: {log_root}")
+        return EXIT_SUCCESS
+    cutoff_ts = (datetime.now(timezone.utc) - timedelta(days=older_than_days)).timestamp()
+    removed = 0
+    for path in sorted(log_root.iterdir()):
+        if not path.is_file() or not GENERATED_RUN_LOG_RE.fullmatch(path.name):
+            continue
+        try:
+            if path.stat().st_mtime >= cutoff_ts:
+                continue
+        except OSError:
+            continue
+        removed += 1
+        if dry_run:
+            _log("cleanup", f"would delete {path.name}")
+            continue
+        try:
+            path.unlink()
+            _log("cleanup", f"deleted {path.name}")
+        except FileNotFoundError:
+            pass
+    action = "would delete" if dry_run else "deleted"
+    _log("cleanup", f"{action} {removed} generated log(s) older than {older_than_days}d")
+    return EXIT_SUCCESS
 
 
 def _parse_older_than(value: str) -> int:
@@ -2987,7 +3357,12 @@ def parse_cli() -> argparse.Namespace:
     parser.add_argument(
         "--prune-ledger",
         action="store_true",
-        help="Remove ledger entries older than --older-than.",
+        help="Remove generated ledger/run-history entries older than --older-than.",
+    )
+    parser.add_argument(
+        "--prune-generated-logs",
+        action="store_true",
+        help="Remove timestamped generated run logs older than --older-than; preserves *-latest.log.",
     )
     parser.add_argument(
         "--older-than",
@@ -3014,6 +3389,14 @@ def parse_cli() -> argparse.Namespace:
         "--cortex-dir",
         default=os.getenv("INTENT_CORTEX_DIR"),
         help="Obsidian cortex write target (default: $INTENT_CORTEX_DIR or <journal_dir>/cortex).",
+    )
+    parser.add_argument(
+        "--wellness-dir",
+        default=os.getenv("INTENT_WELLNESS_DIR"),
+        help=(
+            "Voice wellness note target "
+            "(default: $INTENT_WELLNESS_DIR or <journal_dir>/wellness)."
+        ),
     )
     parser.add_argument(
         "--state-dir",
@@ -3046,6 +3429,14 @@ def main() -> int:
             return EXIT_PERMANENT
         return cmd_prune_ledger(state_dir, days)
 
+    if args.prune_generated_logs:
+        try:
+            days = _parse_older_than(args.older_than)
+        except ValueError as exc:
+            print(f"[intent] {exc}", file=sys.stderr)
+            return EXIT_PERMANENT
+        return cmd_prune_generated_logs(state_dir, days, dry_run=args.dry_run)
+
     # Resolve parameters
     gate_model = args.gate_model
     gate_style = resolve_gate_style(gate_model)
@@ -3065,6 +3456,13 @@ def main() -> int:
     else:
         cortex_dir = Path.home() / "cortex"
 
+    # Wellness dir (sibling of daily notes; never under cortex/)
+    if args.wellness_dir:
+        wellness_dir = Path(args.wellness_dir).expanduser()
+    else:
+        journal_for_wellness = Path(args.journal_dir).expanduser() if args.journal_dir else None
+        wellness_dir = resolve_wellness_dir(journal_for_wellness)
+
     pipeline_kwargs = dict(
         gate_model=gate_model,
         gate_style=gate_style,
@@ -3075,6 +3473,7 @@ def main() -> int:
         in_flight_ttl=in_flight_ttl,
         dry_run=args.dry_run,
         verbose=args.verbose,
+        wellness_dir=wellness_dir,
     )
 
     # Retry mode

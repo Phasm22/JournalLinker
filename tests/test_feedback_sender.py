@@ -1,8 +1,11 @@
 import importlib.util
+import io
 import json
 import os
+import sys
 import tempfile
 import unittest
+import urllib.error
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
@@ -13,6 +16,8 @@ spec = importlib.util.spec_from_file_location("feedback_sender", SCRIPT_PATH)
 fs = importlib.util.module_from_spec(spec)
 assert spec and spec.loader
 spec.loader.exec_module(fs)
+
+EVENT_PREFIX = "JOURNAL_LINKER_EVENT="
 
 
 class TestFeedbackSenderCallbacks(unittest.TestCase):
@@ -303,34 +308,47 @@ class TestFeedbackSenderLongPolling(unittest.TestCase):
         self.assertEqual(ledger[key]["feedback_signal"], "confirmed")
         self.assertEqual(offset, 8)
 
-    def test_run_daemon_emits_health_probe(self):
-        clock = {"t": 0.0}
-
-        def monotonic():
-            clock["t"] += 40.0
-            return clock["t"]
-
+    def _run_daemon_capturing_events(self, get_updates_side_effect):
+        buf = io.StringIO()
         with tempfile.TemporaryDirectory() as tmpdir:
-            state_dir = Path(tmpdir)
             with (
-                mock.patch.object(fs.time, "monotonic", side_effect=monotonic),
-                mock.patch.object(fs, "_heartbeat_interval_sec", return_value=30),
-                mock.patch.object(fs, "get_updates", side_effect=[[], KeyboardInterrupt]),
-                mock.patch.object(fs, "emit_health_probe") as probe_mock,
+                mock.patch.object(fs, "get_updates", side_effect=get_updates_side_effect),
                 mock.patch.object(fs, "_send_due_for_state"),
+                mock.patch.object(fs.time, "sleep"),
+                mock.patch.object(sys, "stderr", buf),
             ):
-                fs.run_daemon(
-                    state_dir,
-                    "token",
-                    "chat",
-                    poll_timeout=1,
-                    send_interval=999,
-                )
+                exit_code = fs.run_daemon(Path(tmpdir), "token", "chat", poll_timeout=1, send_interval=1)
+        self.assertEqual(exit_code, 0)
+        lines = [line for line in buf.getvalue().splitlines() if line.startswith(EVENT_PREFIX)]
+        return [json.loads(line[len(EVENT_PREFIX):]) for line in lines]
 
-        self.assertGreaterEqual(probe_mock.call_count, 2)
-        self.assertEqual(probe_mock.call_args_list[0][0][0], "feedback-sender")
-        self.assertIn("uptime_sec", probe_mock.call_args_list[0][1])
-        self.assertIn("feedback_queue_pending", probe_mock.call_args_list[0][1])
+    def test_run_daemon_emits_state_transitions(self):
+        err = urllib.error.URLError("network down")
+        events = self._run_daemon_capturing_events(
+            [[], [], err, err, [], [], KeyboardInterrupt]
+        )
+        self.assertEqual(
+            [(e["event"], e["status"], e["reason"]) for e in events],
+            [
+                ("service.state", "ready", "polling"),
+                ("service.state", "degraded", "poll failed: URLError"),
+                ("service.state", "recovered", "polling"),
+                ("service.state", "stopping", "shutdown"),
+            ],
+        )
+        self.assertTrue(all(e["service"] == "feedback-sender" for e in events))
+        self.assertIn("feedback_queue_pending", events[0]["metrics"])
+
+    def test_run_daemon_is_silent_while_healthy(self):
+        events = self._run_daemon_capturing_events([[]] * 50 + [KeyboardInterrupt])
+        self.assertEqual([e["status"] for e in events], ["ready", "stopping"])
+
+    def test_no_periodic_health_emitter_remains(self):
+        self.assertFalse(hasattr(fs, "emit_health_probe"))
+        self.assertFalse(hasattr(fs, "_heartbeat_interval_sec"))
+        for path in SCRIPT_PATH.parent.rglob("*"):
+            if path.is_file() and path.suffix in {".py", ".sh"}:
+                self.assertNotIn("emit_health_probe", path.read_text(encoding="utf-8"), str(path))
 
 
 class TestFeedbackSenderMessages(unittest.TestCase):

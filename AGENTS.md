@@ -5,8 +5,6 @@
 This repository is a local-first journal pipeline for an Obsidian vault. Core scripts live at the repo root:
 
 - `Scribe.py` - wikilink insertion and learning-store updates
-- `weekly_insights.py` - weekly reflection generation
-- `daily_reflection.py` - day-behind reflection and push delivery
 - `archivist.py` - standalone clipboard/Ollama helper
 
 Supporting code lives in `scripts/` (including `scripts/process_intents.py` — intent gate, routing, and delivery pipeline), with launchd and systemd examples in `launchd/` and `systemd/`. Documentation lives in `docs/`, and tests are under `tests/` with fixtures in `tests/fixtures/`.
@@ -17,8 +15,6 @@ Use `just` from the repo root:
 
 - `just` - list available recipes
 - `just scribe` - run the wikilink pipeline
-- `just weekly` - generate the weekly insight note
-- `just daily-reflection` - dry-run the Pushover reflection path
 - `just test` - run the test suite with mocked Ollama calls
 - `just doctor` - verify local paths, venv, and config
 
@@ -49,7 +45,7 @@ Tests use `pytest` to run `unittest`-style cases. Keep tests isolated with `temp
 
 ## Commit & Pull Request Guidelines
 
-Recent commits use short, imperative summaries like `Add ...`, `Rewrite ...`, or `Guard against ...`. Keep commit subjects focused and present-tense. PRs should include a brief description of the change, the command(s) used to verify it, and any user-facing behavior changes. If a change affects launchd, voice processing, or reflections, mention the relevant logs or config paths.
+Recent commits use short, imperative summaries like `Add ...`, `Rewrite ...`, or `Guard against ...`. Keep commit subjects focused and present-tense. PRs should include a brief description of the change, the command(s) used to verify it, and any user-facing behavior changes. If a change affects launchd, voice processing, or Pushover delivery, mention the relevant logs or config paths.
 
 ## Security & Configuration Tips
 

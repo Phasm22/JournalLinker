@@ -22,15 +22,13 @@ chmod 600 ~/.config/journal-linker/journal-linker.env
 
 ```bash
 SCRIBE_JOURNAL_DIR="/path/to/your/journal"
-SCRIBE_MODEL="llama3.1:8b"
+SCRIBE_MODEL="llama3.2:latest"
 SCRIBE_CTX="8192"
 SCRIBE_EMBED_MODEL="nomic-embed-text"
 SCRIBE_EMBED_KEEP_ALIVE="5m"
 SCRIBE_EMBED_CACHE_MAX_ITEMS="512"
 SCRIBE_PUSHOVER_APP_TOKEN="your-app-token"
 SCRIBE_PUSHOVER_USER_KEY="your-user-key"
-SCRIBE_DAILY_REFLECTION_WINDOW_START="16:00"
-SCRIBE_DAILY_REFLECTION_WINDOW_END="21:00"
 ```
 
 ## Offline corpus sampling (no intent pipeline / no time)
@@ -54,7 +52,7 @@ See `python3 scripts/corpus_sample.py --help`. Output formats: `paths`, `jsonl` 
 ```bash
 python3 Scribe.py [text]
 python3 Scribe.py --journal-dir "/path/to/your/journal"
-python3 Scribe.py --model "llama3.1:8b"
+python3 Scribe.py --model "llama3.2:latest"
 python3 Scribe.py --ctx 8192
 python3 Scribe.py --active-date 2026-03-11
 python3 Scribe.py --active-file "/path/to/your/journal/2026-03-11.md"
@@ -67,37 +65,15 @@ python3 Scribe.py --reset-learning
 - `--active-date` and `--active-file` override how the current note is resolved.
 - `--reset-learning` clears `scribe_learning.json` before the run.
 
-## `weekly_insights.py` CLI
+## Pushover credentials
 
-```bash
-python3 weekly_insights.py --journal-dir "/path/to/journal"
-python3 weekly_insights.py --learning-file "/path/to/scribe_learning.json"
-python3 weekly_insights.py --week 2026-W10
-python3 weekly_insights.py --update-vault-map
-```
-
-- `--journal-dir` points at the Obsidian daily note folder.
-- `--learning-file` selects the shared learning and embedding cache file.
-- `--week` selects the ISO week to summarize.
-- `--update-vault-map` runs `vault_mapper.py` after writing the insight note.
-
-## `daily_reflection.py` CLI
-
-```bash
-python3 daily_reflection.py --journal-dir "/path/to/journal"
-python3 daily_reflection.py --dry-run
-python3 daily_reflection.py --date 2026-04-08
-python3 daily_reflection.py --force-send
-```
-
-- `--date` overrides the reflected day; default is yesterday in local time.
-- `--dry-run` prints the Pushover payload without sending it.
-- `--force-send` bypasses the sent-state check for manual testing.
-- Pushover credentials can be provided as either `SCRIBE_PUSHOVER_APP_TOKEN` / `SCRIBE_PUSHOVER_USER_KEY` or the older aliases `PUSHOVER_TOKEN` / `PUSHOVER_KEY`.
+- Preferred: keep the keys only in the shared pnotify file `~/.config/pnotify/env` (mode 600, `PUSHOVER_APP_TOKEN=` / `PUSHOVER_USER_KEY=` lines; override the path with `PNOTIFY_ENV_FILE`). `journal_linker_env.py` loads it at bootstrap and `~/bin/pnotify` reads it directly, so systemd jobs, agents and interactive shells all see the same keys.
+- `pnotify` exits `3` when it has no credentials (a skip, not a send); the command path logs that as `pnotify skipped`.
+- Pushover credentials can also be provided as either `SCRIBE_PUSHOVER_APP_TOKEN` / `SCRIBE_PUSHOVER_USER_KEY` or the aliases `PUSHOVER_TOKEN` / `PUSHOVER_KEY` and `PUSHOVER_APP_TOKEN` / `PUSHOVER_USER_KEY` (the names `~/bin/pnotify` uses).
 
 ## Intent pipeline (`scripts/process_intents.py` in `JOURNAL_LINKER_REPO`)
 
-The intent watcher runs from the journalLinker checkout referenced by `JOURNAL_LINKER_REPO`. It gates journal text, calls the routing model, then delivers to Pushover, Obsidian cortex, optional digest queue file, and optional Telegram feedback queue.
+The intent watcher runs from the journalLinker checkout referenced by `JOURNAL_LINKER_REPO`. It gates journal text, calls the routing model, then delivers to Pushover, Obsidian cortex, optional digest queue file, and optional Telegram feedback queue. Voice wellness captures (meal/water/craving/want_to_cook/preference) write under `<SCRIBE_JOURNAL_DIR>/wellness/` (or `$INTENT_WELLNESS_DIR`), **not** under `cortex/` — llmLibrarian and AnythingLLM vault sync both skip cortex directories.
 
 **Digest and Telegram scheduling (capture-first):**
 
@@ -122,7 +98,7 @@ Unset behavior preserves legacy pipelines; set flags in `~/.config/journal-linke
 | `INTENT_PUSHOVER_URGENCIES` | *(unset → `immediate`, `today`, `soon`)* | Comma-separated subset of `immediate,today,soon,low` that may trigger a Pushover message. Example: `immediate,today` skips Pushover when the router sets `urgency=soon`. |
 
 
-Other useful intent variables (see the script docstring in-repo): `INTENT_GATE_MODEL`, `INTENT_ROUTING_MODEL`, `INTENT_STATE_DIR`, `INTENT_FEEDBACK_DELAY_TODAY`, `INTENT_FEEDBACK_DELAY_SOON`, `INTENT_CORTEX_DIR`, `OPENAI_API_KEY`, and the same `SCRIBE_PUSHOVER_*` keys as daily reflection.
+Other useful intent variables (see the script docstring in-repo): `INTENT_GATE_MODEL`, `INTENT_ROUTING_MODEL`, `INTENT_STATE_DIR`, `INTENT_FEEDBACK_DELAY_TODAY`, `INTENT_FEEDBACK_DELAY_SOON`, `INTENT_CORTEX_DIR`, `INTENT_WELLNESS_DIR`, `INTENT_WATER_BOTTLE_ML`, `OPENAI_API_KEY`, and the `SCRIBE_PUSHOVER_*` keys (see Pushover credentials above).
 
 ### Telegram design contract + reactions + reply learning
 
@@ -193,24 +169,9 @@ Recommended indexing pattern:
 3. Index the snapshot in llmLibrarian as a text source/silo for pattern queries.
 4. If you rotate/prune ledger rows, regenerate the snapshot after rotation to keep retrieval aligned.
 
-## `vault_mapper.py` CLI
-
-```bash
-python3 vault_mapper.py --journal-dir "/path/to/journal"
-python3 vault_mapper.py --learning-file "/path/to/scribe_learning.json"
-python3 vault_mapper.py --output-dir "/path/to/output"
-python3 vault_mapper.py --min-cooccurrence 3
-```
-
-- `--journal-dir` points at the Obsidian daily note folder.
-- `--learning-file` selects the shared learning file used for strength scoring.
-- `--output-dir` changes where the markdown and JSON outputs are written.
-- `--min-cooccurrence` controls the minimum link co-occurrence threshold for edges.
-- Suggested cadence: run with weekly insight generation (`python3 weekly_insights.py --update-vault-map`) so `vault_map.md` and weekly summaries stay synchronized.
-
 ## Supervised job telemetry
 
-Wrappers (`scripts/scheduled_run.sh`, `daily_reflection.sh`, `voice_*.sh`, `intent_*.sh`, `feedback_sender.sh`) source `scripts/job_log_lib.sh` and finalize via `python -m journal_linker_telemetry finalize`. Entrypoints write service-specific fields with `journal_linker_telemetry.maybe_write_job_payload()` when `JOURNAL_LINKER_JOB_PAYLOAD_FILE` is set. See [`SERVICE_INTAKE.md`](SERVICE_INTAKE.md) for the `JOURNAL_LINKER_EVENT=` schema.
+Wrappers (`scripts/scheduled_run.sh`, `voice_*.sh`, `intent_*.sh`, `feedback_sender.sh`) source `scripts/job_log_lib.sh` and finalize via `python -m journal_linker_telemetry finalize`. Entrypoints write service-specific fields with `journal_linker_telemetry.maybe_write_job_payload()` when `JOURNAL_LINKER_JOB_PAYLOAD_FILE` is set. See [`SERVICE_INTAKE.md`](SERVICE_INTAKE.md) for the `JOURNAL_LINKER_EVENT=` schema.
 
 **Linux log root:** `SCRIBE_JOB_LOG_DIR` (typical: `~/.local/state/journal-linker/`). Not `~/Library/Logs/JournalLinker/` (macOS) and not `~/.local/state/journal-linker/logs/` (legacy).
 
@@ -237,8 +198,6 @@ Restart is required: a process that opened the DB before migrate keeps the old s
 - It uses Ollama for candidate generation.
 - It ranks candidates with heuristics plus optional local embeddings.
 - It writes and reuses learning data in `scribe_learning.json`.
-- Weekly insights use ISO week boundaries and write to `Insights/Weekly Insight - YYYY-Www.md`.
-- Daily reflection push reads only the previous day's note, computes a deterministic random send time within the configured local window, and sends to Pushover at most once per day.
 - The embedding cache lives in the same learning file so repeated runs can reuse vectors.
 
 ## Notes
@@ -249,4 +208,3 @@ Restart is required: a process that opened the DB before migrate keeps the old s
 - For body-only Shortcut input, Scribe updates nav links in the resolved active note file by default.
 - Scribe also updates the previous existing journal note so its `Tomorrow` points at the latest note.
 - `just test` runs plain `pytest`; `just coverage` requires `coverage` in the project venv and prints missing lines after the test run.
-
