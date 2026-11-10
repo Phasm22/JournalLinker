@@ -1233,7 +1233,7 @@ class TestEnrichEnvelope(unittest.TestCase):
     def test_enrich_includes_local_cortex_hits_when_available(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             journal_dir = Path(tmpdir)
-            cortex_dir = journal_dir / "cortex" / "task"
+            cortex_dir = journal_dir / "intents" / "task"
             cortex_dir.mkdir(parents=True)
             source_file = journal_dir / "2026-04-16.md"
             source_file.write_text("follow up with accountant this week", encoding="utf-8")
@@ -1248,7 +1248,7 @@ class TestEnrichEnvelope(unittest.TestCase):
 
         self.assertIn("related_cortex_hits", result)
         self.assertEqual(result["related_cortex_hits"][0]["source"], "cortex")
-        self.assertTrue(result["related_silo_hits"][0]["title"].startswith("cortex/"))
+        self.assertTrue(result["related_silo_hits"][0]["title"].startswith("intents/"))
 
     def test_enrich_continues_on_failure(self):
         """An exception inside enrich_envelope must not propagate."""

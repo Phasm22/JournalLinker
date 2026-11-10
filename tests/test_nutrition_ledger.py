@@ -795,11 +795,11 @@ class TestWellnessCapture(unittest.TestCase):
         self.assertEqual(result["intake_logged"], 0)
         self.assertEqual(result["wellness_notes"], 1)
         self.assertFalse(nl.ledger_path(self.state).exists())
-        # Must be <journal>/wellness/, never under cortex/ (indexers skip cortex).
+        # Must be <journal>/wellness/, never under intents/ (indexers skip cortex).
         notes = list(self.wellness.glob("*.md"))
         self.assertEqual(len(notes), 1)
         self.assertEqual(notes[0].parent, self.wellness)
-        self.assertNotIn("cortex", notes[0].parts)
+        self.assertNotIn("intents", notes[0].parts)
         content = notes[0].read_text(encoding="utf-8")
         self.assertIn("type: craving", content)
         self.assertIn('items: ["pizza"]', content)
@@ -868,8 +868,8 @@ class TestWellnessCapture(unittest.TestCase):
         self.assertEqual(len(notes), 1)
         self.assertEqual(notes[0].parent.name, "wellness")
         self.assertIn("type: meal", notes[0].read_text(encoding="utf-8"))
-        # Confirm nothing landed under a cortex tree.
-        self.assertFalse((self.journal / "cortex").exists())
+        # Confirm nothing landed under an intents tree.
+        self.assertFalse((self.journal / "intents").exists())
         self.assertNotIn("meal meal", notes[0].name)
 
 

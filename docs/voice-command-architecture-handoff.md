@@ -33,11 +33,11 @@ Practical implications:
 - Company name can now appear before or after the verb ("Ford's 10-K, can you pull it" works, not just "pull the 10-K for Ford").
 
 ### New route: `watchlist_add`
-- "Palindrome, watch/track/follow `<company>`" — decoupled from filing status entirely (no form/10-K check). Writes/updates a single `cortex/Watchlist.md` note (idempotent), then best-effort tries a background 10-K fetch that never blocks or fails the watchlist add itself.
+- "Palindrome, watch/track/follow `<company>`" — decoupled from filing status entirely (no form/10-K check). Writes/updates a single `intents/Watchlist.md` note (idempotent), then best-effort tries a background 10-K fetch that never blocks or fails the watchlist add itself.
 - Disjoint verb vocabulary from the fetch route (`watch`/`track`/`follow` vs. `pull`/`fetch`/`grab`/etc.) so the two routes never compete for the same utterance.
 
 ### Reference doc written
-- `cortex/Voice Command Routes.md` — user-facing reference for both routes' trigger words, requirements, and a checklist for adding a new route. Written for manual editing as routes grow; not read by any code.
+- `intents/Voice Command Routes.md` — user-facing reference for both routes' trigger words, requirements, and a checklist for adding a new route. Written for manual editing as routes grow; not read by any code.
 
 ### Files touched
 **Modified:** `scripts/process_intents.py`, `scripts/process_voice.py`, `systemd/journal-linker-voice-watcher.service`, `systemd/journal-linker.env.example`, `tests/conftest.py`, `tests/test_process_intents.py`, `.gitignore`
