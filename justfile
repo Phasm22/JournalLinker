@@ -161,7 +161,7 @@ handoff-check:
       printf "%s\n" "  llmli add --full /home/tj/Documents/twin-brain/TJ\\'s\\ PC"; \
       if [[ "$mode" != "off" ]]; then \
         printf "%s\n" ""; \
-        printf "%s\n" "Enrichment is enabled; if context is unexpectedly thin, verify cortex is indexed in llmLibrarian excludes/archetypes."; \
+        printf "%s\n" "Enrichment is enabled; if context is unexpectedly thin, verify intents is indexed in llmLibrarian excludes/archetypes."; \
       fi'
 
 # Telegram Bot API: getMe + getChat. Sources repo .env, then XDG files (later overrides), then JOURNAL_LINKER_ENV_FILE.

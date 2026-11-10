@@ -6,7 +6,7 @@ looks up branded names on the web, and appends one JSONL row per intake.
 Also classifies wellness captures
 (meal|water|craving|want_to_cook|want_to_eat|preference) and writes structured
 notes under <journal_dir>/wellness/ (override with INTENT_WELLNESS_DIR) — never
-under cortex/, which vault indexers skip.
+under intents/, which vault indexers skip.
 
 A separate `--summary` command sends one end-of-day Pushover and scores the
 previous journal day against nutrition_memory.json.
@@ -67,8 +67,8 @@ KEEP_ALIVE = "5m"
 MEAL_SLOTS = {"breakfast", "lunch", "dinner", "snack", "drink", "unknown"}
 IDENTITIES = {"generic", "branded", "unresolved"}
 KINDS = {"food", "drink"}
-# Voice wellness capture types written to <journal_dir>/wellness/ (not cortex —
-# llmLibrarian and AnythingLLM vault sync both skip directories named cortex).
+# Voice wellness capture types written to <journal_dir>/wellness/ (not intents —
+# llmLibrarian and AnythingLLM vault sync both skip directories named intents).
 # meal/water are intake; the rest are not.
 CAPTURE_TYPES = {
     "meal", "water", "craving", "want_to_cook", "want_to_eat", "preference", "none",
@@ -2483,7 +2483,7 @@ def resolve_branded_item(
 def resolve_wellness_dir(journal_dir: Path | None = None) -> Path | None:
     """Return wellness write root: $INTENT_WELLNESS_DIR or <journal_dir>/wellness.
 
-    Kept under the journal dir (sibling of daily notes, not under cortex/) so
+    Kept under the journal dir (sibling of daily notes, not under intents/) so
     llmLibrarian and AnythingLLM vault sync both index it. Paths stay relative
     to the vault root that syncs from the PC to the Mac.
     """

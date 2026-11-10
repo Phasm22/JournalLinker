@@ -11,7 +11,7 @@ recognized command maps to an executable route. Three routes exist:
 ("Palindrome, watch/track/follow <company>" — record the ticker in the
 Obsidian watchlist, independent of whether a 10-K exists or was ever
 fetched), and `word_of_the_day` ("word of the day is <word>" — append the
-word to the "Tuff words" Obsidian note in cortex, no wake word required).
+word to the "Tuff words" Obsidian note in intents, no wake word required).
 The two wake-word routes use
 disjoint verb vocabularies so they never compete for the same utterance;
 word_of_the_day uses a distinct fixed-phrase anchor instead of a verb, so it

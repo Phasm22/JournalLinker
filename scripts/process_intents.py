@@ -3,12 +3,12 @@
 
 Reads a daily note, gates actionable intent via a local Ollama model,
 packages context, calls an OpenAI model for structured routing output, then delivers
-to Pushover / Obsidian cortex/ / JSON digest queue.
+to Pushover / Obsidian intents/ / JSON digest queue.
 
 Also runs a voice wellness/nutrition stage (see nutrition_ledger.py) that extracts
 meal|water|craving|want_to_cook|preference captures from `> [!voice]` callouts into
 <journal_dir>/wellness/ notes with filterable YAML frontmatter (plus the calorie JSONL
-ledger for intake). Wellness stays outside cortex/ so llmLibrarian and AnythingLLM
+ledger for intake). Wellness stays outside intents/ so llmLibrarian and AnythingLLM
 vault sync both index it.
 
 Usage:
@@ -36,9 +36,9 @@ Env vars (from .env or environment):
     INTENT_NUTRITION_LOOKUP_MODEL
                                  OpenAI model for branded nutrition lookup
                                  (default: gpt-4o-mini)
-    INTENT_CORTEX_DIR            Obsidian cortex write target (default: <journal_dir>/cortex)
+    INTENT_CORTEX_DIR            Obsidian intent-note write target (default: <journal_dir>/intents)
     INTENT_WELLNESS_DIR          Voice wellness note target
-                                 (default: <journal_dir>/wellness; not under cortex/)
+                                 (default: <journal_dir>/wellness; not under intents/)
     INTENT_WATER_BOTTLE_ML       Default water-bottle size in ml when the speaker
                                  says "a water bottle" / "filled up my bottle"
                                  (default: 1000)
@@ -828,7 +828,7 @@ def _cortex_root_for_enrichment(envelope: dict) -> Path | None:
         return None
     source_path = Path(source_file).expanduser()
     journal_dir = source_path.parent
-    path = journal_dir / "cortex"
+    path = journal_dir / "intents"
     return path if path.exists() else None
 
 
@@ -878,7 +878,7 @@ def _search_local_cortex(envelope: dict, max_hits: int = DEFAULT_LOCAL_CORTEX_HI
     hits: list[dict] = []
     for overlap_count, density, rel, _path, snippet in scored[:max_hits]:
         hits.append({
-            "title": f"cortex/{rel}",
+            "title": f"intents/{rel}",
             "snippet": snippet,
             "source": "cortex",
             "score": round(density, 2),
@@ -3388,7 +3388,7 @@ def parse_cli() -> argparse.Namespace:
     parser.add_argument(
         "--cortex-dir",
         default=os.getenv("INTENT_CORTEX_DIR"),
-        help="Obsidian cortex write target (default: $INTENT_CORTEX_DIR or <journal_dir>/cortex).",
+        help="Obsidian intent-note write target (default: $INTENT_CORTEX_DIR or <journal_dir>/intents).",
     )
     parser.add_argument(
         "--wellness-dir",
@@ -3452,11 +3452,11 @@ def main() -> int:
     if args.cortex_dir:
         cortex_dir = Path(args.cortex_dir).expanduser()
     elif args.journal_dir:
-        cortex_dir = Path(args.journal_dir).expanduser() / "cortex"
+        cortex_dir = Path(args.journal_dir).expanduser() / "intents"
     else:
-        cortex_dir = Path.home() / "cortex"
+        cortex_dir = Path.home() / "intents"
 
-    # Wellness dir (sibling of daily notes; never under cortex/)
+    # Wellness dir (sibling of daily notes; never under intents/)
     if args.wellness_dir:
         wellness_dir = Path(args.wellness_dir).expanduser()
     else:

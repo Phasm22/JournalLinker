@@ -33,16 +33,16 @@ SCRIBE_PUSHOVER_USER_KEY="your-user-key"
 
 ## Offline corpus sampling (no intent pipeline / no time)
 
-To **list, date-filter, randomly sample, or export previews** of `YYYY-MM-DD.md` notes (and optional cortex trees with `--recursive`) without running `process_intents`, watchers, or Telegram, use:
+To **list, date-filter, randomly sample, or export previews** of `YYYY-MM-DD.md` notes (and optional intents trees with `--recursive`) without running `process_intents`, watchers, or Telegram, use:
 
 ```bash
 python3 scripts/corpus_sample.py --journal-dir "$SCRIBE_JOURNAL_DIR" --from-date 2025-01-01 --sample 20 --seed 1 --format jsonl --preview-chars 300
 ```
 
-Multiple roots (e.g. daily vault + cortex):
+Multiple roots (e.g. daily vault + intents):
 
 ```bash
-python3 scripts/corpus_sample.py --roots ~/Journal ~/Journal/cortex --recursive --format paths | head
+python3 scripts/corpus_sample.py --roots ~/Journal ~/Journal/intents --recursive --format paths | head
 ```
 
 See `python3 scripts/corpus_sample.py --help`. Output formats: `paths`, `jsonl` (good for Parquet/CSV pipelines), or full `text`.
@@ -73,7 +73,7 @@ python3 Scribe.py --reset-learning
 
 ## Intent pipeline (`scripts/process_intents.py` in `JOURNAL_LINKER_REPO`)
 
-The intent watcher runs from the journalLinker checkout referenced by `JOURNAL_LINKER_REPO`. It gates journal text, calls the routing model, then delivers to Pushover, Obsidian cortex, optional digest queue file, and optional Telegram feedback queue. Voice wellness captures (meal/water/craving/want_to_cook/preference) write under `<SCRIBE_JOURNAL_DIR>/wellness/` (or `$INTENT_WELLNESS_DIR`), **not** under `cortex/` — llmLibrarian and AnythingLLM vault sync both skip cortex directories.
+The intent watcher runs from the journalLinker checkout referenced by `JOURNAL_LINKER_REPO`. It gates journal text, calls the routing model, then delivers to Pushover, Obsidian intents, optional digest queue file, and optional Telegram feedback queue. Voice wellness captures (meal/water/craving/want_to_cook/preference) write under `<SCRIBE_JOURNAL_DIR>/wellness/` (or `$INTENT_WELLNESS_DIR`), **not** under `intents/` — llmLibrarian and AnythingLLM vault sync both skip cortex directories.
 
 **Digest and Telegram scheduling (capture-first):**
 
