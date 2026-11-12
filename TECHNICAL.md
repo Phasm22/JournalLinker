@@ -2,6 +2,37 @@
 
 This file collects the setup, configuration, and behavior details that are useful for maintenance or deeper customization.
 
+## Reproducible environments (uv)
+
+`pyproject.toml` + `uv.lock` pin the exact version of every dependency this repo
+uses, including `mcp` — the client library for llmLibrarian enrichment. This
+exists because an unpinned `pip install mcp` (the old `just intent-mcp-install`
+recipe) silently jumped from mcp 1.x to 2.3.0 on 2026-11-09 and broke enrichment
+(`mcp.client.streamable_http` dropped `streamablehttp_client`; see
+`process_intents.py`'s `_open_llmlibrarian_transport` for the compat shim).
+Rebuilding either venv from the lockfile now reproduces the same versions every
+time, and bumping `mcp` is a deliberate `uv lock` + review, not a silent upgrade.
+
+Two venvs, one lockfile:
+
+- **`ScribeVenv`** — the full runtime (`mcp`, `openai`, `ollama`, `faster-whisper`,
+  `pyyaml`) used by `just` recipes and the systemd/launchd units:
+
+  ```bash
+  UV_PROJECT_ENVIRONMENT=ScribeVenv uv sync --locked
+  ```
+
+- **`.venv`** — the lightweight test-only fallback from `AGENTS.md` (no
+  `faster-whisper`/`mcp`/`openai` — Ollama and MCP calls are mocked in tests):
+
+  ```bash
+  UV_PROJECT_ENVIRONMENT=.venv uv sync --locked --only-group dev --no-install-project
+  ```
+
+Bumping a dependency (e.g. `mcp`) is `uv lock -P mcp` (or edit the pin in
+`pyproject.toml` and `uv lock`), then re-run the `uv sync --locked` above for
+whichever venv(s) need the new version, then `just test`.
+
 ## Environment Variables
 
 Prefer keeping secrets **outside the git repo**.

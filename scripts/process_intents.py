@@ -758,9 +758,36 @@ def _resolve_llmlibrarian_silo(list_silos_payload: dict, configured_silo: str) -
     raise ValueError(f"configured LLMLIBRARIAN_MCP_SILO not found: {configured_silo}")
 
 
+@contextlib.asynccontextmanager
+async def _open_llmlibrarian_transport(url: str, headers: dict[str, str] | None, timeout: float):
+    """Yield (read_stream, write_stream) for the MCP streamable-HTTP transport.
+
+    mcp 2.3 removed `mcp.client.streamable_http.streamablehttp_client` (the
+    headers/timeout/sse_read_timeout signature) in favor of
+    `streamable_http_client`, which takes an `http_client=` (an httpx2.AsyncClient
+    in 2.x, plain httpx.AsyncClient in 1.x) instead. Build that client via
+    `create_mcp_http_client`, which mcp's own transport code uses internally in
+    both lines, so it always returns the right type. The new name exists in
+    1.27+ too, so only genuinely old 1.x installs hit the deprecated fallback.
+    """
+    try:
+        from mcp.client.streamable_http import streamable_http_client as _client_cm  # type: ignore
+    except ImportError:
+        from mcp.client.streamable_http import streamablehttp_client as _client_cm  # type: ignore[attr-defined]
+        async with _client_cm(url, headers=headers, timeout=timeout, sse_read_timeout=timeout) as streams:
+            yield streams[0], streams[1]
+        return
+
+    from mcp.shared._httpx_utils import create_mcp_http_client  # type: ignore
+
+    http_client = create_mcp_http_client(headers=headers, timeout=timeout)
+    async with http_client:
+        async with _client_cm(url, http_client=http_client) as streams:
+            yield streams[0], streams[1]
+
+
 async def _query_llmlibrarian_mcp_async(query: str) -> dict:
     from mcp import ClientSession  # type: ignore
-    from mcp.client.streamable_http import streamablehttp_client  # type: ignore
 
     timeout = _env_float("LLMLIBRARIAN_MCP_TIMEOUT", DEFAULT_LLMLIBRARIAN_MCP_TIMEOUT)
     n_results = _env_int("LLMLIBRARIAN_MCP_N_RESULTS", DEFAULT_LLMLIBRARIAN_MCP_N_RESULTS)
@@ -770,12 +797,9 @@ async def _query_llmlibrarian_mcp_async(query: str) -> dict:
     if token:
         headers = {"Authorization": f"Bearer {token}"}
 
-    async with streamablehttp_client(
-        _llmlibrarian_mcp_endpoint(),
-        headers=headers,
-        timeout=timeout,
-        sse_read_timeout=timeout,
-    ) as (read_stream, write_stream, _get_session_id):
+    async with _open_llmlibrarian_transport(
+        _llmlibrarian_mcp_endpoint(), headers, timeout
+    ) as (read_stream, write_stream):
         async with ClientSession(read_stream, write_stream) as session:
             await session.initialize()
 
@@ -887,6 +911,25 @@ def _search_local_cortex(envelope: dict, max_hits: int = DEFAULT_LOCAL_CORTEX_HI
     return hits
 
 
+def _classify_enrichment_error(detail: str) -> str:
+    """Short, stable reason code for the enrichment-failure log line.
+
+    Keeps `[enrich] best-effort enrichment failed` greppable while giving
+    automated monitoring (argus journald_unit checks) a field to key on
+    instead of free-text diffing.
+    """
+    low = detail.lower()
+    if "healthz" in low:
+        return "unreachable"
+    if "timed out" in low or "timeout" in low:
+        return "timeout"
+    if "importerror" in low or "modulenotfounderror" in low or "no attribute" in low:
+        return "client_import_error"
+    if "list_silos" in low or "llmlibrarian_mcp_silo" in low:
+        return "silo_not_found"
+    return "mcp_error"
+
+
 def enrich_envelope(envelope: dict) -> dict:
     """Query llmLibrarian for related hits. Never raises — failure is logged only."""
     intent_raw = envelope.get("intent_raw", "")
@@ -898,8 +941,10 @@ def enrich_envelope(envelope: dict) -> dict:
     result = query_llmlibrarian_mcp(str(intent_raw))
     if result.get("error"):
         detail = str(result.get("error"))
-        _log("enrich", f"best-effort enrichment failed (continuing): {detail}")
+        reason = _classify_enrichment_error(detail)
+        _log("enrich", f"best-effort enrichment failed (continuing): reason={reason} detail={detail}")
         envelope["_enrichment_error"] = detail
+        envelope["_enrichment_error_reason"] = reason
         if local_cortex_hits:
             envelope["related_silo_hits"] = local_cortex_hits
             envelope["recurrence_signal"] = len(local_cortex_hits) >= 3
@@ -2953,6 +2998,7 @@ def run_intent_pipeline(
                 "related_silo_hits": envelope.get("related_silo_hits", []),
                 "recurrence_signal": envelope.get("recurrence_signal", False),
                 "_enrichment_error": envelope.get("_enrichment_error", ""),
+                "_enrichment_error_reason": envelope.get("_enrichment_error_reason", ""),
             },
         }
 
@@ -3078,6 +3124,7 @@ def run_intent_pipeline(
             "related_silo_hits": envelope.get("related_silo_hits", []),
             "recurrence_signal": envelope.get("recurrence_signal", False),
             "_enrichment_error": envelope.get("_enrichment_error", ""),
+            "_enrichment_error_reason": envelope.get("_enrichment_error_reason", ""),
         }
         ledger_entry["delivery_attempts"].append({
             "run_id": run_id,
