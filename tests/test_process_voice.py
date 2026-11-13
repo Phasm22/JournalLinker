@@ -315,6 +315,28 @@ class TestProcessFileGate(unittest.TestCase):
             self.assertTrue(pv.is_failed(audio))
             self.assertFalse(pv.is_transient_failed(audio))  # permanent
 
+    def test_successful_transcript_is_sent_for_review(self):
+        with tempfile.TemporaryDirectory() as td:
+            audio = Path(td) / "2026-11-12_14-29-14.m4a"
+            audio.write_bytes(b"placeholder")
+            with mock.patch.object(pv, "probe_decodable", return_value=(True, "", "")), \
+                    mock.patch.object(
+                        pv, "transcribe_audio",
+                        return_value=pv.TranscriptResult("just bear tenders", 3.0, "en", ()),
+                    ), \
+                    mock.patch.object(pv, "append_voice_block"), \
+                    mock.patch.object(pv, "run_scribe", return_value=0), \
+                    mock.patch("transcript_review.review_saved_note") as review:
+                ok = pv.process_file(
+                    audio, journal_dir=Path(td), model=mock.Mock(), whisper_prompt="",
+                    python_bin=Path("/usr/bin/python3"), scribe_py=Path("scribe.py"),
+                    night_cutoff=4, dry_run=False, verbose=False,
+                )
+            self.assertTrue(ok)
+            review.assert_called_once()
+            self.assertEqual(review.call_args.kwargs["when"], "Nov 12, 2:29 PM")
+            self.assertEqual(review.call_args.kwargs["focus_text"], "just bear tenders")
+
     def test_transient_probe_failure_marks_transient(self):
         with tempfile.TemporaryDirectory() as td:
             result, audio, transcribe = self._run(
@@ -390,6 +412,12 @@ class TestBoundedRetry(unittest.TestCase):
                 self.assertFalse(pv.is_transient_failed(audio))
                 self.assertTrue(pv.is_failed(audio))
                 notify.assert_called_once()
+                title, body = notify.call_args.args
+                self.assertEqual(title, "Voice memo stuck")
+                self.assertEqual(
+                    body,
+                    "Jul 8, 9:00 AM\nGave up after 3 tries.\n\nreason",
+                )
                 marker = audio.with_suffix(audio.suffix + pv.FAILED_SUFFIX)
                 self.assertIn("escalated", marker.read_text())
 
@@ -410,6 +438,46 @@ class TestBoundedRetry(unittest.TestCase):
             with mock.patch.object(pv, "_notify"):
                 pv.mark_failed(audio, "again", kind=pv.FAIL_TRANSIENT)
             self.assertEqual(pv._read_marker_attempts(audio), 1)
+
+
+class TestGaveUpNotice(unittest.TestCase):
+    def test_tailscale_name_reads_as_clock_time(self):
+        title, body = pv.gave_up_notice(
+            Path("2026-11-12_14-29-14.m4a"),
+            10,
+            "transcription error: open() got an unexpected keyword argument 'metadata_errors'",
+        )
+        self.assertEqual(title, "Voice memo stuck")
+        self.assertEqual(
+            body,
+            "Nov 12, 2:29 PM\nGave up after 10 tries.\n\n"
+            "transcription error: open() got an unexpected keyword argument 'metadata_errors'",
+        )
+
+    def test_unrecognized_name_stays_as_filename(self):
+        title, body = pv.gave_up_notice(Path("memo.m4a"), 2, "")
+        self.assertEqual(title, "Voice memo stuck")
+        self.assertIn("memo.m4a", body)
+        self.assertIn("unknown error", body)
+
+
+class TestPyav19OpenCompat(unittest.TestCase):
+    def test_wrapper_drops_kwargs_pyav19_removed(self):
+        seen = {}
+
+        def original(*args, **kwargs):
+            seen["args"] = args
+            seen["kwargs"] = kwargs
+            return "opened"
+
+        wrapped = pv.av_open_dropping_removed_kwargs(original)
+        self.assertTrue(wrapped._jl_pyav19_compat)
+        self.assertEqual(
+            wrapped("clip.m4a", mode="r", metadata_errors="ignore", metadata_encoding="utf-8"),
+            "opened",
+        )
+        self.assertEqual(seen["args"], ("clip.m4a",))
+        self.assertEqual(seen["kwargs"], {"mode": "r"})
 
 
 class TestNotifyBestEffort(unittest.TestCase):

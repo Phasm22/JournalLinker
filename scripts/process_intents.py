@@ -1220,7 +1220,15 @@ def _get_pushover_key() -> str:
     )
 
 
-def send_pushover(title: str, body: str, urgency: str = "today") -> tuple[int, str]:
+def send_pushover(
+    title: str,
+    body: str,
+    urgency: str = "today",
+    *,
+    priority: str | None = None,
+    link: str = "",
+    link_title: str = "",
+) -> tuple[int, str]:
     app_token = _get_pushover_token()
     user_key = _get_pushover_key()
     if not app_token:
@@ -1228,9 +1236,10 @@ def send_pushover(title: str, body: str, urgency: str = "today") -> tuple[int, s
     if not user_key:
         raise ValueError("SCRIBE_PUSHOVER_USER_KEY is required for Pushover delivery.")
 
-    # Map urgency to Pushover priority
+    # Map urgency to Pushover priority. An explicit priority wins.
     priority_map = {"immediate": "1", "today": "0", "soon": "0", "low": "-1"}
-    priority = priority_map.get(urgency, os.getenv("SCRIBE_PUSHOVER_PRIORITY", DEFAULT_PUSHOVER_PRIORITY))
+    if priority is None:
+        priority = priority_map.get(urgency, os.getenv("SCRIBE_PUSHOVER_PRIORITY", DEFAULT_PUSHOVER_PRIORITY))
 
     server = (
         os.getenv("SCRIBE_PUSHOVER_SERVER", DEFAULT_PUSHOVER_SERVER).rstrip("/")
@@ -1243,6 +1252,10 @@ def send_pushover(title: str, body: str, urgency: str = "today") -> tuple[int, s
         "message": body[:1024],
         "priority": priority,
     }
+    if link:
+        form_data["url"] = link[:512]
+        if link_title:
+            form_data["url_title"] = link_title[:100]
     device = os.getenv("SCRIBE_PUSHOVER_DEVICE", "").strip()
     if device:
         form_data["device"] = device

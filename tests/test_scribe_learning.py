@@ -590,6 +590,14 @@ class TestScribeLearning(unittest.TestCase):
             history_path = base_dir / scribe.RUN_REPORTS_DIRNAME / scribe.RUN_HISTORY_FILENAME
             history = history_path.read_text(encoding="utf-8")
             self.assertLess(history.find("2026-03-17 10:00:00"), history.find("2026-03-17 09:00:00"))
+            report_link = (
+                "[[journal-linker/Journal Linker Run - Latest|Journal Linker Run - Latest]]"
+            )
+            self.assertEqual(history.count(f"- Report: {report_link}"), 2)
+            self.assertNotIn(
+                "[Journal Linker Run - Latest.md](Journal Linker Run - Latest.md)",
+                history,
+            )
 
     def test_main_uses_resolved_journal_note_when_input_and_clipboard_empty(self):
         with tempfile.TemporaryDirectory() as d:

@@ -618,10 +618,14 @@ def write_run_report(
 
     status_label = "Success" if status == "success" else "Error"
     history_header = "# Journal Linker Run History\n\n"
+    # Vault-root wikilink. Spaces in the filename keep a markdown link from
+    # resolving, and a same-folder relative path only works inside journal-linker/.
+    report_stem = Path(report_name).stem
+    report_link = f"[[{RUN_REPORTS_DIRNAME}/{report_stem}|{report_stem}]]"
     history_entry_lines = [
         f"## {started_at.strftime('%Y-%m-%d %H:%M:%S')} - {status_label}",
         "",
-        f"- Report: [{report_name}]({report_name})",
+        f"- Report: {report_link}",
         f"- Active date: `{active_date or 'unset'}`",
         f"- Active file: `{str(active_file) if active_file else 'unset'}`",
         f"- Result: `{status_label}`",

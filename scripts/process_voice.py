@@ -305,6 +305,46 @@ def resolve_target_date(audio_path: Path, night_cutoff_hour: int = DEFAULT_NIGHT
 # Transcription
 # ---------------------------------------------------------------------------
 
+def av_open_dropping_removed_kwargs(original):
+    """Wrap av.open so PyAV 19+ ignores kwargs that release removed.
+
+    faster-whisper 1.2.1 still calls av.open(..., metadata_errors="ignore").
+    PyAV 19 dropped metadata_errors and metadata_encoding; passing them raises
+    TypeError before any audio is decoded. Popping them is a no-op on a call
+    that does not pass them.
+    """
+    def _open(*args, **kwargs):
+        kwargs.pop("metadata_errors", None)
+        kwargs.pop("metadata_encoding", None)
+        return original(*args, **kwargs)
+
+    _open._jl_pyav19_compat = True  # type: ignore[attr-defined]
+    return _open
+
+
+def install_pyav19_open_compat() -> None:
+    """Patch the imported av.open when this environment is PyAV 19 or newer.
+
+    Idempotent. No-op when av or faster-whisper is missing, or when av is
+    still old enough to accept metadata_errors.
+    """
+    try:
+        import av
+        import faster_whisper.audio as fw_audio
+    except ImportError:
+        return
+    current = fw_audio.av.open
+    if getattr(current, "_jl_pyav19_compat", False):
+        return
+    try:
+        major = int(str(getattr(av, "__version__", "0")).split(".", 1)[0])
+    except (TypeError, ValueError):
+        return
+    if major < 19:
+        return
+    fw_audio.av.open = av_open_dropping_removed_kwargs(current)
+
+
 def load_whisper_model(model_name: str):
     """Load a faster-whisper WhisperModel. Exits with a helpful message if not installed."""
     try:
@@ -318,27 +358,65 @@ def load_whisper_model(model_name: str):
         )
         sys.exit(1)
 
+    install_pyav19_open_compat()
     print(f"[voice] loading Whisper model '{model_name}' (downloads on first use) …", file=sys.stderr)
     return WhisperModel(model_name, device="cpu", compute_type="int8")
 
 
-def transcribe_audio(audio_path: Path, model, initial_prompt: str) -> tuple[str, float, str]:
-    """Return (transcript_text, duration_sec, detected_language).
+class TranscriptResult(tuple):
+    """Text plus the decoder scores the transcript checks read.
+
+    A tuple so older callers can still unpack text, duration, language.
+    """
+
+    def __new__(cls, text: str, duration: float, language: str, segments: tuple = ()):
+        return super().__new__(cls, (text, duration, language))
+
+    def __init__(self, text: str, duration: float, language: str, segments: tuple = ()):
+        self.text = text
+        self.duration = duration
+        self.language = language
+        self.segments = segments
+
+
+def _segment_scores(segments) -> tuple:
+    scored = []
+    for segment in segments:
+        words = []
+        for word in getattr(segment, "words", None) or []:
+            token = str(getattr(word, "word", "")).strip()
+            if token:
+                words.append((token, float(getattr(word, "probability", 0) or 0)))
+        scored.append({
+            "text": str(getattr(segment, "text", "") or ""),
+            "avg_logprob": float(getattr(segment, "avg_logprob", 0) or 0),
+            "compression_ratio": float(getattr(segment, "compression_ratio", 0) or 0),
+            "words": words,
+        })
+    return tuple(scored)
+
+
+def transcribe_audio(audio_path: Path, model, initial_prompt: str) -> TranscriptResult:
+    """Return text, duration, language, and per-word decoder scores.
 
     Passes initial_prompt to Whisper so the decoder prefers vocabulary from
-    the learning store. Segments are joined into a single continuous transcript.
+    the learning store. Word probabilities are kept for the transcript checks.
+    Segments are joined into a single continuous transcript.
     """
+    install_pyav19_open_compat()
     segments, info = model.transcribe(
         str(audio_path),
         initial_prompt=initial_prompt or None,
         language="en",
         beam_size=5,
+        word_timestamps=True,
     )
-    parts = [seg.text.strip() for seg in segments]
-    transcript = " ".join(p for p in parts if p)
+    segment_list = list(segments)
+    parts = [seg.text.strip() for seg in segment_list]
+    transcript = " ".join(part for part in parts if part)
     duration = getattr(info, "duration", 0.0)
     language = getattr(info, "language", "en")
-    return transcript, duration, language
+    return TranscriptResult(transcript, duration, language, _segment_scores(segment_list))
 
 
 # ---------------------------------------------------------------------------
@@ -460,6 +538,30 @@ def _read_marker_attempts(audio_path: Path) -> int:
     return 0
 
 
+def recording_when(audio_path: Path) -> str:
+    """Clock time from a dated recording name, for a notification first line.
+
+    Uses the time in the filename (what was recorded), not the journal day
+    after the night cutoff. Unrecognized names stay as the filename.
+    """
+    match = FILENAME_RE.fullmatch(audio_path.stem)
+    if not match:
+        return audio_path.name
+    recorded = datetime.strptime(match.group(1), "%Y-%m-%d")
+    hour = int(match.group(2) or match.group(4))
+    minute = int(match.group(3) or match.group(5))
+    hour12 = hour % 12 or 12
+    ampm = "AM" if hour < 12 else "PM"
+    return f"{recorded.strftime('%b')} {recorded.day}, {hour12}:{minute:02d} {ampm}"
+
+
+def gave_up_notice(audio_path: Path, attempts: int, reason: str) -> tuple[str, str]:
+    """Title and body for the one-time 'stopped retrying' Pushover."""
+    detail = (reason or "unknown error").strip()
+    body = f"{recording_when(audio_path)}\nGave up after {attempts} tries.\n\n{detail}"
+    return "Voice memo stuck", body
+
+
 def _notify(title: str, body: str) -> None:
     """Best-effort desktop/push notification via the pnotify CLI (TJ's Pushover
     wrapper). Mirrors process_intents' pnotify tier without importing that
@@ -508,11 +610,8 @@ def mark_failed(audio_path: Path, reason: str = "", kind: str = FAIL_PERMANENT) 
         escalated = f"escalated to permanent after {attempts} transient attempts: {reason}"
         _write_marker(audio_path, FAIL_PERMANENT, escalated, attempts)
         print(f"[voice] {audio_path.name}: {escalated}", file=sys.stderr)
-        _notify(
-            "Voice recording gave up",
-            f"{audio_path.name} failed {attempts} transient retries and was "
-            f"marked permanent. Last reason: {reason or 'unknown error'}",
-        )
+        title, body = gave_up_notice(audio_path, attempts, reason)
+        _notify(title, body)
         return
     _write_marker(audio_path, FAIL_TRANSIENT, reason, attempts)
 
@@ -710,7 +809,11 @@ def process_file(
         print(f"[voice] whisper prompt ({len(whisper_prompt)} chars): {whisper_prompt[:120]}…", file=sys.stderr)
 
     try:
-        transcript, duration, language = transcribe_audio(audio_path, model, whisper_prompt)
+        transcribed = transcribe_audio(audio_path, model, whisper_prompt)
+        transcript = transcribed.text
+        duration = transcribed.duration
+        language = transcribed.language
+        segments = transcribed.segments
     except Exception as exc:
         # Reached only after probe_decodable() vetted the container, so a failure
         # here is genuinely model/infra (model load, resampler I/O) — not the
@@ -746,6 +849,19 @@ def process_file(
         return False
 
     if not dry_run:
+        # Checks read the note Scribe just wrote. A failure here still leaves
+        # the recording processed; the next Scribe run is unchanged.
+        try:
+            import transcript_review
+
+            transcript_review.review_saved_note(
+                journal_dir / f"{date_str}.md",
+                segments=list(segments),
+                when=recording_when(audio_path),
+                focus_text=transcript,
+            )
+        except Exception as exc:  # noqa: BLE001 — the note is already saved
+            print(f"[voice] transcript check skipped: {exc}", file=sys.stderr)
         mark_processed(audio_path)
         print(f"[voice] marked processed: {audio_path.name}", file=sys.stderr)
 
