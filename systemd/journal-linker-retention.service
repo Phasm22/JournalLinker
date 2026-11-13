@@ -1,0 +1,11 @@
+[Unit]
+Description=journalLinker generated log/state retention
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/journalLinker
+EnvironmentFile=-%h/.config/journal-linker/journal-linker.env
+ExecStart=%h/journalLinker/ScribeVenv/bin/python %h/journalLinker/scripts/retention_cleanup.py --apply
+
+[Install]
+WantedBy=default.target

@@ -13,6 +13,10 @@ One-shot mode is two-phase:
 
 Deferred entries are re-queued at +24h (state reset to pending, send_after updated).
 
+Daemon health is reported as service.state transitions on stderr (ready on the
+first good poll, degraded on poll/API failures, recovered afterwards, stopping
+on shutdown); nothing is emitted while the state is unchanged.
+
 Usage:
     python3 scripts/feedback_sender.py
     python3 scripts/feedback_sender.py --daemon
@@ -24,7 +28,6 @@ Env vars:
     INTENT_STATE_DIR     state dir (default: ~/.local/state/journal-linker/intents)
     INTENT_FEEDBACK_POLL_TIMEOUT    long-poll timeout seconds (default: 25)
     INTENT_FEEDBACK_SEND_INTERVAL   due-message scan interval seconds (default: 60)
-    INTENT_FEEDBACK_HEARTBEAT_SEC   health.probe interval in --daemon mode (default: 300, min 30)
     INTENT_FEEDBACK_QUIET_START     quiet-hours start, local hour 0-23 (default: 22)
     INTENT_FEEDBACK_QUIET_END       quiet-hours end, local hour 0-23 (default: 8)
     INTENT_TELEGRAM_REACTION_SPIKE  1|true|on — extra raw-ish reaction debug log (sanitized spike row).
@@ -43,6 +46,7 @@ import html
 import json
 import os
 import re
+import signal
 import sys
 import tempfile
 import time
@@ -56,7 +60,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from journal_linker_telemetry import emit_health_probe, maybe_write_job_payload
+from journal_linker_telemetry import HealthState, maybe_write_job_payload
 
 FEEDBACK_QUEUE_FILENAME = "intent_feedback_queue.jsonl"
 LEDGER_FILENAME = "intent_delivery_ledger.jsonl"
@@ -66,6 +70,7 @@ FEEDBACK_TAP_TRACE_FILENAME = "intent_feedback_tap_trace.jsonl"
 REACTION_SPIKE_FILENAME = "intent_feedback_reaction_spike.jsonl"
 REACTION_AUDIT_FILENAME = "intent_feedback_reaction_audit.jsonl"
 REPLY_TRACE_FILENAME = "intent_feedback_reply_trace.jsonl"
+SERVICE_NAME = "feedback-sender"
 DEFER_DELAY_SECS = 86400  # 24h re-queue on defer
 DEFAULT_DEFER_LIMIT = 3
 DEFAULT_MAX_PER_SOURCE_PER_RUN = 1
@@ -682,10 +687,6 @@ def _normalize_suppression_phrase(text: str) -> str:
 
 def _feedback_queue_pending(entries: list[dict]) -> int:
     return sum(1 for entry in entries if str(entry.get("state", "")).strip().lower() == "pending")
-
-
-def _heartbeat_interval_sec() -> int:
-    return _env_int("INTENT_FEEDBACK_HEARTBEAT_SEC", 300)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -1684,52 +1685,47 @@ def run_daemon(
         "daemon",
         f"starting long polling poll_timeout={poll_timeout}s send_interval={send_interval}s state_dir={state_dir}",
     )
-    started_at = time.monotonic()
+    health = HealthState(SERVICE_NAME)
     next_send_at = 0.0
-    next_heartbeat_at = 0.0
-    heartbeat_interval = max(30, _heartbeat_interval_sec())
-    last_updates_count = 0
-    poll_offset = load_offset(state_dir)
+    offset: int | None = None
 
-    def _emit_probe() -> None:
-        nonlocal poll_offset, last_updates_count
-        entries = load_feedback_queue(state_dir)
-        emit_health_probe(
-            "feedback-sender",
-            uptime_sec=round(time.monotonic() - started_at, 1),
-            poll_offset=poll_offset,
-            updates_last_cycle=last_updates_count,
-            feedback_queue_pending=_feedback_queue_pending(entries),
-        )
-        last_updates_count = 0
-
-    _emit_probe()
-    next_heartbeat_at = time.monotonic() + heartbeat_interval
-
-    while True:
+    def _metrics() -> dict:
         try:
-            offset = load_offset(state_dir)
-            poll_offset = offset
-            _vlog("updates", f"long polling getUpdates offset={offset} timeout={poll_timeout}")
-            updates = get_updates(token, offset, timeout=poll_timeout)
-            if updates:
-                last_updates_count = len(updates)
-                _log("updates", f"received {len(updates)} update(s)")
-                _process_updates_for_state(state_dir, token, updates, chat_id=chat_id)
+            pending = _feedback_queue_pending(load_feedback_queue(state_dir))
+        except Exception:
+            pending = None
+        return {"poll_offset": offset, "feedback_queue_pending": pending}
 
-            now = time.monotonic()
-            if now >= next_send_at:
-                _send_due_for_state(state_dir, token, chat_id)
-                next_send_at = now + send_interval
-            if now >= next_heartbeat_at:
-                _emit_probe()
-                next_heartbeat_at = now + heartbeat_interval
-        except KeyboardInterrupt:
-            _log("daemon", "stopping on keyboard interrupt")
-            return 0
-        except Exception as exc:
-            _log("daemon", f"ERROR: {exc}")
-            time.sleep(5)
+    try:
+        while True:
+            try:
+                offset = load_offset(state_dir)
+                _vlog("updates", f"long polling getUpdates offset={offset} timeout={poll_timeout}")
+                updates = get_updates(token, offset, timeout=poll_timeout)
+                if updates:
+                    _log("updates", f"received {len(updates)} update(s)")
+                    _process_updates_for_state(state_dir, token, updates, chat_id=chat_id)
+
+                now = time.monotonic()
+                if now >= next_send_at:
+                    _send_due_for_state(state_dir, token, chat_id)
+                    next_send_at = now + send_interval
+            except Exception as exc:
+                _log("daemon", f"ERROR: {exc}")
+                health.set("degraded", f"poll failed: {type(exc).__name__}", **_metrics())
+                time.sleep(5)
+                continue
+            # Pre-check so steady-state cycles skip the queue read for metrics.
+            if health.status in (None, "degraded"):
+                health.ok("polling", **_metrics())
+    except KeyboardInterrupt:
+        _log("daemon", "stopping on interrupt")
+        health.set("stopping", "shutdown")
+        return 0
+
+
+def _interrupt_on_sigterm(signum, frame):
+    raise KeyboardInterrupt
 
 
 # ---------------------------------------------------------------------------
@@ -1794,6 +1790,7 @@ def main() -> int:
 
     try:
         if args.daemon:
+            signal.signal(signal.SIGTERM, _interrupt_on_sigterm)
             return run_daemon(
                 state_dir,
                 token,

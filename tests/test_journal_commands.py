@@ -364,6 +364,78 @@ class TestFindCommandsWithDiagnostics(unittest.TestCase):
         self.assertEqual(routes, [("hot_seat_fetch", "ford"), ("watchlist_add", "apple")])
 
 
+class TestWordOfTheDay(unittest.TestCase):
+    def test_no_wake_word_needed(self):
+        spans = jc.extract_word_of_day_spans("word of the day is ephemeral")
+        self.assertEqual(len(spans), 1)
+        self.assertEqual(spans[0]["word"], "ephemeral")
+        self.assertEqual(spans[0]["route"], "word_of_the_day")
+
+    def test_wake_word_prefix_still_works(self):
+        spans = jc.extract_word_of_day_spans(
+            "hey palindrome, word of the day is petrichor"
+        )
+        self.assertEqual(len(spans), 1)
+        self.assertEqual(spans[0]["word"], "petrichor")
+
+    def test_colon_form(self):
+        spans = jc.extract_word_of_day_spans("word of the day: petrichor")
+        self.assertEqual(spans[0]["word"], "petrichor")
+
+    def test_the_prefix_form(self):
+        spans = jc.extract_word_of_day_spans("the word of the day is defenestrate")
+        self.assertEqual(spans[0]["word"], "defenestrate")
+
+    def test_no_delimiter_falls_back_to_next_word(self):
+        spans = jc.extract_word_of_day_spans("word of the day ephemeral, love that one")
+        self.assertEqual(spans[0]["word"], "ephemeral")
+
+    def test_skips_leading_filler(self):
+        spans = jc.extract_word_of_day_spans("word of the day is a corker")
+        self.assertEqual(spans[0]["word"], "corker")
+
+    def test_question_form_captures_nothing(self):
+        spans = jc.extract_word_of_day_spans("what's the word of the day? not sure yet.")
+        self.assertEqual(spans, [])
+
+    def test_no_mention_no_spans(self):
+        self.assertEqual(jc.extract_word_of_day_spans("just a normal journal entry"), [])
+
+    def test_empty(self):
+        self.assertEqual(jc.extract_word_of_day_spans(""), [])
+
+    def test_two_distinct_words_both_recognized(self):
+        text = "word of the day is ephemeral. Later: word of the day is petrichor."
+        commands = jc.find_word_of_day_commands(text)
+        words = sorted(c["word"] for c in commands)
+        self.assertEqual(words, ["ephemeral", "petrichor"])
+
+    def test_duplicate_word_deduped(self):
+        text = "word of the day is ephemeral. word of the day is ephemeral."
+        commands = jc.find_word_of_day_commands(text)
+        self.assertEqual(len(commands), 1)
+
+    def test_key_is_route_scoped(self):
+        commands = jc.find_word_of_day_commands("word of the day is ephemeral")
+        self.assertEqual(commands[0]["key"], "word_of_the_day||ephemeral")
+
+    def test_coexists_with_wake_word_routes(self):
+        text = ("Palindrome, pull the 10-K for Ford. "
+                "Word of the day is ephemeral.")
+        wake_commands, _ = jc.find_commands_with_diagnostics(text)
+        wod_commands = jc.find_word_of_day_commands(text)
+        all_routes = sorted(c["route"] for c in wake_commands + wod_commands)
+        self.assertEqual(all_routes, ["hot_seat_fetch", "word_of_the_day"])
+
+    def test_span_strippable_from_note(self):
+        text = "Morning pages. Word of the day is ephemeral. Gym after."
+        commands = jc.find_word_of_day_commands(text)
+        stripped = jc.strip_command_spans(text, commands)
+        self.assertNotIn("Word of the day", stripped)
+        self.assertIn("Morning pages.", stripped)
+        self.assertIn("Gym after.", stripped)
+
+
 def _load_jc_with_config(config_path: str):
     """Load a fresh journal_commands module instance with a specific route
     config, without disturbing the module-level `jc` used by other tests."""

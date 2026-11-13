@@ -20,9 +20,9 @@
 		<!-- Optional: override gate model (default: phi4:14b) -->
 		<!-- <key>INTENT_GATE_MODEL</key> -->
 		<!-- <string>phi4:14b</string> -->
-		<!-- Optional: explicit cortex write dir (default: <journal_dir>/cortex) -->
+		<!-- Optional: explicit cortex write dir (default: <journal_dir>/intents) -->
 		<!-- <key>INTENT_CORTEX_DIR</key> -->
-		<!-- <string>/Users/YOURNAME/path/to/cortex</string> -->
+		<!-- <string>/Users/YOURNAME/path/to/intents</string> -->
 	</dict>
 
 	<key>ProgramArguments</key>

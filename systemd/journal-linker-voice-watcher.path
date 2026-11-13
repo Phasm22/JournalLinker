@@ -1,12 +1,11 @@
-# Fires when VoiceDrop changes (Dropbox sync). Directory must exist before: systemctl --user enable --now …
-# Path must be literal (no env). Default: ~/Dropbox/VoiceDrop — override with:
+# Fires when VoiceDrop changes (journal-linker-voice-ingest.service writes here). Directory must exist before: systemctl --user enable --now …
+# Path must be literal (no env) and match SCRIBE_VOICEDROP_DIR. Default: ~/VoiceDrop — override with:
 #   systemctl --user edit journal-linker-voice-watcher.path
-# If Dropbox is flaky with inotify, use journal-linker-voice-poll.timer instead.
 [Unit]
 Description=Journal Linker — watch VoiceDrop directory
 
 [Path]
-PathChanged=%h/Dropbox/VoiceDrop
+PathChanged=%h/VoiceDrop
 Unit=journal-linker-voice-watcher.service
 
 [Install]

@@ -16,7 +16,7 @@ def get_clipboard_text() -> str:
 
 def parse_cli() -> tuple[str, int, list[str]]:
     """Parse --model/--ctx flags and return (model, num_ctx, remaining_args)."""
-    model = "llama3.1:8b"
+    model = "llama3.2:latest"
     num_ctx = 8192
 
     env_model = os.getenv("SCRIBE_MODEL")
