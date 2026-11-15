@@ -8,6 +8,14 @@ Also classifies wellness captures
 notes under <journal_dir>/wellness/ (override with INTENT_WELLNESS_DIR) — never
 under intents/, which vault indexers skip.
 
+A wellness span keeps one file across callout edits. Its id is the journal
+file stem (the YYYY-MM-DD note, not the absolute path), the spoken minute,
+the same-minute callout ordinal, and the capture type/slot. Item text and
+wording live in the note body and are updated in place. A span that disappears
+from the source note is marked status: superseded. State lives in
+nutrition_span_index.json. Historical copies are left for
+scripts/dedupe_wellness_notes.py.
+
 A separate `--summary` command sends one end-of-day Pushover and scores the
 previous journal day against nutrition_memory.json.
 
@@ -41,6 +49,7 @@ from text_normalize import strip_wikilinks  # noqa: E402
 
 LEDGER_FILENAME = "nutrition_ledger.jsonl"
 PROCESSED_FILENAME = "nutrition_processed.jsonl"
+SPAN_INDEX_FILENAME = "nutrition_span_index.json"
 CACHE_FILENAME = "nutrition_lookup_cache.json"
 MEMORY_FILENAME = "nutrition_memory.json"
 SUMMARY_STATE_FILENAME = "nutrition_summary_state.json"
@@ -488,13 +497,74 @@ def extract_voice_callouts(note_text: str) -> list[dict]:
         raw = re.sub(r"\s+", " ", raw).strip()
         if raw:
             callouts.append({"spoken_at": spoken_at, "raw_text": raw})
+    counts: dict[str, int] = {}
+    for callout in callouts:
+        spoken = callout["spoken_at"]
+        callout["ordinal"] = counts.get(spoken, 0)
+        counts[spoken] = callout["ordinal"] + 1
     return callouts
 
 
-def span_key(source_path: Path | str, spoken_at: str, raw_text: str) -> str:
-    normalized = re.sub(r"\s+", " ", raw_text).strip().lower()
-    payload = f"{source_path}|{spoken_at}|{normalized}"
+def _normalized_callout_text(raw_text: str) -> str:
+    return re.sub(r"\s+", " ", raw_text or "").strip().lower()
+
+
+def text_fingerprint(raw_text: str) -> str:
+    """Hash of the callout wording. Not part of the stable span id."""
+    return hashlib.sha256(_normalized_callout_text(raw_text).encode("utf-8")).hexdigest()
+
+
+def legacy_span_key(source_path: Path | str, spoken_at: str, raw_text: str) -> str:
+    """Pre-v2 id: absolute path + spoken_at + raw text.
+
+    Kept so an unchanged callout already listed in nutrition_processed.jsonl
+    is not extracted again and does not mint another wellness file.
+    """
+    payload = f"{source_path}|{spoken_at}|{_normalized_callout_text(raw_text)}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def source_note_stem(source_path: Path | str, source_date: str = "") -> str:
+    """Journal identity: the dated note stem, never the absolute path."""
+    stem = Path(source_path).stem
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", stem):
+        return stem
+    date = (source_date or "").strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+        return date
+    return stem
+
+
+def normalize_spoken_minute(spoken_at: str) -> str:
+    match = re.fullmatch(r"\s*(\d{1,2}):(\d{2})\s*", spoken_at or "")
+    if not match:
+        return (spoken_at or "").strip()
+    return f"{int(match.group(1)):02d}:{match.group(2)}"
+
+
+def callout_span_key(source_stem: str, spoken_at: str, ordinal: int) -> str:
+    """Stable id for one voice callout. Wording is not an input."""
+    payload = (
+        f"v2|{source_stem}|{normalize_spoken_minute(spoken_at)}|{int(ordinal)}"
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def capture_span_key(
+    callout_key: str,
+    capture_type: str,
+    meal_slot: str,
+    sibling_index: int,
+) -> str:
+    """Stable id for one wellness note inside a callout."""
+    slot = (meal_slot or "unknown").strip().lower() or "unknown"
+    payload = f"v2|{callout_key}|{capture_type}|{slot}|{int(sibling_index)}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def span_key(source_path: Path | str, spoken_at: str, raw_text: str) -> str:
+    """Legacy wrapper. New code uses callout_span_key."""
+    return legacy_span_key(source_path, spoken_at, raw_text)
 
 
 # ---------------------------------------------------------------------------
@@ -577,6 +647,39 @@ def load_processed_keys(state_dir: Path) -> set[str]:
 
 def append_processed(state_dir: Path, record: dict) -> None:
     _append_jsonl(processed_path(state_dir), record)
+
+
+def span_index_path(state_dir: Path) -> Path:
+    return state_dir / SPAN_INDEX_FILENAME
+
+
+def load_span_index(state_dir: Path) -> dict:
+    data = _read_json(span_index_path(state_dir), {"callouts": {}})
+    if not isinstance(data.get("callouts"), dict):
+        data["callouts"] = {}
+    return data
+
+
+def save_span_index(state_dir: Path, index: dict) -> None:
+    callouts = index.get("callouts") if isinstance(index.get("callouts"), dict) else {}
+    _atomic_write_json(span_index_path(state_dir), {"callouts": callouts})
+
+
+def upsert_ledger_row(state_dir: Path, row: dict, also_keys: set[str] | None = None) -> bool:
+    """Replace a row with the same id. Return True when a new row is appended."""
+    keys = {str(row.get("idempotency_key") or "")}
+    for key in also_keys or ():
+        if key:
+            keys.add(str(key))
+    keys.discard("")
+    rows = load_ledger_rows(state_dir)
+    for index, existing in enumerate(rows):
+        if str(existing.get("idempotency_key") or "") in keys:
+            rows[index] = row
+            rewrite_ledger_rows(state_dir, rows)
+            return False
+    _append_jsonl(ledger_path(state_dir), row)
+    return True
 
 
 def load_cache(state_dir: Path) -> dict:
@@ -2537,6 +2640,284 @@ def _wellness_filename_slug(capture_type: str, meal_slot: str, labels: list[str]
     return slug or capture_type
 
 
+_FRONTMATTER_RE = re.compile(r"\A---\n(.*?)\n---", re.S)
+
+
+def read_frontmatter(text: str) -> dict[str, str]:
+    match = _FRONTMATTER_RE.match(text or "")
+    if not match:
+        return {}
+    fields: dict[str, str] = {}
+    for line in match.group(1).splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        fields[key.strip()] = value.strip()
+    return fields
+
+
+def _unquote_yaml(value: str) -> str:
+    text = (value or "").strip()
+    if len(text) >= 2 and text[0] == '"' and text[-1] == '"':
+        return text[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+    return text
+
+
+def parse_frontmatter_items(raw: str) -> list[str]:
+    text = (raw or "").strip()
+    if not text or text == "[]":
+        return []
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(data, list):
+        return []
+    return [str(item) for item in data]
+
+
+def _set_frontmatter_field(text: str, field: str, value: str) -> str:
+    line = f"{field}: {value}"
+    pattern = re.compile(rf"(?m)^{re.escape(field)}:.*$")
+    if pattern.search(text):
+        return pattern.sub(line, text, count=1)
+    return re.sub(r"\A---\n", f"---\n{line}\n", text, count=1)
+
+
+def _path_inside_dir(root: Path, path: Path) -> bool:
+    try:
+        if path.is_symlink():
+            return False
+        return path.resolve().is_relative_to(root.resolve())
+    except OSError:
+        return False
+
+
+def _resolved_path(path: Path) -> str:
+    try:
+        return str(path.resolve())
+    except OSError:
+        return str(path)
+
+
+def supersede_wellness_note(path: Path) -> None:
+    """Mark a note superseded. The file stays on disk."""
+    if not path.is_file() or path.is_symlink():
+        return
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    if _unquote_yaml(read_frontmatter(text).get("status", "")) == "superseded":
+        return
+    path.write_text(_set_frontmatter_field(text, "status", "superseded"), encoding="utf-8")
+    _log(f"superseded {path.name}")
+
+
+def _note_mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _spoken_sort_value(spoken: str) -> tuple:
+    minute = normalize_spoken_minute(spoken)
+    match = re.fullmatch(r"(\d{2}):(\d{2})", minute)
+    if not match:
+        return (1, 99, 99)
+    return (0, int(match.group(1)), int(match.group(2)))
+
+
+def _labels_overlap(left: list[str], right: list[str]) -> int:
+    score = 0
+    for a in left:
+        for b in right:
+            if not a or not b:
+                continue
+            if a == b:
+                score += 3
+            elif a in b or b in a:
+                score += 2
+    return score
+
+
+def iter_wellness_notes(wellness_dir: Path | None) -> list[Path]:
+    if wellness_dir is None or not wellness_dir.is_dir():
+        return []
+    notes: list[Path] = []
+    for path in sorted(wellness_dir.glob("*.md")):
+        if not path.is_file() or path.is_symlink():
+            continue
+        if not _path_inside_dir(wellness_dir, path):
+            continue
+        notes.append(path)
+    return notes
+
+
+def _note_record_from_path(path: Path, capture_key: str = "") -> dict:
+    try:
+        fields = read_frontmatter(path.read_text(encoding="utf-8"))
+    except OSError:
+        fields = {}
+    return {
+        "capture_key": capture_key,
+        "path": _resolved_path(path),
+        "type": _unquote_yaml(fields.get("type", "")),
+        "meal_slot": _unquote_yaml(fields.get("meal_slot", "")) or "unknown",
+        "items": parse_frontmatter_items(fields.get("items", "")),
+        "time": _unquote_yaml(fields.get("time", "")),
+    }
+
+
+def _canonical_note(paths: list[Path]) -> Path:
+    def sort_key(path: Path) -> tuple:
+        record = _note_record_from_path(path)
+        return (_spoken_sort_value(str(record.get("time") or "")), _note_mtime(path), path.name)
+
+    return sorted(paths, key=sort_key)[0]
+
+
+def notes_for_legacy_key(wellness_dir: Path | None, legacy_key: str) -> list[dict]:
+    """One canonical note per (type, items) for files minted by an old span key."""
+    prefix8 = (legacy_key or "")[:8]
+    prefix16 = (legacy_key or "")[:16]
+    if not prefix8:
+        return []
+    grouped: dict[tuple, list[Path]] = {}
+    for path in iter_wellness_notes(wellness_dir):
+        try:
+            fields = read_frontmatter(path.read_text(encoding="utf-8"))
+        except OSError:
+            continue
+        if _unquote_yaml(fields.get("status", "")) == "superseded":
+            continue
+        span = _unquote_yaml(fields.get("span_key", ""))
+        if not (span.startswith(prefix16) or path.stem.endswith(prefix8)):
+            continue
+        labels = tuple(
+            normalize_label(item) for item in parse_frontmatter_items(fields.get("items", ""))
+        )
+        cap_type = _unquote_yaml(fields.get("type", ""))
+        grouped.setdefault((cap_type, labels), []).append(path)
+    return [_note_record_from_path(_canonical_note(paths)) for paths in grouped.values()]
+
+
+def assign_capture_keys(callout_key: str, records: list[dict]) -> list[dict]:
+    ordered = sorted(
+        records,
+        key=lambda record: (
+            str(record.get("type") or ""),
+            str(record.get("meal_slot") or ""),
+            str(record.get("path") or ""),
+        ),
+    )
+    counts: dict[tuple, int] = {}
+    for record in ordered:
+        slot_key = (str(record.get("type") or ""), str(record.get("meal_slot") or "unknown"))
+        sibling = counts.get(slot_key, 0)
+        counts[slot_key] = sibling + 1
+        record["capture_key"] = capture_span_key(
+            callout_key,
+            slot_key[0],
+            slot_key[1],
+            sibling,
+        )
+    return ordered
+
+
+def _match_prior_note(
+    prior: list[dict],
+    cap: dict,
+    capture_key: str,
+    used: set[str],
+) -> dict | None:
+    for note in prior:
+        path = str(note.get("path") or "")
+        if not path or path in used:
+            continue
+        if note.get("capture_key") == capture_key:
+            return note
+    labels = [normalize_label(label) for label in item_labels(cap.get("items") or [])]
+    cap_type = str(cap.get("capture_type") or "")
+    slot = str(cap.get("meal_slot") or "unknown")
+    best = None
+    best_score = -1
+    type_matches: list[dict] = []
+    for note in prior:
+        path = str(note.get("path") or "")
+        if not path or path in used:
+            continue
+        if str(note.get("type") or "") != cap_type:
+            continue
+        type_matches.append(note)
+        note_labels = [normalize_label(item) for item in (note.get("items") or [])]
+        score = _labels_overlap(labels, note_labels)
+        if str(note.get("meal_slot") or "unknown") == slot:
+            score += 2
+        if score > best_score:
+            best_score = score
+            best = note
+    if best is None:
+        return None
+    if best_score > 0 or len(type_matches) == 1:
+        return best
+    return None
+
+
+def _adopt_existing_note(
+    wellness_dir: Path | None,
+    *,
+    source_date: str,
+    capture_type: str,
+    labels: list[str],
+    spoken_at: str,
+    used: set[str],
+    reserved: set[str],
+) -> Path | None:
+    """Reuse one on-disk note when state has not yet pointed at it."""
+    wanted = [normalize_label(label) for label in labels]
+    candidates: list[Path] = []
+    for path in iter_wellness_notes(wellness_dir):
+        resolved = _resolved_path(path)
+        if resolved in used or resolved in reserved:
+            continue
+        try:
+            fields = read_frontmatter(path.read_text(encoding="utf-8"))
+        except OSError:
+            continue
+        if _unquote_yaml(fields.get("status", "")) == "superseded":
+            continue
+        if _unquote_yaml(fields.get("source_date", "")) != source_date:
+            continue
+        if _unquote_yaml(fields.get("type", "")) != capture_type:
+            continue
+        have = [normalize_label(item) for item in parse_frontmatter_items(fields.get("items", ""))]
+        if _labels_overlap(wanted, have) <= 0 and have != wanted:
+            continue
+        candidates.append(path)
+    if not candidates:
+        return None
+    wanted_time = normalize_spoken_minute(spoken_at)
+    timed = [
+        path for path in candidates
+        if normalize_spoken_minute(str(_note_record_from_path(path).get("time") or "")) == wanted_time
+    ]
+    return _canonical_note(timed or candidates)
+
+
+def _reserved_note_paths(callouts: dict, current_key: str) -> set[str]:
+    reserved: set[str] = set()
+    for key, entry in callouts.items():
+        if key == current_key or not isinstance(entry, dict):
+            continue
+        for note in entry.get("notes") or []:
+            path = str(note.get("path") or "")
+            if path:
+                reserved.add(path)
+    return reserved
+
+
 def write_wellness_note(
     wellness_dir: Path,
     *,
@@ -2549,13 +2930,22 @@ def write_wellness_note(
     span_id: str,
     meal_slot: str = "unknown",
     notes: str = "",
+    dest: Path | None = None,
 ) -> Path:
-    """Write a structured wellness note under wellness_dir for vault indexing."""
+    """Write a structured wellness note under wellness_dir for vault indexing.
+
+    dest, when it is an existing file in wellness_dir, is overwritten in place
+    so an edited callout keeps its filename.
+    """
     wellness_dir.mkdir(parents=True, exist_ok=True)
     labels = item_labels(items)
-    slug = _wellness_filename_slug(capture_type, meal_slot, labels, water_oz)
-    key_prefix = (span_id or "")[:8] or "note"
-    note_path = wellness_dir / f"{source_date} {capture_type} {slug} {key_prefix}.md"
+    note_path: Path | None = None
+    if dest is not None and dest.is_file() and not dest.is_symlink() and _path_inside_dir(wellness_dir, dest):
+        note_path = dest
+    if note_path is None:
+        slug = _wellness_filename_slug(capture_type, meal_slot, labels, water_oz)
+        key_prefix = (span_id or "")[:8] or "note"
+        note_path = wellness_dir / f"{source_date} {capture_type} {slug} {key_prefix}.md"
     created = f"{source_date}T{spoken_at}:00" if spoken_at else source_date
     water_line = "null" if water_oz is None else str(_clean_qty(float(water_oz)))
     context = str(notes or "").strip()
@@ -2571,6 +2961,8 @@ def write_wellness_note(
         f"context: {_yaml_double_quoted(context)}" if context else "context: \"\"",
         f"tags: [wellness, {capture_type}]",
         f"created: {created}",
+        "status: active",
+        "span_version: 2",
         f"span_key: {span_id[:16]}",
         "---",
     ]
@@ -2594,7 +2986,7 @@ def write_wellness_note(
             body_lines.append(f"> {line}")
         body_lines.append("")
     note_path.write_text("\n".join(fm_lines) + "\n" + "\n".join(body_lines), encoding="utf-8")
-    _log(f"wellness note {note_path}")
+    _log(f"wellness note {note_path.name}")
     return note_path
 
 
@@ -2614,8 +3006,12 @@ def _process_callout(
     journal_dir: Path | None,
     model: str | None,
     wellness_dir: Path | None = None,
-) -> tuple[int, int, dict | None]:
-    """Return (intake_rows_written, wellness_notes_written, summary_row)."""
+    callout_key: str,
+    legacy_key: str = "",
+    prior_notes: list[dict] | None = None,
+    reserved_paths: set[str] | None = None,
+) -> tuple[int, int, dict | None, list[dict]]:
+    """Return (intake_rows_written, wellness_notes_written, summary_row, note_records)."""
     user = build_extract_user(callout["spoken_at"], callout["raw_text"], memory)
     raw_payload = call_nutrition_model(NUTRITION_LEDGER_PROMPT, user, model=model)
     captures = validate_captures(raw_payload, callout["raw_text"])
@@ -2641,7 +3037,6 @@ def _process_callout(
                 resolve_branded_item(
                     item, cache, memory, journal_dir, dry_run=dry_run, model=model,
                 )
-    key = span_key(source_path, callout["spoken_at"], callout["raw_text"])
     intake_items: list[dict] = []
     for cap in captures:
         if cap.get("is_intake"):
@@ -2653,9 +3048,10 @@ def _process_callout(
         "water_oz": None, "items": [], "notes": "",
     }
     row = {
-        "idempotency_key": key,
+        "idempotency_key": callout_key,
         "logged_at": _now_iso(),
         "source_path": str(source_path),
+        "source_stem": source_note_stem(source_path, source_date),
         "source_date": source_date,
         "spoken_at": callout["spoken_at"],
         "raw_text": callout["raw_text"],
@@ -2670,55 +3066,110 @@ def _process_callout(
     wellness_count = sum(1 for c in captures if c.get("capture_type") in WELLNESS_CAPTURE_TYPES)
     if dry_run:
         print(json.dumps(row, ensure_ascii=False, indent=2))
-        return (1 if any_intake else 0), wellness_count, row
+        return (1 if any_intake else 0), wellness_count, row, []
 
     intake_written = 0
     if any_intake:
-        _append_jsonl(ledger_path(state_dir), row)
-        update_memory_from_row(memory, row)
-        save_memory(state_dir, memory)
+        appended = upsert_ledger_row(state_dir, row, {legacy_key} if legacy_key else set())
+        if appended:
+            update_memory_from_row(memory, row)
+            save_memory(state_dir, memory)
+            intake_written = 1
         save_cache(state_dir, cache)
-        intake_written = 1
 
+    prior = list(prior_notes or [])
+    reserved = set(reserved_paths or ())
+    used: set[str] = set()
+    note_records: list[dict] = []
     wellness_paths: list[str] = []
     notes_written = 0
+    sibling_counts: dict[tuple, int] = {}
     if wellness_dir is not None:
-        for index, cap in enumerate(captures):
+        for cap in captures:
             if cap.get("capture_type") not in WELLNESS_CAPTURE_TYPES:
                 continue
+            slot = str(cap.get("meal_slot") or "unknown")
+            slot_key = (str(cap.get("capture_type") or ""), slot)
+            sibling = sibling_counts.get(slot_key, 0)
+            sibling_counts[slot_key] = sibling + 1
+            cap_key = capture_span_key(callout_key, slot_key[0], slot, sibling)
+            labels = item_labels(cap.get("items") or [])
+            matched = _match_prior_note(prior, cap, cap_key, used)
+            dest: Path | None = None
+            if matched and matched.get("path"):
+                candidate = Path(str(matched["path"]))
+                if (
+                    candidate.is_file()
+                    and not candidate.is_symlink()
+                    and _path_inside_dir(wellness_dir, candidate)
+                ):
+                    dest = candidate
+            if dest is None:
+                dest = _adopt_existing_note(
+                    wellness_dir,
+                    source_date=source_date,
+                    capture_type=slot_key[0],
+                    labels=labels,
+                    spoken_at=callout["spoken_at"],
+                    used=used,
+                    reserved=reserved,
+                )
             try:
                 note_path = write_wellness_note(
                     wellness_dir,
-                    capture_type=cap["capture_type"],
+                    capture_type=slot_key[0],
                     source_date=source_date,
                     spoken_at=callout["spoken_at"],
                     items=cap.get("items") or [],
                     water_oz=cap.get("water_oz"),
                     raw_text=callout["raw_text"],
-                    span_id=f"{key}:{index}",
-                    meal_slot=str(cap.get("meal_slot") or "unknown"),
+                    span_id=cap_key,
+                    meal_slot=slot,
                     notes=str(cap.get("notes") or ""),
+                    dest=dest,
                 )
-                wellness_paths.append(str(note_path))
-                notes_written += 1
             except Exception as exc:
                 _log(f"wellness write failed: {exc}")
+                continue
+            resolved = _resolved_path(note_path)
+            used.add(resolved)
+            wellness_paths.append(resolved)
+            notes_written += 1
+            note_records.append({
+                "capture_key": cap_key,
+                "path": resolved,
+                "type": slot_key[0],
+                "meal_slot": slot,
+                "items": labels,
+                "time": callout["spoken_at"],
+            })
+        for note in prior:
+            path_str = str(note.get("path") or "")
+            if not path_str or path_str in used:
+                continue
+            try:
+                if _resolved_path(Path(path_str)) in used:
+                    continue
+            except OSError:
+                pass
+            supersede_wellness_note(Path(path_str))
     elif wellness_count:
         _log("wellness capture skipped: no wellness_dir")
 
     append_processed(state_dir, {
-        "idempotency_key": key,
+        "idempotency_key": callout_key,
+        "legacy_key": legacy_key,
         "is_intake": any_intake,
         "capture_type": ",".join(
             sorted({str(c.get("capture_type")) for c in captures})
         ) or "none",
-        "source_path": str(source_path),
+        "source_stem": source_note_stem(source_path, source_date),
         "spoken_at": callout["spoken_at"],
         "wellness_note": wellness_paths[0] if len(wellness_paths) == 1 else "",
         "wellness_notes": wellness_paths,
         "capture_count": len(captures),
     })
-    return intake_written, notes_written, row
+    return intake_written, notes_written, row, note_records
 
 
 def retry_error_lookups(
@@ -2768,7 +3219,10 @@ def run_nutrition_stage(
     model: str | None = None,
     wellness_dir: Path | None = None,
 ) -> dict:
-    """Parse new voice callouts. Failures stay inside this function.
+    """Parse voice callouts. Failures stay inside this function.
+
+    An unchanged callout is a no-op. Edited wording updates the existing
+    wellness file. A callout that is gone is marked status: superseded.
 
     Returns counts: {"intake_logged": int, "wellness_notes": int, "nutrition_failed": int}.
     """
@@ -2779,6 +3233,7 @@ def run_nutrition_stage(
     logged = 0
     wellness_notes = 0
     nutrition_failed = 0
+    stem = source_note_stem(source_path, source_date)
     if not dry_run:
         try:
             retry_error_lookups(state_dir, journal_dir, model=chosen_model)
@@ -2790,14 +3245,42 @@ def run_nutrition_stage(
         _log(f"callout parse failed: {exc}")
         return {"intake_logged": 0, "wellness_notes": 0, "nutrition_failed": 1}
     processed = load_processed_keys(state_dir)
+    index = load_span_index(state_dir)
+    callout_index = index.setdefault("callouts", {})
     memory = load_memory(state_dir)
     cache = load_cache(state_dir)
+    live_keys: list[str] = []
     for callout in callouts:
-        key = span_key(source_path, callout["spoken_at"], callout["raw_text"])
-        if key in processed:
+        spoken = str(callout.get("spoken_at") or "")
+        ordinal = int(callout.get("ordinal") or 0)
+        key = callout_span_key(stem, spoken, ordinal)
+        raw_hash = text_fingerprint(str(callout.get("raw_text") or ""))
+        legacy = legacy_span_key(source_path, spoken, str(callout.get("raw_text") or ""))
+        entry = callout_index.get(key)
+        unchanged = (
+            isinstance(entry, dict)
+            and entry.get("status") != "superseded"
+            and entry.get("raw_hash") == raw_hash
+        )
+        if unchanged or (not isinstance(entry, dict) and legacy in processed):
+            live_keys.append(key)
+            if not dry_run and not isinstance(entry, dict):
+                bound = assign_capture_keys(key, notes_for_legacy_key(wellness_dir, legacy))
+                callout_index[key] = {
+                    "raw_hash": raw_hash,
+                    "source_stem": stem,
+                    "source_date": source_date,
+                    "spoken_at": spoken,
+                    "ordinal": ordinal,
+                    "legacy_key": legacy,
+                    "status": "active",
+                    "notes": bound,
+                }
             continue
+        prior_notes = list(entry.get("notes") or []) if isinstance(entry, dict) else []
+        prior_legacy = str(entry.get("legacy_key") or legacy) if isinstance(entry, dict) else legacy
         try:
-            intake_n, wellness_n, _row = _process_callout(
+            intake_n, wellness_n, _row, note_records = _process_callout(
                 callout,
                 source_path=source_path,
                 source_date=source_date,
@@ -2808,6 +3291,10 @@ def run_nutrition_stage(
                 journal_dir=journal_dir,
                 model=chosen_model,
                 wellness_dir=wellness_dir,
+                callout_key=key,
+                legacy_key=prior_legacy,
+                prior_notes=prior_notes,
+                reserved_paths=_reserved_note_paths(callout_index, key),
             )
         except Exception as exc:
             _log(f"extract failed for {callout['spoken_at']}: {exc}")
@@ -2815,8 +3302,35 @@ def run_nutrition_stage(
             continue
         logged += int(intake_n)
         wellness_notes += int(wellness_n)
+        live_keys.append(key)
         if not dry_run:
-            processed.add(key)
+            callout_index[key] = {
+                "raw_hash": raw_hash,
+                "source_stem": stem,
+                "source_date": source_date,
+                "spoken_at": spoken,
+                "ordinal": ordinal,
+                "legacy_key": prior_legacy,
+                "status": "active",
+                "notes": note_records,
+            }
+    if not dry_run:
+        if nutrition_failed == 0:
+            for existing_key, entry in callout_index.items():
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("source_stem") != stem:
+                    continue
+                if entry.get("status") == "superseded":
+                    continue
+                if existing_key in live_keys:
+                    continue
+                for note in entry.get("notes") or []:
+                    path_str = str(note.get("path") or "")
+                    if path_str:
+                        supersede_wellness_note(Path(path_str))
+                entry["status"] = "superseded"
+        save_span_index(state_dir, index)
     return {
         "intake_logged": logged,
         "wellness_notes": wellness_notes,

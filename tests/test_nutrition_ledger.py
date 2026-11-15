@@ -1584,3 +1584,131 @@ class TestFoodVlogHarnessOffline(unittest.TestCase):
         self.assertEqual(failures, [], msg=json.dumps(failures, indent=2))
         self.assertEqual(out["e2e"]["second"]["wellness_notes"], 0)
         self.assertEqual(out["e2e"]["second"]["intake_logged"], 0)
+
+
+class TestStableWellnessIdentity(unittest.TestCase):
+    """A callout edit updates the same wellness file. A rerun does nothing."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state = Path(self.tmp.name) / "state"
+        self.state.mkdir()
+        self.journal = Path(self.tmp.name) / "journal"
+        self.journal.mkdir()
+        self.wellness = self.journal / "wellness"
+        self.note = self.journal / "2026-11-09.md"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _payload(self, label: str, notes: str = ""):
+        return {
+            "is_intake": True,
+            "capture_type": "meal",
+            "meal_slot": "dinner",
+            "items": [{
+                "label": label,
+                "kind": "food",
+                "identity": "generic",
+                "quantity": 1,
+                "unit": "serving",
+                "serving_basis": "default_serving",
+                "calories_est": 400,
+            }],
+            "notes": notes,
+        }
+
+    def test_editing_callout_text_updates_same_note_and_rerun_is_noop(self):
+        original = "> [!voice] 20:26\n> I had beef stew for dinner\n"
+        edited = "> [!voice] 20:26\n> I had beef stew and bread for dinner\n"
+        with mock.patch.object(nl, "call_nutrition_model", side_effect=[
+            self._payload("beef stew"),
+            self._payload("beef stew and bread", notes="with bread"),
+        ]) as model, mock.patch.object(nl, "lookup_product", return_value={
+            "status": "miss", "query": "", "matched_name": "",
+            "serving_description": "", "source_urls": [], "per_serving": None,
+        }):
+            first = nl.run_nutrition_stage(
+                original, self.note, "2026-11-09", self.state,
+                journal_dir=self.journal, wellness_dir=self.wellness,
+            )
+            notes = list(self.wellness.glob("*.md"))
+            self.assertEqual(len(notes), 1)
+            original_path = notes[0]
+            original_name = original_path.name
+            second = nl.run_nutrition_stage(
+                edited, self.note, "2026-11-09", self.state,
+                journal_dir=self.journal, wellness_dir=self.wellness,
+            )
+            third = nl.run_nutrition_stage(
+                edited, self.note, "2026-11-09", self.state,
+                journal_dir=self.journal, wellness_dir=self.wellness,
+            )
+            other = Path(self.tmp.name) / "elsewhere" / "2026-11-09.md"
+            other.parent.mkdir()
+            fourth = nl.run_nutrition_stage(
+                edited, other, "2026-11-09", self.state,
+                journal_dir=self.journal, wellness_dir=self.wellness,
+            )
+        self.assertEqual(first["wellness_notes"], 1)
+        self.assertEqual(second["wellness_notes"], 1)
+        self.assertEqual(third["wellness_notes"], 0)
+        self.assertEqual(fourth["wellness_notes"], 0)
+        self.assertEqual(model.call_count, 2)
+        remaining = list(self.wellness.glob("*.md"))
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(remaining[0].name, original_name)
+        body = remaining[0].read_text(encoding="utf-8")
+        self.assertIn("beef stew and bread", body)
+        self.assertIn("with bread", body)
+        self.assertIn("status: active", body)
+        self.assertEqual(len(nl.load_ledger_rows(self.state)), 1)
+
+    def test_removed_callout_marks_note_superseded(self):
+        text = "> [!voice] 20:26\n> I had beef stew for dinner\n"
+        with mock.patch.object(nl, "call_nutrition_model", return_value=self._payload("beef stew")), \
+                mock.patch.object(nl, "lookup_product", return_value={
+                    "status": "miss", "query": "", "matched_name": "",
+                    "serving_description": "", "source_urls": [], "per_serving": None,
+                }):
+            nl.run_nutrition_stage(
+                text, self.note, "2026-11-09", self.state,
+                journal_dir=self.journal, wellness_dir=self.wellness,
+            )
+            path = next(self.wellness.glob("*.md"))
+            nl.run_nutrition_stage(
+                "", self.note, "2026-11-09", self.state,
+                journal_dir=self.journal, wellness_dir=self.wellness,
+            )
+        self.assertTrue(path.exists())
+        self.assertIn("status: superseded", path.read_text(encoding="utf-8"))
+
+    def test_legacy_processed_key_does_not_mint_another_file(self):
+        text = "> [!voice] 20:26\n> I had beef stew for dinner\n"
+        callouts = nl.extract_voice_callouts(text)
+        legacy = nl.legacy_span_key(self.note, callouts[0]["spoken_at"], callouts[0]["raw_text"])
+        nl.append_processed(self.state, {"idempotency_key": legacy})
+        self.wellness.mkdir()
+        kept = self.wellness / f"2026-11-09 meal dinner beef stew {legacy[:8]}.md"
+        other = self.wellness / "2026-11-09 meal dinner beef stew aaaaaaaa.md"
+        body = (
+            "---\n"
+            "type: meal\n"
+            'items: ["beef stew"]\n'
+            'time: "20:26"\n'
+            "source_date: 2026-11-09\n"
+            "meal_slot: dinner\n"
+            f"span_key: {legacy[:16]}\n"
+            "---\n\n"
+            "# Dinner: beef stew\n"
+        )
+        kept.write_text(body, encoding="utf-8")
+        other.write_text(body.replace(legacy[:16], "aaaaaaaaaaaaaaaa"), encoding="utf-8")
+        with mock.patch.object(nl, "call_nutrition_model") as model:
+            result = nl.run_nutrition_stage(
+                text, self.note, "2026-11-09", self.state,
+                journal_dir=self.journal, wellness_dir=self.wellness,
+            )
+        self.assertEqual(result["wellness_notes"], 0)
+        model.assert_not_called()
+        self.assertEqual(len(list(self.wellness.glob("*.md"))), 2)

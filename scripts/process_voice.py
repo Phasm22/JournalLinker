@@ -21,6 +21,7 @@ Env vars (from environment, optional XDG env file, or legacy repo `.env`):
 """
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -56,9 +57,34 @@ FAILED_SUFFIX = ".failed"
 
 # Failure kinds written into the .failed marker file.
 # Transient = worth retrying automatically (Ollama/network down, Mac was asleep).
-# Permanent = do not auto-retry (empty transcript, corrupt audio, bad file).
+# Permanent = do not auto-retry (corrupt audio, bad file).
+# An empty transcript is a skip, not a failure: items_skipped_empty, exit 0.
 FAIL_TRANSIENT = "transient"
 FAIL_PERMANENT = "permanent"
+SKIP_EMPTY = "empty"
+SKIP_DUPLICATE = "duplicate"
+
+
+class FileOutcome:
+    """One recording's disposition. Truthy only when the note was updated."""
+
+    def __init__(self, status: str):
+        self.status = status
+
+    def __bool__(self) -> bool:
+        return self.status == "ok"
+
+
+def _outcome_ok() -> FileOutcome:
+    return FileOutcome("ok")
+
+
+def _outcome_empty() -> FileOutcome:
+    return FileOutcome("empty")
+
+
+def _outcome_error() -> FileOutcome:
+    return FileOutcome("error")
 
 # Structural-completeness probe (see probe_decodable). We decode with the same
 # backend transcription uses. A decoded stream materially shorter than the
@@ -505,11 +531,84 @@ def is_failed(audio_path: Path) -> bool:
     return audio_path.with_suffix(audio_path.suffix + FAILED_SUFFIX).exists()
 
 
-def mark_processed(audio_path: Path) -> None:
+def audio_content_hash(audio_path: Path) -> str:
+    """SHA-256 of the recording bytes. Used to skip a renamed duplicate."""
+    digest = hashlib.sha256()
+    with audio_path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def processed_marker_hash(audio_path: Path) -> str:
+    marker = audio_path.with_suffix(audio_path.suffix + PROCESSED_SUFFIX)
+    if not marker.is_file():
+        return ""
+    try:
+        lines = marker.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    for line in lines:
+        if line.startswith("sha256:"):
+            return line.split(":", 1)[1].strip().lower()
+    return ""
+
+
+def mark_processed(
+    audio_path: Path,
+    *,
+    content_hash: str = "",
+    duplicate_of: str = "",
+    skip: str = "",
+) -> None:
     failed = audio_path.with_suffix(audio_path.suffix + FAILED_SUFFIX)
     if failed.exists():
         failed.unlink()
-    audio_path.with_suffix(audio_path.suffix + PROCESSED_SUFFIX).touch()
+    if not content_hash:
+        try:
+            content_hash = audio_content_hash(audio_path)
+        except OSError:
+            content_hash = ""
+    lines: list[str] = []
+    if content_hash:
+        lines.append(f"sha256: {content_hash}")
+    if duplicate_of:
+        lines.append(f"duplicate_of: {duplicate_of}")
+    if skip:
+        lines.append(f"skip: {skip}")
+    marker = audio_path.with_suffix(audio_path.suffix + PROCESSED_SUFFIX)
+    marker.write_text(("\n".join(lines) + "\n") if lines else "", encoding="utf-8")
+
+
+def _audio_candidates(drop_dir: Path) -> list[Path]:
+    return sorted(
+        path
+        for ext in ("*.m4a", "*.wav", "*.mp4", "*.aac")
+        for path in drop_dir.glob(ext)
+        if path.is_file()
+    )
+
+
+def find_processed_duplicate(audio_path: Path) -> Path | None:
+    """Another file in the same folder with identical bytes already processed."""
+    try:
+        digest = audio_content_hash(audio_path)
+    except OSError:
+        return None
+    for other in _audio_candidates(audio_path.parent):
+        if other.resolve() == audio_path.resolve():
+            continue
+        if not is_processed(other):
+            continue
+        other_hash = processed_marker_hash(other)
+        if not other_hash:
+            try:
+                other_hash = audio_content_hash(other)
+            except OSError:
+                continue
+        if other_hash == digest:
+            return other
+    return None
 
 
 def _max_transient_attempts() -> int:
@@ -593,8 +692,9 @@ def mark_failed(audio_path: Path, reason: str = "", kind: str = FAIL_PERMANENT) 
     """Write a structured .failed marker, with bounded transient retries.
 
     kind is FAIL_TRANSIENT or FAIL_PERMANENT. Permanent failures (a content
-    verdict — corrupt/truncated audio, empty transcript) are written straight
-    through: not retried, not counted. Transient failures are eligible for the
+    verdict — corrupt/truncated audio) are written straight
+    through: not retried, not counted. Empty transcripts are skips, not
+    failures. Transient failures are eligible for the
     timed retry loop, but the attempt count is tracked in the marker; once it
     reaches the cap the failure escalates to permanent and fires a one-time
     notification, so a reason that never resolves leaves the queue instead of
@@ -786,8 +886,8 @@ def process_file(
     night_cutoff: int,
     dry_run: bool,
     verbose: bool,
-) -> bool:
-    """Process one .m4a file. Returns True on success."""
+) -> FileOutcome:
+    """Process one audio file. ok, empty (skip), or error."""
     print(f"[voice] processing {audio_path.name}", file=sys.stderr)
 
     date_str, time_str = resolve_target_date(audio_path, night_cutoff)
@@ -803,7 +903,7 @@ def process_file(
               f"({fail_kind})", file=sys.stderr)
         if not dry_run:
             mark_failed(audio_path, fail_reason, kind=fail_kind)
-        return False
+        return _outcome_error()
 
     if verbose and whisper_prompt:
         print(f"[voice] whisper prompt ({len(whisper_prompt)} chars): {whisper_prompt[:120]}…", file=sys.stderr)
@@ -822,7 +922,7 @@ def process_file(
         if not dry_run:
             # Treat as transient — model load or I/O error may resolve on retry.
             mark_failed(audio_path, f"transcription error: {exc}", kind=FAIL_TRANSIENT)
-        return False
+        return _outcome_error()
 
     print(
         f"[voice] transcribed {duration:.1f}s audio [{language}]: {len(transcript.split())} words",
@@ -834,9 +934,10 @@ def process_file(
     if not transcript.strip():
         print(f"[voice] empty transcript, skipping {audio_path.name}", file=sys.stderr)
         if not dry_run:
-            # Permanent — re-transcribing the same audio won't produce words.
-            mark_failed(audio_path, "empty transcript", kind=FAIL_PERMANENT)
-        return False
+            # Same bytes will not grow words later. Record a skip, not a failure,
+            # so a batch of empty recordings still exits 0.
+            mark_processed(audio_path, skip=SKIP_EMPTY)
+        return _outcome_empty()
 
     append_voice_block(journal_dir, date_str, time_str, transcript, dry_run=dry_run)
 
@@ -846,7 +947,7 @@ def process_file(
         if not dry_run:
             # Transient — Ollama may have been unavailable (Mac asleep, model not loaded).
             mark_failed(audio_path, f"Scribe exit code {scribe_exit}", kind=FAIL_TRANSIENT)
-        return False
+        return _outcome_error()
 
     if not dry_run:
         # Checks read the note Scribe just wrote. A failure here still leaves
@@ -865,7 +966,7 @@ def process_file(
         mark_processed(audio_path)
         print(f"[voice] marked processed: {audio_path.name}", file=sys.stderr)
 
-    return True
+    return _outcome_ok()
 
 
 # ---------------------------------------------------------------------------
@@ -971,7 +1072,29 @@ def main() -> int:
             return 0
         if args.force and is_processed(audio_path):
             print(f"[voice] --force: re-processing {audio_path.name}", file=sys.stderr)
-        success = process_file(
+        duplicate = None if args.force else find_processed_duplicate(audio_path)
+        if duplicate is not None:
+            print(
+                f"[voice] skip duplicate {audio_path.name} matches {duplicate.name}",
+                file=sys.stderr,
+            )
+            if not args.dry_run:
+                mark_processed(
+                    audio_path,
+                    duplicate_of=duplicate.name,
+                    skip=SKIP_DUPLICATE,
+                )
+            _write_voice_payload(
+                items_processed=0,
+                items_failed=0,
+                items_skipped_placeholder=0,
+                items_skipped_already=0,
+                items_skipped_empty=0,
+                items_skipped_duplicate=1,
+                items_pending_at_start=1,
+            )
+            return 0
+        outcome = process_file(
             audio_path,
             journal_dir=journal_dir,
             model=model,
@@ -983,13 +1106,15 @@ def main() -> int:
             verbose=args.verbose,
         )
         _write_voice_payload(
-            items_processed=1 if success else 0,
-            items_failed=0 if success else 1,
+            items_processed=1 if outcome.status == "ok" else 0,
+            items_failed=1 if outcome.status == "error" else 0,
             items_skipped_placeholder=0,
             items_skipped_already=0,
+            items_skipped_empty=1 if outcome.status == "empty" else 0,
+            items_skipped_duplicate=0,
             items_pending_at_start=1,
         )
-        return 0 if success else 1
+        return 0 if outcome.status != "error" else 1
 
     # Scan-dir mode
     drop_dir = Path(args.drop_dir).expanduser()
@@ -1051,14 +1176,51 @@ def main() -> int:
             items_failed=0,
             items_skipped_placeholder=items_skipped_placeholder,
             items_skipped_already=items_skipped_already,
+            items_skipped_empty=0,
+            items_skipped_duplicate=0,
             items_pending_at_start=0,
         )
         return 0
 
+    known_hashes: dict[str, Path] = {}
+    for processed_path in candidates:
+        if not is_processed(processed_path):
+            continue
+        digest = processed_marker_hash(processed_path)
+        if not digest:
+            try:
+                digest = audio_content_hash(processed_path)
+            except OSError:
+                continue
+            if not args.dry_run:
+                mark_processed(processed_path, content_hash=digest)
+        known_hashes.setdefault(digest, processed_path)
+
     errors = 0
     processed = 0
+    items_skipped_empty = 0
+    items_skipped_duplicate = 0
     for audio_path in pending:
-        ok = process_file(
+        try:
+            digest = audio_content_hash(audio_path)
+        except OSError:
+            digest = ""
+        prior = known_hashes.get(digest) if digest else None
+        if prior is not None and prior.resolve() != audio_path.resolve():
+            print(
+                f"[voice] skip duplicate {audio_path.name} matches {prior.name}",
+                file=sys.stderr,
+            )
+            if not args.dry_run:
+                mark_processed(
+                    audio_path,
+                    content_hash=digest,
+                    duplicate_of=prior.name,
+                    skip=SKIP_DUPLICATE,
+                )
+            items_skipped_duplicate += 1
+            continue
+        outcome = process_file(
             audio_path,
             journal_dir=journal_dir,
             model=model,
@@ -1069,16 +1231,22 @@ def main() -> int:
             dry_run=args.dry_run,
             verbose=args.verbose,
         )
-        if ok:
+        if outcome.status == "ok":
             processed += 1
+        elif outcome.status == "empty":
+            items_skipped_empty += 1
         else:
             errors += 1
+        if digest and outcome.status in {"ok", "empty"}:
+            known_hashes.setdefault(digest, audio_path)
 
     _write_voice_payload(
         items_processed=processed,
         items_failed=errors,
         items_skipped_placeholder=items_skipped_placeholder,
         items_skipped_already=items_skipped_already,
+        items_skipped_empty=items_skipped_empty,
+        items_skipped_duplicate=items_skipped_duplicate,
         items_pending_at_start=items_pending_at_start,
     )
     return 0 if errors == 0 else 1
