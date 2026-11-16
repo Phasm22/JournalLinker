@@ -8,6 +8,7 @@ the prompt, independent of scribe_learning.json success counts.
 import importlib.util
 import json
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -532,3 +533,81 @@ class TestAppendVoiceBlock(unittest.TestCase):
             text = (journal / "2026-09-30.md").read_text(encoding="utf-8")
             self.assertEqual(text.count("> [!voice] 09:26"), 1)
             self.assertEqual(text.count("I drank water"), 1)
+
+
+class TestVoiceDuplicateAndEmpty(unittest.TestCase):
+    def _scan(self, drop: Path, journal: Path, transcript: str):
+        payload = journal.parent / "payload.json"
+        argv = [
+            "process_voice.py",
+            "--journal-dir", str(journal),
+            "--drop-dir", str(drop),
+        ]
+        calls: list[str] = []
+
+        def transcribe(audio_path, model, prompt):
+            calls.append(audio_path.name)
+            return pv.TranscriptResult(transcript, 1.0, "en", ())
+
+        with mock.patch.dict(os.environ, {
+            "JOURNAL_LINKER_ENV_BOOTSTRAPPED": "1",
+            "JOURNAL_LINKER_JOB_PAYLOAD_FILE": str(payload),
+        }), mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(pv, "load_whisper_model", return_value=object()), \
+                mock.patch.object(pv, "extract_whisper_prompt", return_value=""), \
+                mock.patch.object(pv, "probe_decodable", return_value=(True, "", "")), \
+                mock.patch.object(pv, "is_fully_synced", return_value=True), \
+                mock.patch.object(pv, "transcribe_audio", side_effect=transcribe), \
+                mock.patch.object(pv, "append_voice_block") as append, \
+                mock.patch.object(pv, "run_scribe", return_value=0), \
+                mock.patch("transcript_review.review_saved_note"):
+            rc = pv.main()
+        data = json.loads(payload.read_text(encoding="utf-8"))
+        return rc, calls, append, data
+
+    def test_plus_one_hour_duplicate_audio_is_skipped(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            journal = root / "journal"
+            journal.mkdir()
+            drop = root / "drop"
+            drop.mkdir()
+            payload = b"identical-audio-bytes"
+            original = drop / "2026-11-09_20-26-03.m4a"
+            shifted = drop / "2026-11-09_21-26-03.m4a"
+            original.write_bytes(payload)
+            shifted.write_bytes(payload)
+            rc, calls, append, data = self._scan(drop, journal, "beef stew tonight")
+            self.assertEqual(rc, 0)
+            self.assertEqual(calls, ["2026-11-09_20-26-03.m4a"])
+            self.assertEqual(append.call_count, 1)
+            self.assertEqual(data["items_processed"], 1)
+            self.assertEqual(data["items_failed"], 0)
+            self.assertEqual(data["items_skipped_duplicate"], 1)
+            self.assertTrue(pv.is_processed(shifted))
+            self.assertFalse(pv.is_failed(shifted))
+            marker = shifted.with_suffix(shifted.suffix + pv.PROCESSED_SUFFIX).read_text(encoding="utf-8")
+            self.assertIn("sha256:", marker)
+            self.assertIn("duplicate_of: 2026-11-09_20-26-03.m4a", marker)
+            self.assertIn("skip: duplicate", marker)
+
+    def test_empty_transcript_exits_zero(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            journal = root / "journal"
+            journal.mkdir()
+            drop = root / "drop"
+            drop.mkdir()
+            audio = drop / "2026-11-12_14-29-14.m4a"
+            audio.write_bytes(b"silence")
+            rc, calls, append, data = self._scan(drop, journal, "   ")
+            self.assertEqual(rc, 0)
+            self.assertEqual(calls, ["2026-11-12_14-29-14.m4a"])
+            append.assert_not_called()
+            self.assertEqual(data["items_processed"], 0)
+            self.assertEqual(data["items_failed"], 0)
+            self.assertEqual(data["items_skipped_empty"], 1)
+            self.assertFalse(pv.is_failed(audio))
+            self.assertTrue(pv.is_processed(audio))
+            marker = audio.with_suffix(audio.suffix + pv.PROCESSED_SUFFIX).read_text(encoding="utf-8")
+            self.assertIn("skip: empty", marker)

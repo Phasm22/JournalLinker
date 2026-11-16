@@ -400,7 +400,7 @@ Human-readable header/footer (`start`, `end`, `duration_sec`, `exit_code` text l
 | Service | Extra JSON fields |
 |---------|-------------------|
 | `scribe` | `active_file`, `write_back`, `links_added`, `ollama_sec` |
-| `voice`, `voice-retry` | `items_processed`, `items_failed`, `items_skipped_placeholder`, `items_skipped_already`, `items_pending_at_start` |
+| `voice`, `voice-retry` | `items_processed`, `items_failed`, `items_skipped_placeholder`, `items_skipped_already`, `items_skipped_empty`, `items_skipped_duplicate`, `items_pending_at_start` |
 | `intent-watcher`, `intent-retry` | `intents_gated`, `intents_delivered`, `intents_suppressed`, `intents_failed`, `retry_queue_in`, `retry_queue_out`, `worst_exit_code` |
 | `feedback-sender` (one-shot) | `updates_received`, `feedback_queue_pending`, `poll_offset` |
 
