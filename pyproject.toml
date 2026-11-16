@@ -1,0 +1,21 @@
+[project]
+name = "journal-linker"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "mcp==2.3.0",
+    "openai==3.48.0",
+    "ollama==0.6.3",
+    "faster-whisper==1.2.1",
+    "pyyaml==6.0.3",
+]
+
+[dependency-groups]
+dev = [
+    "pytest==9.2.0",
+    "ollama==0.6.3",
+    "pyyaml==6.0.3",
+]
+
+[tool.uv]
+package = false

@@ -44,7 +44,7 @@ try:
 except ImportError as exc:  # pragma: no cover
     raise SystemExit(
         "PyYAML is required for food_vlog_harness. "
-        "Install with: uv pip install pyyaml  (or pip install -r requirements-dev.txt)"
+        "Install with: uv pip install pyyaml  (or uv sync --locked --only-group dev --no-install-project)"
     ) from exc
 
 

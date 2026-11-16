@@ -4,6 +4,8 @@ All external services (Ollama, Anthropic API, Pushover) are mocked.
 Tests use tempfile.TemporaryDirectory for isolation.
 """
 
+import asyncio
+import contextlib
 import importlib.util
 import json
 import os
@@ -1258,6 +1260,22 @@ class TestEnrichEnvelope(unittest.TestCase):
         # Pipeline should continue; error is recorded but envelope returned
         self.assertIsInstance(result, dict)
         self.assertIn("_enrichment_error", result)
+        self.assertEqual(result["_enrichment_error_reason"], "unreachable")
+
+    def test_enrich_failure_logs_one_line_with_reason_code(self):
+        """The failure log line must stay greppable ("[enrich] best-effort
+        enrichment failed") and carry a reason= code for monitoring to key on."""
+        import io
+
+        envelope = self._base_envelope()
+        buf = io.StringIO()
+        with mock.patch.object(pi, "query_llmlibrarian_mcp", return_value={"error": "healthz failed", "chunks": []}), \
+             contextlib.redirect_stderr(buf):
+            pi.enrich_envelope(envelope)
+        lines = [line for line in buf.getvalue().splitlines() if "best-effort enrichment failed" in line]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("[enrich] best-effort enrichment failed", lines[0])
+        self.assertIn("reason=unreachable", lines[0])
 
     def test_enrich_noop_when_intent_empty(self):
         envelope = self._base_envelope()
@@ -1298,6 +1316,46 @@ class TestEnrichEnvelope(unittest.TestCase):
     def test_unknown_configured_silo_fails_closed(self):
         with self.assertRaises(ValueError):
             pi._resolve_llmlibrarian_silo({"silos": []}, "missing")
+
+    def test_open_llmlibrarian_transport_imports_and_constructs(self):
+        """Regression for the mcp 2.3.0 break (2026-11-09): mcp.client.streamable_http
+        dropped `streamablehttp_client`. The transport must import and attempt a
+        connection against whatever mcp version is installed, not fail on import
+        or on an unexpected kwarg before it ever reaches the network."""
+        from mcp import ClientSession  # type: ignore
+
+        async def _try_connect():
+            async with pi._open_llmlibrarian_transport("http://127.0.0.1:1/mcp", None, 0.5) as (
+                read_stream, write_stream,
+            ):
+                async with ClientSession(read_stream, write_stream) as session:
+                    await session.initialize()
+
+        with self.assertRaises(Exception) as ctx:
+            asyncio.run(_try_connect())
+        self.assertNotIsInstance(ctx.exception, (ImportError, AttributeError, TypeError))
+
+    def test_query_llmlibrarian_mcp_surfaces_connection_error_not_import_error(self):
+        """End-to-end through the public entry point: a dead MCP endpoint should
+        fail with a connection-shaped error, never an import/attribute error."""
+        with mock.patch.object(pi, "_llmlibrarian_health_check", return_value=(True, "ok")), \
+             mock.patch.object(pi, "_llmlibrarian_mcp_endpoint", return_value="http://127.0.0.1:1/mcp"):
+            result = pi.query_llmlibrarian_mcp("anything")
+        self.assertEqual(result["chunks"], [])
+        error = result.get("error", "")
+        self.assertNotIn("ImportError", error)
+        self.assertNotIn("ModuleNotFoundError", error)
+        self.assertNotIn("AttributeError", error)
+
+    def test_classify_enrichment_error_reason_codes(self):
+        self.assertEqual(pi._classify_enrichment_error("healthz failed: connection refused"), "unreachable")
+        self.assertEqual(pi._classify_enrichment_error("MCP query timed out after 2s"), "timeout")
+        self.assertEqual(
+            pi._classify_enrichment_error("ImportError: cannot import name 'streamablehttp_client'"),
+            "client_import_error",
+        )
+        self.assertEqual(pi._classify_enrichment_error("list_silos failed: boom"), "silo_not_found")
+        self.assertEqual(pi._classify_enrichment_error("ConnectionResetError: boom"), "mcp_error")
 
 
 class TestSuppressionMatching(unittest.TestCase):

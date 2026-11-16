@@ -18,7 +18,7 @@ Use `just` from the repo root:
 - `just test` - run the test suite with mocked Ollama calls
 - `just doctor` - verify local paths, venv, and config
 
-Direct test execution also works with `python3 -m pytest tests/`. If `just test` fails (e.g. no `ScribeVenv` on Linux), use a local venv: `uv venv .venv && uv pip install -r requirements-dev.txt && .venv/bin/python -m pytest tests/`.
+Direct test execution also works with `python3 -m pytest tests/`. If `just test` fails (e.g. no `ScribeVenv` on Linux), use a local venv built from the pinned lockfile (see TECHNICAL.md "Reproducible environments"): `UV_PROJECT_ENVIRONMENT=.venv uv sync --locked --only-group dev --no-install-project && .venv/bin/python -m pytest tests/`.
 
 ## Coding Style & Naming Conventions
 

@@ -76,13 +76,18 @@ voice-scan:
 voice-ingest:
     "{{py}}" "{{root}}/scripts/voice_ingest_server.py"
 
-# Install faster-whisper into the project venv
-voice-install:
-    "{{py}}" -m pip install faster-whisper
+# Sync ScribeVenv to the pinned lockfile (mcp, openai, ollama, faster-whisper,
+# pyyaml — see TECHNICAL.md "Reproducible environments"). Replaces ad hoc
+# `pip install <pkg>`, which silently took mcp 1.x -> 2.3.0 on 2026-11-09 and
+# broke enrichment.
+scribevenv-sync:
+    UV_PROJECT_ENVIRONMENT="{{root}}/ScribeVenv" uv sync --locked
 
-# Install the MCP client used for llmLibrarian intent enrichment
-intent-mcp-install:
-    "{{py}}" -m pip install mcp
+# Install faster-whisper into the project venv (pinned; see scribevenv-sync)
+voice-install: scribevenv-sync
+
+# Install the MCP client used for llmLibrarian intent enrichment (pinned; see scribevenv-sync)
+intent-mcp-install: scribevenv-sync
 
 # Smoke test: initialize → tools/list → tools/call against the live MCP server
 intent-mcp-smoke *ARGS:
