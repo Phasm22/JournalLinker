@@ -21,6 +21,7 @@ Env vars (from environment, optional XDG env file, or legacy repo `.env`):
 """
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -56,9 +57,62 @@ FAILED_SUFFIX = ".failed"
 
 # Failure kinds written into the .failed marker file.
 # Transient = worth retrying automatically (Ollama/network down, Mac was asleep).
-# Permanent = do not auto-retry (empty transcript, corrupt audio, bad file).
+# Permanent = do not auto-retry (corrupt audio, bad file).
+# An empty transcript is a skip, not a failure: items_skipped_empty, exit 0.
 FAIL_TRANSIENT = "transient"
 FAIL_PERMANENT = "permanent"
+SKIP_EMPTY = "empty"
+SKIP_DUPLICATE = "duplicate"
+
+
+class FileOutcome:
+    """One recording's disposition. Truthy only when the note was updated."""
+
+    def __init__(self, status: str):
+        self.status = status
+
+    def __bool__(self) -> bool:
+        return self.status == "ok"
+
+
+def _outcome_ok() -> FileOutcome:
+    return FileOutcome("ok")
+
+
+def _outcome_empty() -> FileOutcome:
+    return FileOutcome("empty")
+
+
+def _outcome_error() -> FileOutcome:
+    return FileOutcome("error")
+
+# Structural-completeness probe (see probe_decodable). We decode with the same
+# backend transcription uses. A decoded stream materially shorter than the
+# container's declared duration means a truncated tail (the faststart case: the
+# front-loaded moov advertises the full length but the mdat is short and decode
+# stops early without erroring). Allow a small slack for codec priming / rounding.
+PROBE_SAMPLE_RATE = 16000
+DECODE_DURATION_TOLERANCE = 0.97       # decoded must reach >=97% of declared …
+DECODE_DURATION_ABS_SLACK = 0.5        # … or be within 0.5s, whichever is looser
+PROBE_TIMEOUT_SEC = 120                # a decode that hangs longer is treated as transient
+
+# The decode probe runs in a child process (`--_probe-decode`): a malformed
+# container can make libav *segfault*, and an uncatchable SIGSEGV in-process
+# would take down the whole batch (and, with no marker written, crash it again
+# every run). Isolating the decode lets the parent survive and disposition the
+# child by its exit code — a signal death (negative returncode) is caught, not
+# fatal. Worker exit codes:
+PROBE_EXIT_OK = 0            # decoded; stdout carries [decoded_sec, declared_sec]
+PROBE_EXIT_CONTENT = 3      # caught content defect (corrupt/EOF/no audio stream)
+PROBE_EXIT_ENV = 4         # caught environmental error (I/O, missing codec, …)
+PROBE_WORKER_FLAG = "--_probe-decode"
+
+# A transient failure retries on the voice-retry timer. Genuinely time-based
+# reasons (Ollama down, machine asleep) resolve within a few cycles; a reason
+# that never resolves would otherwise retry forever. Cap the attempts, then
+# escalate to permanent and notify once, so a stuck file leaves the queue
+# instead of silently looping. Override via SCRIBE_VOICE_MAX_TRANSIENT_ATTEMPTS.
+DEFAULT_MAX_TRANSIENT_ATTEMPTS = 10
 VOICEDROP_DEFAULT = (
     Path.home() / "Library" / "Mobile Documents" / "com~apple~CloudDocs" / "VoiceDrop"
 )
@@ -239,22 +293,26 @@ def extract_whisper_prompt(
 # Date resolution from filename
 # ---------------------------------------------------------------------------
 
-FILENAME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})-(\d{2})(\d{2})$")
+# YYYY-MM-DD-HHmm (Dropbox-era Shortcut) or YYYY-MM-DD_HH-MM-SS (Tailscale upload Shortcut).
+FILENAME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})(?:-(\d{2})(\d{2})|_(\d{2})-(\d{2})-\d{2})$")
 
 
 def resolve_target_date(audio_path: Path, night_cutoff_hour: int = DEFAULT_NIGHT_CUTOFF) -> tuple[str, str]:
     """Return (date_str YYYY-MM-DD, time_str HH:MM) for the recording.
 
-    Filename convention: YYYY-MM-DD-HHmm.m4a  (produced by the iOS Shortcut).
+    Filename convention: YYYY-MM-DD-HHmm.m4a or YYYY-MM-DD_HH-MM-SS.m4a
+    (produced by the iOS Shortcut).
     If the recording hour is before night_cutoff_hour, it is attributed to the
     previous calendar day (e.g. a 01:30 AM recording belongs to "yesterday").
-    Falls back to mtime if the filename doesn't match the convention.
+    Falls back to mtime if the filename doesn't match the convention — which
+    for uploaded files is the *upload* time, so the ingest endpoint rejects
+    names that don't match.
     """
     m = FILENAME_RE.fullmatch(audio_path.stem)
     if m:
         date_str = m.group(1)
-        hour = int(m.group(2))
-        minute = int(m.group(3))
+        hour = int(m.group(2) or m.group(4))
+        minute = int(m.group(3) or m.group(5))
         time_str = f"{hour:02d}:{minute:02d}"
         if hour < night_cutoff_hour:
             dt = datetime.strptime(date_str, "%Y-%m-%d") - timedelta(days=1)
@@ -273,6 +331,46 @@ def resolve_target_date(audio_path: Path, night_cutoff_hour: int = DEFAULT_NIGHT
 # Transcription
 # ---------------------------------------------------------------------------
 
+def av_open_dropping_removed_kwargs(original):
+    """Wrap av.open so PyAV 19+ ignores kwargs that release removed.
+
+    faster-whisper 1.2.1 still calls av.open(..., metadata_errors="ignore").
+    PyAV 19 dropped metadata_errors and metadata_encoding; passing them raises
+    TypeError before any audio is decoded. Popping them is a no-op on a call
+    that does not pass them.
+    """
+    def _open(*args, **kwargs):
+        kwargs.pop("metadata_errors", None)
+        kwargs.pop("metadata_encoding", None)
+        return original(*args, **kwargs)
+
+    _open._jl_pyav19_compat = True  # type: ignore[attr-defined]
+    return _open
+
+
+def install_pyav19_open_compat() -> None:
+    """Patch the imported av.open when this environment is PyAV 19 or newer.
+
+    Idempotent. No-op when av or faster-whisper is missing, or when av is
+    still old enough to accept metadata_errors.
+    """
+    try:
+        import av
+        import faster_whisper.audio as fw_audio
+    except ImportError:
+        return
+    current = fw_audio.av.open
+    if getattr(current, "_jl_pyav19_compat", False):
+        return
+    try:
+        major = int(str(getattr(av, "__version__", "0")).split(".", 1)[0])
+    except (TypeError, ValueError):
+        return
+    if major < 19:
+        return
+    fw_audio.av.open = av_open_dropping_removed_kwargs(current)
+
+
 def load_whisper_model(model_name: str):
     """Load a faster-whisper WhisperModel. Exits with a helpful message if not installed."""
     try:
@@ -286,27 +384,65 @@ def load_whisper_model(model_name: str):
         )
         sys.exit(1)
 
+    install_pyav19_open_compat()
     print(f"[voice] loading Whisper model '{model_name}' (downloads on first use) …", file=sys.stderr)
     return WhisperModel(model_name, device="cpu", compute_type="int8")
 
 
-def transcribe_audio(audio_path: Path, model, initial_prompt: str) -> tuple[str, float, str]:
-    """Return (transcript_text, duration_sec, detected_language).
+class TranscriptResult(tuple):
+    """Text plus the decoder scores the transcript checks read.
+
+    A tuple so older callers can still unpack text, duration, language.
+    """
+
+    def __new__(cls, text: str, duration: float, language: str, segments: tuple = ()):
+        return super().__new__(cls, (text, duration, language))
+
+    def __init__(self, text: str, duration: float, language: str, segments: tuple = ()):
+        self.text = text
+        self.duration = duration
+        self.language = language
+        self.segments = segments
+
+
+def _segment_scores(segments) -> tuple:
+    scored = []
+    for segment in segments:
+        words = []
+        for word in getattr(segment, "words", None) or []:
+            token = str(getattr(word, "word", "")).strip()
+            if token:
+                words.append((token, float(getattr(word, "probability", 0) or 0)))
+        scored.append({
+            "text": str(getattr(segment, "text", "") or ""),
+            "avg_logprob": float(getattr(segment, "avg_logprob", 0) or 0),
+            "compression_ratio": float(getattr(segment, "compression_ratio", 0) or 0),
+            "words": words,
+        })
+    return tuple(scored)
+
+
+def transcribe_audio(audio_path: Path, model, initial_prompt: str) -> TranscriptResult:
+    """Return text, duration, language, and per-word decoder scores.
 
     Passes initial_prompt to Whisper so the decoder prefers vocabulary from
-    the learning store. Segments are joined into a single continuous transcript.
+    the learning store. Word probabilities are kept for the transcript checks.
+    Segments are joined into a single continuous transcript.
     """
+    install_pyav19_open_compat()
     segments, info = model.transcribe(
         str(audio_path),
         initial_prompt=initial_prompt or None,
         language="en",
         beam_size=5,
+        word_timestamps=True,
     )
-    parts = [seg.text.strip() for seg in segments]
-    transcript = " ".join(p for p in parts if p)
+    segment_list = list(segments)
+    parts = [seg.text.strip() for seg in segment_list]
+    transcript = " ".join(part for part in parts if part)
     duration = getattr(info, "duration", 0.0)
     language = getattr(info, "language", "en")
-    return transcript, duration, language
+    return TranscriptResult(transcript, duration, language, _segment_scores(segment_list))
 
 
 # ---------------------------------------------------------------------------
@@ -339,11 +475,17 @@ def append_voice_block(
 
     if note_path.exists():
         existing = note_path.read_text(encoding="utf-8")
-        # Guard against duplicate: skip if this exact timestamp callout already exists.
-        # Handles the case where a prior run appended the block but Scribe then failed.
-        marker = f"> [!voice] {time_str}"
-        if marker in existing:
-            print(f"[voice] voice block for {time_str} already in {note_path.name}, skipping append", file=sys.stderr)
+        # Guard against duplicate retries: skip only when this exact callout
+        # (same timestamp AND same transcript body) is already present.
+        # Distinct utterances that share an HH:MM minute must both append —
+        # Tailscale uploads often land multiple clips in the same minute.
+        callout_body = callout.strip()
+        if callout_body and callout_body in existing:
+            print(
+                f"[voice] identical voice block for {time_str} already in "
+                f"{note_path.name}, skipping append",
+                file=sys.stderr,
+            )
             return note_path
         note_path.write_text(existing.rstrip("\n") + callout, encoding="utf-8")
     else:
@@ -389,21 +531,189 @@ def is_failed(audio_path: Path) -> bool:
     return audio_path.with_suffix(audio_path.suffix + FAILED_SUFFIX).exists()
 
 
-def mark_processed(audio_path: Path) -> None:
+def audio_content_hash(audio_path: Path) -> str:
+    """SHA-256 of the recording bytes. Used to skip a renamed duplicate."""
+    digest = hashlib.sha256()
+    with audio_path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def processed_marker_hash(audio_path: Path) -> str:
+    marker = audio_path.with_suffix(audio_path.suffix + PROCESSED_SUFFIX)
+    if not marker.is_file():
+        return ""
+    try:
+        lines = marker.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    for line in lines:
+        if line.startswith("sha256:"):
+            return line.split(":", 1)[1].strip().lower()
+    return ""
+
+
+def mark_processed(
+    audio_path: Path,
+    *,
+    content_hash: str = "",
+    duplicate_of: str = "",
+    skip: str = "",
+) -> None:
     failed = audio_path.with_suffix(audio_path.suffix + FAILED_SUFFIX)
     if failed.exists():
         failed.unlink()
-    audio_path.with_suffix(audio_path.suffix + PROCESSED_SUFFIX).touch()
+    if not content_hash:
+        try:
+            content_hash = audio_content_hash(audio_path)
+        except OSError:
+            content_hash = ""
+    lines: list[str] = []
+    if content_hash:
+        lines.append(f"sha256: {content_hash}")
+    if duplicate_of:
+        lines.append(f"duplicate_of: {duplicate_of}")
+    if skip:
+        lines.append(f"skip: {skip}")
+    marker = audio_path.with_suffix(audio_path.suffix + PROCESSED_SUFFIX)
+    marker.write_text(("\n".join(lines) + "\n") if lines else "", encoding="utf-8")
+
+
+def _audio_candidates(drop_dir: Path) -> list[Path]:
+    return sorted(
+        path
+        for ext in ("*.m4a", "*.wav", "*.mp4", "*.aac")
+        for path in drop_dir.glob(ext)
+        if path.is_file()
+    )
+
+
+def find_processed_duplicate(audio_path: Path) -> Path | None:
+    """Another file in the same folder with identical bytes already processed."""
+    try:
+        digest = audio_content_hash(audio_path)
+    except OSError:
+        return None
+    for other in _audio_candidates(audio_path.parent):
+        if other.resolve() == audio_path.resolve():
+            continue
+        if not is_processed(other):
+            continue
+        other_hash = processed_marker_hash(other)
+        if not other_hash:
+            try:
+                other_hash = audio_content_hash(other)
+            except OSError:
+                continue
+        if other_hash == digest:
+            return other
+    return None
+
+
+def _max_transient_attempts() -> int:
+    """Attempt cap before a transient failure escalates to permanent."""
+    raw = os.getenv("SCRIBE_VOICE_MAX_TRANSIENT_ATTEMPTS", "").strip()
+    if not raw:
+        return DEFAULT_MAX_TRANSIENT_ATTEMPTS
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return DEFAULT_MAX_TRANSIENT_ATTEMPTS
+
+
+def _read_marker_attempts(audio_path: Path) -> int:
+    """Prior transient-attempt count from an existing .failed marker (0 if none
+    or legacy/unparsable)."""
+    marker = audio_path.with_suffix(audio_path.suffix + FAILED_SUFFIX)
+    if not marker.exists():
+        return 0
+    try:
+        for line in marker.read_text(encoding="utf-8").splitlines():
+            if line.strip().startswith("attempts:"):
+                return int(line.split(":", 1)[1].strip())
+    except Exception:
+        return 0
+    return 0
+
+
+def recording_when(audio_path: Path) -> str:
+    """Clock time from a dated recording name, for a notification first line.
+
+    Uses the time in the filename (what was recorded), not the journal day
+    after the night cutoff. Unrecognized names stay as the filename.
+    """
+    match = FILENAME_RE.fullmatch(audio_path.stem)
+    if not match:
+        return audio_path.name
+    recorded = datetime.strptime(match.group(1), "%Y-%m-%d")
+    hour = int(match.group(2) or match.group(4))
+    minute = int(match.group(3) or match.group(5))
+    hour12 = hour % 12 or 12
+    ampm = "AM" if hour < 12 else "PM"
+    return f"{recorded.strftime('%b')} {recorded.day}, {hour12}:{minute:02d} {ampm}"
+
+
+def gave_up_notice(audio_path: Path, attempts: int, reason: str) -> tuple[str, str]:
+    """Title and body for the one-time 'stopped retrying' Pushover."""
+    detail = (reason or "unknown error").strip()
+    body = f"{recording_when(audio_path)}\nGave up after {attempts} tries.\n\n{detail}"
+    return "Voice memo stuck", body
+
+
+def _notify(title: str, body: str) -> None:
+    """Best-effort desktop/push notification via the pnotify CLI (TJ's Pushover
+    wrapper). Mirrors process_intents' pnotify tier without importing that
+    heavy module. Never raises into the pipeline; logs and moves on."""
+    import shutil
+
+    pnotify = shutil.which("pnotify")
+    if not pnotify:
+        candidate = Path.home() / "bin" / "pnotify"
+        pnotify = str(candidate) if os.access(candidate, os.X_OK) else ""
+    if not pnotify:
+        print(f"[voice] (no pnotify) {title}: {body}", file=sys.stderr)
+        return
+    try:
+        subprocess.run([pnotify, title, body], capture_output=True, timeout=15)
+    except Exception as exc:  # noqa: BLE001 — notification is best-effort
+        print(f"[voice] pnotify error (ignored): {exc}", file=sys.stderr)
+
+
+def _write_marker(audio_path: Path, kind: str, reason: str, attempts: int) -> None:
+    marker = audio_path.with_suffix(audio_path.suffix + FAILED_SUFFIX)
+    marker.write_text(
+        f"kind: {kind}\nreason: {reason or 'unknown error'}\nattempts: {attempts}\n",
+        encoding="utf-8",
+    )
 
 
 def mark_failed(audio_path: Path, reason: str = "", kind: str = FAIL_PERMANENT) -> None:
-    """Write a structured .failed marker.
+    """Write a structured .failed marker, with bounded transient retries.
 
-    kind is FAIL_TRANSIENT or FAIL_PERMANENT.  Transient failures are eligible
-    for automatic timed retry; permanent ones are not.
+    kind is FAIL_TRANSIENT or FAIL_PERMANENT. Permanent failures (a content
+    verdict — corrupt/truncated audio) are written straight
+    through: not retried, not counted. Empty transcripts are skips, not
+    failures. Transient failures are eligible for the
+    timed retry loop, but the attempt count is tracked in the marker; once it
+    reaches the cap the failure escalates to permanent and fires a one-time
+    notification, so a reason that never resolves leaves the queue instead of
+    looping forever (and silently).
     """
-    marker = audio_path.with_suffix(audio_path.suffix + FAILED_SUFFIX)
-    marker.write_text(f"kind: {kind}\nreason: {reason or 'unknown error'}\n", encoding="utf-8")
+    if kind != FAIL_TRANSIENT:
+        _write_marker(audio_path, FAIL_PERMANENT, reason, _read_marker_attempts(audio_path))
+        return
+
+    attempts = _read_marker_attempts(audio_path) + 1
+    cap = _max_transient_attempts()
+    if attempts >= cap:
+        escalated = f"escalated to permanent after {attempts} transient attempts: {reason}"
+        _write_marker(audio_path, FAIL_PERMANENT, escalated, attempts)
+        print(f"[voice] {audio_path.name}: {escalated}", file=sys.stderr)
+        title, body = gave_up_notice(audio_path, attempts, reason)
+        _notify(title, body)
+        return
+    _write_marker(audio_path, FAIL_TRANSIENT, reason, attempts)
 
 
 def is_transient_failed(audio_path: Path) -> bool:
@@ -457,6 +767,111 @@ def is_fully_synced(audio_path: Path) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Structural completeness probe
+# ---------------------------------------------------------------------------
+
+def _probe_decode(audio_path: Path) -> tuple[float | None, float]:
+    """Decode `audio_path`'s audio stream to EOF via PyAV.
+
+    Returns (decoded_seconds, declared_seconds), or (None, declared) when the
+    container opens but carries no audio stream (a definitive content defect,
+    not an exception). Decodes with libav directly rather than through
+    faster_whisper.decode_audio: it's the same underlying decoder transcription
+    uses, but surfaces libav's *typed* errors (InvalidDataError / EOFError) on a
+    bad container instead of the bare IndexError decode_audio raises on short
+    input — which we need to disposition correctly. Isolated from
+    probe_decodable() so tests can stub it without real audio fixtures.
+    """
+    import av
+
+    with av.open(str(audio_path)) as container:
+        declared = (container.duration / av.time_base) if container.duration else 0.0
+        if not container.streams.audio:
+            return None, declared
+        # Sum seconds from each decoded frame's own sample_rate rather than the
+        # stream's — a truncated stream can be missing codec params (stream.rate
+        # raises), but every decoded frame reliably carries samples + sample_rate.
+        decoded_seconds = 0.0
+        for frame in container.decode(audio=0):
+            rate = frame.sample_rate or PROBE_SAMPLE_RATE
+            decoded_seconds += frame.samples / rate
+    return decoded_seconds, declared
+
+
+def _probe_worker(audio_path: str) -> int:
+    """Child-process entry: decode the file and report via exit code + stdout.
+
+    Only the two unambiguous content errors (invalid container, premature EOF)
+    and a missing audio stream are content defects; everything else is
+    environmental. A libav *segfault* here kills this child with a signal — the
+    parent sees the negative returncode and survives.
+    """
+    try:
+        import av
+        try:
+            decoded, declared = _probe_decode(Path(audio_path))
+        except (av.error.InvalidDataError, av.error.EOFError):
+            return PROBE_EXIT_CONTENT
+    except Exception:  # noqa: BLE001 — import/decode env error, default-deny
+        return PROBE_EXIT_ENV
+    if decoded is None:  # container opened, no audio stream — content defect
+        return PROBE_EXIT_CONTENT
+    sys.stdout.write(json.dumps([decoded, declared]))
+    return PROBE_EXIT_OK
+
+
+def _reconcile_duration(decoded: float, declared: float) -> tuple[bool, str, str]:
+    """Flag a decoded stream that falls materially short of the declared
+    duration (the faststart short-decode that doesn't raise)."""
+    if declared > 0:
+        allowed_shortfall = max(DECODE_DURATION_ABS_SLACK,
+                                declared * (1.0 - DECODE_DURATION_TOLERANCE))
+        if (declared - decoded) > allowed_shortfall:
+            return (False, FAIL_PERMANENT,
+                    f"truncated: decoded {decoded:.1f}s < declared {declared:.1f}s")
+    return True, "", ""
+
+
+def probe_decodable(audio_path: Path) -> tuple[bool, str, str]:
+    """Verify a recording is a structurally complete, decodable container.
+
+    Returns (ok, kind, reason). The decode runs in an isolated child process so a
+    libav crash on a malformed file can't take down the batch. Disposition:
+    FAIL_PERMANENT for a deterministic content defect (corrupt, no audio stream,
+    or decoded materially shorter than declared); FAIL_TRANSIENT for an
+    environmental error, a timeout, or a signal death (crash/OOM) — default-deny
+    toward a bounded retry, never a silent pass. Runs before transcription so a
+    partial/corrupt file is caught instead of yielding a plausible-but-truncated
+    transcript that gets marked processed.
+    """
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()), PROBE_WORKER_FLAG, str(audio_path)],
+            capture_output=True, text=True, timeout=PROBE_TIMEOUT_SEC,
+        )
+    except subprocess.TimeoutExpired:
+        return False, FAIL_TRANSIENT, f"decode timed out after {PROBE_TIMEOUT_SEC}s"
+
+    rc = proc.returncode
+    if rc == PROBE_EXIT_CONTENT:
+        return False, FAIL_PERMANENT, "corrupt / truncated / no audio stream"
+    if rc == PROBE_EXIT_ENV:
+        return False, FAIL_TRANSIENT, "environmental decode error"
+    if rc < 0:
+        # Killed by a signal (e.g. SIGSEGV from libav on hostile bytes, or OOM):
+        # cause is ambiguous, so default-deny to a bounded transient retry. The
+        # win is that the parent survived and the file got dispositioned.
+        return False, FAIL_TRANSIENT, f"decode crashed (signal {-rc})"
+    if rc != PROBE_EXIT_OK:
+        return False, FAIL_TRANSIENT, f"probe exited {rc}"
+    try:
+        decoded, declared = json.loads(proc.stdout)
+    except Exception:  # noqa: BLE001 — malformed worker output, default-deny
+        return False, FAIL_TRANSIENT, "probe produced no result"
+    return _reconcile_duration(decoded, declared)
+
+
+# ---------------------------------------------------------------------------
 # Single-file pipeline
 # ---------------------------------------------------------------------------
 
@@ -471,24 +886,43 @@ def process_file(
     night_cutoff: int,
     dry_run: bool,
     verbose: bool,
-) -> bool:
-    """Process one .m4a file. Returns True on success."""
+) -> FileOutcome:
+    """Process one audio file. ok, empty (skip), or error."""
     print(f"[voice] processing {audio_path.name}", file=sys.stderr)
 
     date_str, time_str = resolve_target_date(audio_path, night_cutoff)
     print(f"[voice] target date={date_str} time={time_str}", file=sys.stderr)
 
+    # Structural completeness gate: reject a corrupt or truncated file up front
+    # rather than letting it become a plausible-but-short transcript that gets
+    # marked processed. Content-deterministic failures go straight to permanent;
+    # environmental ones stay transient (see probe_decodable / mark_failed).
+    ok, fail_kind, fail_reason = probe_decodable(audio_path)
+    if not ok:
+        print(f"[voice] incomplete/undecodable {audio_path.name}: {fail_reason} "
+              f"({fail_kind})", file=sys.stderr)
+        if not dry_run:
+            mark_failed(audio_path, fail_reason, kind=fail_kind)
+        return _outcome_error()
+
     if verbose and whisper_prompt:
         print(f"[voice] whisper prompt ({len(whisper_prompt)} chars): {whisper_prompt[:120]}…", file=sys.stderr)
 
     try:
-        transcript, duration, language = transcribe_audio(audio_path, model, whisper_prompt)
+        transcribed = transcribe_audio(audio_path, model, whisper_prompt)
+        transcript = transcribed.text
+        duration = transcribed.duration
+        language = transcribed.language
+        segments = transcribed.segments
     except Exception as exc:
+        # Reached only after probe_decodable() vetted the container, so a failure
+        # here is genuinely model/infra (model load, resampler I/O) — not the
+        # file — and is correctly transient.
         print(f"[voice] transcription failed for {audio_path.name}: {exc}", file=sys.stderr)
         if not dry_run:
             # Treat as transient — model load or I/O error may resolve on retry.
             mark_failed(audio_path, f"transcription error: {exc}", kind=FAIL_TRANSIENT)
-        return False
+        return _outcome_error()
 
     print(
         f"[voice] transcribed {duration:.1f}s audio [{language}]: {len(transcript.split())} words",
@@ -500,9 +934,10 @@ def process_file(
     if not transcript.strip():
         print(f"[voice] empty transcript, skipping {audio_path.name}", file=sys.stderr)
         if not dry_run:
-            # Permanent — re-transcribing the same audio won't produce words.
-            mark_failed(audio_path, "empty transcript", kind=FAIL_PERMANENT)
-        return False
+            # Same bytes will not grow words later. Record a skip, not a failure,
+            # so a batch of empty recordings still exits 0.
+            mark_processed(audio_path, skip=SKIP_EMPTY)
+        return _outcome_empty()
 
     append_voice_block(journal_dir, date_str, time_str, transcript, dry_run=dry_run)
 
@@ -512,13 +947,26 @@ def process_file(
         if not dry_run:
             # Transient — Ollama may have been unavailable (Mac asleep, model not loaded).
             mark_failed(audio_path, f"Scribe exit code {scribe_exit}", kind=FAIL_TRANSIENT)
-        return False
+        return _outcome_error()
 
     if not dry_run:
+        # Checks read the note Scribe just wrote. A failure here still leaves
+        # the recording processed; the next Scribe run is unchanged.
+        try:
+            import transcript_review
+
+            transcript_review.review_saved_note(
+                journal_dir / f"{date_str}.md",
+                segments=list(segments),
+                when=recording_when(audio_path),
+                focus_text=transcript,
+            )
+        except Exception as exc:  # noqa: BLE001 — the note is already saved
+            print(f"[voice] transcript check skipped: {exc}", file=sys.stderr)
         mark_processed(audio_path)
         print(f"[voice] marked processed: {audio_path.name}", file=sys.stderr)
 
-    return True
+    return _outcome_ok()
 
 
 # ---------------------------------------------------------------------------
@@ -574,6 +1022,12 @@ def _write_voice_payload(**fields) -> None:
 
 
 def main() -> int:
+    # Isolated decode-probe child (see probe_decodable). Handled before the
+    # heavy env bootstrap / arg parsing so it stays a cheap, self-contained run.
+    argv = sys.argv[1:]
+    if len(argv) == 2 and argv[0] == PROBE_WORKER_FLAG:
+        return _probe_worker(argv[1])
+
     args = parse_cli()
 
     if not args.journal_dir:
@@ -618,7 +1072,29 @@ def main() -> int:
             return 0
         if args.force and is_processed(audio_path):
             print(f"[voice] --force: re-processing {audio_path.name}", file=sys.stderr)
-        success = process_file(
+        duplicate = None if args.force else find_processed_duplicate(audio_path)
+        if duplicate is not None:
+            print(
+                f"[voice] skip duplicate {audio_path.name} matches {duplicate.name}",
+                file=sys.stderr,
+            )
+            if not args.dry_run:
+                mark_processed(
+                    audio_path,
+                    duplicate_of=duplicate.name,
+                    skip=SKIP_DUPLICATE,
+                )
+            _write_voice_payload(
+                items_processed=0,
+                items_failed=0,
+                items_skipped_placeholder=0,
+                items_skipped_already=0,
+                items_skipped_empty=0,
+                items_skipped_duplicate=1,
+                items_pending_at_start=1,
+            )
+            return 0
+        outcome = process_file(
             audio_path,
             journal_dir=journal_dir,
             model=model,
@@ -630,13 +1106,15 @@ def main() -> int:
             verbose=args.verbose,
         )
         _write_voice_payload(
-            items_processed=1 if success else 0,
-            items_failed=0 if success else 1,
+            items_processed=1 if outcome.status == "ok" else 0,
+            items_failed=1 if outcome.status == "error" else 0,
             items_skipped_placeholder=0,
             items_skipped_already=0,
+            items_skipped_empty=1 if outcome.status == "empty" else 0,
+            items_skipped_duplicate=0,
             items_pending_at_start=1,
         )
-        return 0 if success else 1
+        return 0 if outcome.status != "error" else 1
 
     # Scan-dir mode
     drop_dir = Path(args.drop_dir).expanduser()
@@ -698,14 +1176,51 @@ def main() -> int:
             items_failed=0,
             items_skipped_placeholder=items_skipped_placeholder,
             items_skipped_already=items_skipped_already,
+            items_skipped_empty=0,
+            items_skipped_duplicate=0,
             items_pending_at_start=0,
         )
         return 0
 
+    known_hashes: dict[str, Path] = {}
+    for processed_path in candidates:
+        if not is_processed(processed_path):
+            continue
+        digest = processed_marker_hash(processed_path)
+        if not digest:
+            try:
+                digest = audio_content_hash(processed_path)
+            except OSError:
+                continue
+            if not args.dry_run:
+                mark_processed(processed_path, content_hash=digest)
+        known_hashes.setdefault(digest, processed_path)
+
     errors = 0
     processed = 0
+    items_skipped_empty = 0
+    items_skipped_duplicate = 0
     for audio_path in pending:
-        ok = process_file(
+        try:
+            digest = audio_content_hash(audio_path)
+        except OSError:
+            digest = ""
+        prior = known_hashes.get(digest) if digest else None
+        if prior is not None and prior.resolve() != audio_path.resolve():
+            print(
+                f"[voice] skip duplicate {audio_path.name} matches {prior.name}",
+                file=sys.stderr,
+            )
+            if not args.dry_run:
+                mark_processed(
+                    audio_path,
+                    content_hash=digest,
+                    duplicate_of=prior.name,
+                    skip=SKIP_DUPLICATE,
+                )
+            items_skipped_duplicate += 1
+            continue
+        outcome = process_file(
             audio_path,
             journal_dir=journal_dir,
             model=model,
@@ -716,16 +1231,22 @@ def main() -> int:
             dry_run=args.dry_run,
             verbose=args.verbose,
         )
-        if ok:
+        if outcome.status == "ok":
             processed += 1
+        elif outcome.status == "empty":
+            items_skipped_empty += 1
         else:
             errors += 1
+        if digest and outcome.status in {"ok", "empty"}:
+            known_hashes.setdefault(digest, audio_path)
 
     _write_voice_payload(
         items_processed=processed,
         items_failed=errors,
         items_skipped_placeholder=items_skipped_placeholder,
         items_skipped_already=items_skipped_already,
+        items_skipped_empty=items_skipped_empty,
+        items_skipped_duplicate=items_skipped_duplicate,
         items_pending_at_start=items_pending_at_start,
     )
     return 0 if errors == 0 else 1

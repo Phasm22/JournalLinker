@@ -1,4 +1,4 @@
-# Journal Linker — local Obsidian journal wikilink helper (Scribe + weekly insights).
+# Journal Linker — local Obsidian journal wikilink helper.
 # Install the runner: brew install just   →   https://github.com/casey/just
 #
 # First-time: configure env vars (recommended: ~/.config/journal-linker/journal-linker.env) — see README.
@@ -33,17 +33,9 @@ scribe-job:
 launchagent-journal p:
     "{{root}}/scripts/patch_launchagent_journal.sh" "{{p}}"
 
-# Weekly insights note (uses the same env bootstrap as Scribe)
-weekly:
-    "{{py}}" "{{root}}/weekly_insights.py"
-
-# Dry-run the daily Pushover reflection without sending
-daily-reflection *ARGS:
-    "{{py}}" "{{root}}/daily_reflection.py" --dry-run {{ARGS}}
-
-# Real daily Pushover reflection run (same core path as the scheduled job)
-daily-reflection-send *ARGS:
-    "{{py}}" "{{root}}/daily_reflection.py" {{ARGS}}
+# Print today's nutrition summary without sending Pushover
+nutrition-summary *ARGS:
+    "{{py}}" "{{root}}/scripts/nutrition_ledger.py" --summary --dry-run {{ARGS}}
 
 # Tests only (Ollama mocked)
 test:
@@ -80,13 +72,22 @@ voice-reprocess-all:
 voice-scan:
     "{{py}}" "{{root}}/scripts/process_voice.py"
 
-# Install faster-whisper into the project venv
-voice-install:
-    "{{py}}" -m pip install faster-whisper
+# Run the Tailscale voice ingest endpoint in the foreground (normally journal-linker-voice-ingest.service)
+voice-ingest:
+    "{{py}}" "{{root}}/scripts/voice_ingest_server.py"
 
-# Install the MCP client used for llmLibrarian intent enrichment
-intent-mcp-install:
-    "{{py}}" -m pip install mcp
+# Sync ScribeVenv to the pinned lockfile (mcp, openai, ollama, faster-whisper,
+# pyyaml — see TECHNICAL.md "Reproducible environments"). Replaces ad hoc
+# `pip install <pkg>`, which silently took mcp 1.x -> 2.3.0 on 2026-11-09 and
+# broke enrichment.
+scribevenv-sync:
+    UV_PROJECT_ENVIRONMENT="{{root}}/ScribeVenv" uv sync --locked
+
+# Install faster-whisper into the project venv (pinned; see scribevenv-sync)
+voice-install: scribevenv-sync
+
+# Install the MCP client used for llmLibrarian intent enrichment (pinned; see scribevenv-sync)
+intent-mcp-install: scribevenv-sync
 
 # Smoke test: initialize → tools/list → tools/call against the live MCP server
 intent-mcp-smoke *ARGS:
@@ -165,7 +166,7 @@ handoff-check:
       printf "%s\n" "  llmli add --full /home/tj/Documents/twin-brain/TJ\\'s\\ PC"; \
       if [[ "$mode" != "off" ]]; then \
         printf "%s\n" ""; \
-        printf "%s\n" "Enrichment is enabled; if context is unexpectedly thin, verify cortex is indexed in llmLibrarian excludes/archetypes."; \
+        printf "%s\n" "Enrichment is enabled; if context is unexpectedly thin, verify intents is indexed in llmLibrarian excludes/archetypes."; \
       fi'
 
 # Telegram Bot API: getMe + getChat. Sources repo .env, then XDG files (later overrides), then JOURNAL_LINKER_ENV_FILE.

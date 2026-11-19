@@ -1,0 +1,10 @@
+# User unit: one end-of-day nutrition Pushover.
+[Unit]
+Description=Journal Linker — nutrition day summary
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-%h/.config/journal-linker/journal-linker.env
+ExecStart=/bin/bash ${JOURNAL_LINKER_REPO}/scripts/nutrition_day_summary.sh

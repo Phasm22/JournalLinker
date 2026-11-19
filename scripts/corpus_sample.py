@@ -4,12 +4,12 @@
 Use this to iterate on historical vault text, export slices for stats (Python/R), or spot-check
 without process_intents, watchers, or Telegram.
 
-Expects daily notes named YYYY-MM-DD.md (same convention as Scribe / vault_mapper).
+Expects daily notes named YYYY-MM-DD.md (the same convention as Scribe).
 
 Examples:
   python3 scripts/corpus_sample.py --journal-dir "$SCRIBE_JOURNAL_DIR" --list
   python3 scripts/corpus_sample.py --from-date 2025-01-01 --to-date 2025-12-31 --sample 12 --seed 42 --format jsonl --preview-chars 400
-  python3 scripts/corpus_sample.py --roots ~/vault/daily ~/vault/cortex --recursive --format paths
+  python3 scripts/corpus_sample.py --roots ~/vault/daily ~/vault/intents --recursive --format paths
 
 Env:
   SCRIBE_JOURNAL_DIR  default for --journal-dir when no --roots given

@@ -8,6 +8,10 @@ Bootstrap precedence (never overwrites existing os.environ values):
 2) `XDG_CONFIG_HOME/journal-linker/journal-linker.env` (fallback: `~/.config/journal-linker/journal-linker.env`)
 3) Optional legacy: `<repo_root>/.env` ONLY if `JOURNAL_LINKER_DOTENV=1`
 
+Pushover credentials are additionally read from the shared pnotify file
+(`PNOTIFY_ENV_FILE`, else `XDG_CONFIG_HOME/pnotify/env`) so every sender —
+these scripts and `~/bin/pnotify` — uses one copy of the keys.
+
 This module is intentionally tiny and stdlib-only so every entrypoint can import it safely.
 """
 
@@ -43,10 +47,23 @@ def load_key_value_file(path: Path) -> int:
     return set_count
 
 
+def _config_home() -> Path:
+    xdg = (os.environ.get("XDG_CONFIG_HOME") or "").strip()
+    return Path(xdg).expanduser() if xdg else (Path.home() / ".config")
+
+
+def load_pnotify_credentials() -> int:
+    """Load PUSHOVER_APP_TOKEN / PUSHOVER_USER_KEY from the shared pnotify env file."""
+    explicit = (os.environ.get("PNOTIFY_ENV_FILE") or "").strip()
+    path = Path(explicit).expanduser() if explicit else _config_home() / "pnotify" / "env"
+    return load_key_value_file(path)
+
+
 def bootstrap_journal_linker_env(*, repo_root: Path) -> None:
     """Populate os.environ from safer defaults; idempotent."""
     if os.environ.get("JOURNAL_LINKER_ENV_BOOTSTRAPPED") == "1":
         return
+    load_pnotify_credentials()
 
     explicit = (os.environ.get("JOURNAL_LINKER_ENV_FILE") or "").strip()
     if explicit:
@@ -56,9 +73,7 @@ def bootstrap_journal_linker_env(*, repo_root: Path) -> None:
             os.environ["JOURNAL_LINKER_ENV_BOOTSTRAPPED"] = "1"
             return
 
-    xdg = (os.environ.get("XDG_CONFIG_HOME") or "").strip()
-    cfg_home = Path(xdg).expanduser() if xdg else (Path.home() / ".config")
-    user_env = (cfg_home / "journal-linker" / "journal-linker.env").expanduser()
+    user_env = (_config_home() / "journal-linker" / "journal-linker.env").expanduser()
     if user_env.exists():
         load_key_value_file(user_env)
         os.environ["JOURNAL_LINKER_ENV_BOOTSTRAPPED"] = "1"

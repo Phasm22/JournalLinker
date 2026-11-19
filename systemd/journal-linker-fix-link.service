@@ -1,0 +1,16 @@
+# Plain Fix? page for transcript findings. Binds 127.0.0.1; expose tailnet-only:
+#   tailscale serve --bg --https=8798 http://127.0.0.1:8798
+# GET shows the span. POST writes it once.
+[Unit]
+Description=Journal Linker — transcript Fix link
+
+[Service]
+Type=simple
+EnvironmentFile=-%h/.config/journal-linker/journal-linker.env
+ExecStart=/usr/bin/env ${JOURNAL_LINKER_REPO}/ScribeVenv/bin/python3 ${JOURNAL_LINKER_REPO}/scripts/fix_link.py
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

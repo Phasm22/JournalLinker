@@ -113,3 +113,17 @@ class TestJournalLinkerEnvBootstrap(unittest.TestCase):
                 repo.mkdir()
                 journal_linker_env.bootstrap_journal_linker_env(repo_root=repo)
                 self.assertNotIn("SCRIBE_JOURNAL_DIR", os.environ)
+
+    def test_loads_pushover_keys_from_shared_pnotify_file(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            cfg = Path(d) / "config"
+            (cfg / "pnotify").mkdir(parents=True)
+            (cfg / "pnotify" / "env").write_text(
+                'PUSHOVER_APP_TOKEN="tok"\nPUSHOVER_USER_KEY=usr\n', encoding="utf-8"
+            )
+            repo = Path(d) / "repo"
+            repo.mkdir()
+            with self._isolated_environ({"PUSHOVER_USER_KEY": "from_env"}, xdg_config_home=str(cfg)):
+                journal_linker_env.bootstrap_journal_linker_env(repo_root=repo)
+                self.assertEqual(os.environ.get("PUSHOVER_APP_TOKEN"), "tok")
+                self.assertEqual(os.environ.get("PUSHOVER_USER_KEY"), "from_env")
