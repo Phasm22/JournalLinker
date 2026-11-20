@@ -177,7 +177,7 @@ class TestPublishCap(unittest.TestCase):
             sent = tr.publish_findings(
                 note, findings, when="Nov 9, 8:26 PM",
                 state_dir=Path(td) / "state", base_url="http://127.0.0.1:8798",
-                send=_send,
+                send=_send, proposals_store=Path(td) / "fp.json",
             )
             self.assertEqual(len(sent), 3)
             self.assertEqual(sent_bodies[0][0], "Saved phrase")
@@ -189,6 +189,35 @@ class TestPublishCap(unittest.TestCase):
             again = tr.publish_findings(
                 note, findings[:1], when="Nov 9, 8:26 PM",
                 state_dir=Path(td) / "state", base_url="http://127.0.0.1:8798",
-                send=_send,
+                send=_send, proposals_store=Path(td) / "fp.json",
             )
             self.assertEqual(again, [])
+
+
+class TestRevertMemory(unittest.TestCase):
+    def test_reverted_fix_is_never_offered_again(self):
+        import fix_link
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            note = td / "2026-11-09.md"
+            note.write_text("a. just bear. b.", encoding="utf-8")
+            store, state = td / "fp.json", td / "state"
+            finding = {"check": "known_mishear", "heard": "just bear", "suggestion": "Just Bare", "why": ""}
+            sent = []
+            send = lambda t, b, l: sent.append((t, b, l))
+            kw = dict(when="x", state_dir=state, base_url="http://h:1", send=send, proposals_store=store)
+            tr.publish_findings(note, [dict(finding)], **kw)
+            token = sent[0][2].rsplit("/", 1)[1]
+            self.assertEqual(fix_link.apply_stored(token, store), "fixed")
+            self.assertIn("Just Bare", note.read_text())
+            self.assertEqual(tr.record_reverts(state, store), 0)  # still applied
+            note.write_text("a. just bear. b.", encoding="utf-8")  # user edits it back
+            sent.clear()
+            result = tr.publish_findings(note, [dict(finding)], force=True, **kw)
+            self.assertEqual(result, [])
+            self.assertEqual(sent, [])
+
+    def test_unlinked_suggestion_says_why(self):
+        _, body = tr.format_notice("w", {"check": "uncertain_words", "heard": "going", "suggestion": "growing", "linkable": False})
+        self.assertIn("No Fix link", body)
+
