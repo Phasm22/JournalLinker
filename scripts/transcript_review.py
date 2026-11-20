@@ -18,6 +18,7 @@ import re
 import subprocess
 import sys
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from pathlib import Path
 
 import fix_link
@@ -348,13 +349,38 @@ def resident_model_name() -> str | None:
     return str(name).strip() or None
 
 
+MIN_SOUND_ALIKE = 0.5
+
+
+def sounds_alike(heard: str, suggestion: str) -> bool:
+    """A mishearing looks like what was said. A synonym or rewrite does not."""
+    def letters(value: str) -> str:
+        return "".join(WORD_RE.findall(value.lower()))
+
+    left, right = letters(heard), letters(suggestion)
+    if not left or not right:
+        return False
+    return SequenceMatcher(None, left, right).ratio() >= MIN_SOUND_ALIKE
+
+
+def _suffix_only(heard: str, suggestion: str) -> bool:
+    """straightforward -> straightforwardly is a rewrite, not a mishearing."""
+    a = "".join(WORD_RE.findall(heard.lower()))
+    b = "".join(WORD_RE.findall(suggestion.lower()))
+    short, long = (a, b) if len(a) <= len(b) else (b, a)
+    return len(short) >= 5 and long.startswith(short) and 0 < len(long) - len(short) <= 3
+
+
 def suggest_for_span(sentence: str, span: str, model: str) -> str:
     """Ask the already-loaded model for replacement words, or empty."""
     import ollama  # type: ignore
 
     prompt = (
-        "A speech transcript has one unsure span. "
-        "Reply with only the replacement words, or NONE.\n"
+        "A speech-to-text transcript has one span the recognizer was unsure of. "
+        "Most of the time the span is already correct. Reply with replacement words "
+        "only if the span is clearly a mishearing: the replacement must sound almost "
+        "the same as the span and fit the sentence better. Never swap in a synonym "
+        "or rephrase. If the span makes sense as written, reply NONE.\n"
         f"Sentence: {sentence}\n"
         f"Unsure span: {span}"
     )
@@ -375,6 +401,12 @@ def suggest_for_span(sentence: str, span: str, model: str) -> str:
     if not suggestion_words or len(suggestion_words) > max(8, len(span_words) + 3):
         return ""
     if text.lower() == re.sub(r"\s+", " ", span).strip().lower():
+        return ""
+    if re.search(r"->|=>|→|[:=]", text):
+        return ""
+    if _suffix_only(span, text):
+        return ""
+    if not sounds_alike(span, text):
         return ""
     return text
 
@@ -490,7 +522,63 @@ def format_notice(when: str, finding: dict) -> tuple[str, str]:
     body = "\n\n".join(parts)
     if why and not suggestion:
         body = f"{body}\n{why}"
+    if suggestion and not finding.get("linkable", True):
+        body = f"{body}\n(No Fix link: those words are not unique in the note.)"
     return title, body
+
+
+REJECTIONS_FILE = "transcript_rejections.json"
+
+
+def _rejections_path(state_dir: Path) -> Path:
+    return state_dir / REJECTIONS_FILE
+
+
+def _pair(heard: str, suggestion: str) -> str:
+    def norm(value: str) -> str:
+        return " ".join(w.lower() for w in WORD_RE.findall(value))
+
+    return f"{norm(heard)}\t{norm(suggestion)}"
+
+
+def load_rejections(state_dir: Path) -> set[str]:
+    try:
+        data = json.loads(_rejections_path(state_dir).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return set()
+    return {str(item) for item in data} if isinstance(data, list) else set()
+
+
+def record_reverts(state_dir: Path, store: Path | None = None) -> int:
+    """A fix that was applied and then edited back is a rejection. Remember it.
+
+    Looks at applied Fix links: when the note no longer holds the replacement
+    but holds the original words again, that heard -> suggestion pair is never
+    offered again.
+    """
+    store_path = store or fix_link.proposals_path()
+    data = fix_link._load(store_path)
+    rejected = load_rejections(state_dir)
+    found = 0
+    changed = False
+    for row in data.values():
+        if not isinstance(row, dict) or not row.get("used") or row.get("reverted"):
+            continue
+        try:
+            text = Path(str(row.get("path") or "")).read_text(encoding="utf-8")
+        except OSError:
+            continue
+        old, new = str(row.get("old") or ""), str(row.get("new") or "")
+        if old and new and new not in text and old in text:
+            rejected.add(_pair(str(row.get("heard") or ""), str(row.get("suggestion") or "")))
+            row["reverted"] = True
+            changed = True
+            found += 1
+    if changed:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        _rejections_path(state_dir).write_text(json.dumps(sorted(rejected), indent=2), encoding="utf-8")
+        fix_link._save(store_path, data)
+    return found
 
 
 def _log_path(state_dir: Path) -> Path:
@@ -571,9 +659,16 @@ def publish_findings(
     send=None,
     force: bool = False,
     dry_run: bool = False,
+    proposals_store: Path | None = None,
 ) -> list[dict]:
     """Notify up to three findings. Mint a Fix link only for a unique replacement."""
     state = state_dir or default_state_dir()
+    if not dry_run:
+        try:
+            record_reverts(state, proposals_store)
+        except Exception as exc:  # noqa: BLE001 — memory is best effort
+            print(f"[voice] revert check skipped: {exc}", file=sys.stderr)
+    rejected = load_rejections(state)
     note = note_path.read_text(encoding="utf-8") if note_path.is_file() else ""
     sender = send or _send
     root = base_url if base_url is not None else fix_base_url()
@@ -581,12 +676,15 @@ def publish_findings(
     for finding in findings:
         if len(sent) >= MAX_PINGS:
             break
+        if finding.get("suggestion") and _pair(str(finding.get("heard") or ""), str(finding["suggestion"])) in rejected:
+            continue
         fingerprint = _fingerprint(note_path, finding)
         if not force and already_logged(state, fingerprint):
             continue
         link = ""
         located = locate_replacement(note, finding) if note else None
         finding["excerpt"] = excerpt_around(note, str(finding.get("heard") or ""))
+        finding["linkable"] = bool(located)
         if dry_run:
             title, body = format_notice(when, finding)
             print(f"\n{title}\n{body}")
@@ -604,6 +702,7 @@ def publish_findings(
                 suggestion=str(finding["suggestion"]),
                 excerpt=str(finding.get("excerpt") or ""),
                 base_url=root,
+                store=proposals_store,
             )
         title, body = format_notice(when, finding)
         try:
