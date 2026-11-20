@@ -363,6 +363,14 @@ def sounds_alike(heard: str, suggestion: str) -> bool:
     return SequenceMatcher(None, left, right).ratio() >= MIN_SOUND_ALIKE
 
 
+def _suffix_only(heard: str, suggestion: str) -> bool:
+    """straightforward -> straightforwardly is a rewrite, not a mishearing."""
+    a = "".join(WORD_RE.findall(heard.lower()))
+    b = "".join(WORD_RE.findall(suggestion.lower()))
+    short, long = (a, b) if len(a) <= len(b) else (b, a)
+    return len(short) >= 5 and long.startswith(short) and 0 < len(long) - len(short) <= 3
+
+
 def suggest_for_span(sentence: str, span: str, model: str) -> str:
     """Ask the already-loaded model for replacement words, or empty."""
     import ollama  # type: ignore
@@ -393,6 +401,10 @@ def suggest_for_span(sentence: str, span: str, model: str) -> str:
     if not suggestion_words or len(suggestion_words) > max(8, len(span_words) + 3):
         return ""
     if text.lower() == re.sub(r"\s+", " ", span).strip().lower():
+        return ""
+    if re.search(r"->|=>|→|[:=]", text):
+        return ""
+    if _suffix_only(span, text):
         return ""
     if not sounds_alike(span, text):
         return ""

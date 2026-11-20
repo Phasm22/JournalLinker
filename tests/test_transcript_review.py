@@ -105,6 +105,10 @@ class TestOtherChecks(unittest.TestCase):
         sys.modules["ollama"] = fake
         try:
             self.assertEqual(tr.suggest_for_span("fairly straightforward. But", "straightforward.", "m"), "")
+            for junk in ("planning -> preparing", "straightforwardly"):
+                fake.chat = lambda junk=junk, **kw: {"message": {"content": junk}}
+                span = junk.split(" ")[0].replace("ly", "")
+                self.assertEqual(tr.suggest_for_span("s", span, "m"), "", junk)
             fake.chat = lambda **kw: {"message": {"content": "pull"}}
             self.assertEqual(tr.suggest_for_span("can you pole the 10-K", "pole", "m"), "pull")
         finally:
