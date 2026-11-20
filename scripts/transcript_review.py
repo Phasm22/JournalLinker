@@ -18,6 +18,7 @@ import re
 import subprocess
 import sys
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from pathlib import Path
 
 import fix_link
@@ -348,13 +349,30 @@ def resident_model_name() -> str | None:
     return str(name).strip() or None
 
 
+MIN_SOUND_ALIKE = 0.5
+
+
+def sounds_alike(heard: str, suggestion: str) -> bool:
+    """A mishearing looks like what was said. A synonym or rewrite does not."""
+    def letters(value: str) -> str:
+        return "".join(WORD_RE.findall(value.lower()))
+
+    left, right = letters(heard), letters(suggestion)
+    if not left or not right:
+        return False
+    return SequenceMatcher(None, left, right).ratio() >= MIN_SOUND_ALIKE
+
+
 def suggest_for_span(sentence: str, span: str, model: str) -> str:
     """Ask the already-loaded model for replacement words, or empty."""
     import ollama  # type: ignore
 
     prompt = (
-        "A speech transcript has one unsure span. "
-        "Reply with only the replacement words, or NONE.\n"
+        "A speech-to-text transcript has one span the recognizer was unsure of. "
+        "Most of the time the span is already correct. Reply with replacement words "
+        "only if the span is clearly a mishearing: the replacement must sound almost "
+        "the same as the span and fit the sentence better. Never swap in a synonym "
+        "or rephrase. If the span makes sense as written, reply NONE.\n"
         f"Sentence: {sentence}\n"
         f"Unsure span: {span}"
     )
@@ -375,6 +393,8 @@ def suggest_for_span(sentence: str, span: str, model: str) -> str:
     if not suggestion_words or len(suggestion_words) > max(8, len(span_words) + 3):
         return ""
     if text.lower() == re.sub(r"\s+", " ", span).strip().lower():
+        return ""
+    if not sounds_alike(span, text):
         return ""
     return text
 

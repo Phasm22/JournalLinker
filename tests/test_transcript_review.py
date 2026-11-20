@@ -83,6 +83,33 @@ class TestOtherChecks(unittest.TestCase):
         findings = tr.check_uncertain_words(segments)
         self.assertEqual([item["heard"] for item in findings], ["bear"])
 
+    def test_sounds_alike_rejects_synonyms_and_keeps_mishearings(self):
+        for heard, suggestion in [
+            ("straightforward.", "clear-cut."),
+            ("kinds", "types"),
+            ("planning", "communicating"),
+            ("it.", "home assistant"),
+            ("like,", "such as"),
+        ]:
+            self.assertFalse(tr.sounds_alike(heard, suggestion), (heard, suggestion))
+        for heard, suggestion in [
+            ("just bear", "Just Bare"),
+            ("one constitutes", "what constitutes"),
+            ("pole", "pull"),
+        ]:
+            self.assertTrue(tr.sounds_alike(heard, suggestion), (heard, suggestion))
+
+    def test_suggest_for_span_drops_a_synonym_from_the_model(self):
+        import types
+        fake = types.SimpleNamespace(chat=lambda **kw: {"message": {"content": "clear-cut."}})
+        sys.modules["ollama"] = fake
+        try:
+            self.assertEqual(tr.suggest_for_span("fairly straightforward. But", "straightforward.", "m"), "")
+            fake.chat = lambda **kw: {"message": {"content": "pull"}}
+            self.assertEqual(tr.suggest_for_span("can you pole the 10-K", "pole", "m"), "pull")
+        finally:
+            del sys.modules["ollama"]
+
     def test_weak_segment_dropped_when_the_table_explains_it(self):
         text = "the just bear spicy"
         segments = [{
